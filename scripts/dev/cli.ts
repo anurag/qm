@@ -245,7 +245,8 @@ async function bootOnSlot(slot: string, worktree: string, branch: string): Promi
         branch,
         callerEnv,
         watch: !opts["no-watch"] && callerEnv.DEV_INSTANCE_WATCH !== "0",
-        sandbox: opts.sandbox as "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "auto",
+        sandbox: opts.sandbox as
+          "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "render" | "auto",
         canaryChannel,
         strict: opts.strict,
         slack: withSlack,
@@ -645,7 +646,7 @@ async function main(): Promise<number> {
       return await runDoctor({ json: opts.json, fix: opts.fix, store, slack: withSlack });
     default:
       console.error(
-        "usage: dev [up|down|status|restart|canary|logs|doctor] [--json] [--force] [--rotate] [--strict] [--sandbox local|sprites|smolmachines|e2b|porter|agent37|auto] [--no-slack] [--no-watch] [--org id] [--fix]",
+        "usage: dev [up|down|status|restart|canary|logs|doctor] [--json] [--force] [--rotate] [--strict] [--sandbox local|sprites|smolmachines|e2b|porter|agent37|render|auto] [--no-slack] [--no-watch] [--org id] [--fix]",
       );
       return EXIT.usage;
   }

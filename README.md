@@ -215,3 +215,6 @@ messages, and screenshots for organization identifiers before it pushes. Nothing
 ## License
 
 Except where otherwise noted, QM is available under the [MIT License](./LICENSE).
+
+Render Sandboxes are available through `SANDBOX_BACKEND=render`. See
+[Render Sandboxes](./docs/render-sandboxes.md) for configuration and recovery.

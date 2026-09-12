@@ -42,6 +42,12 @@ export const MINT_JWK =
 
 export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
+    name: "RENDER_API_KEY",
+    service: "core",
+    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "render" } },
+    description: "Render API key for agent sandboxes.",
+  },
+  {
     name: "ANTHROPIC_API_KEY",
     service: "core",
     required: { when: { kind: "model-provider", provider: "anthropic" }, optionalOtherwise: true },

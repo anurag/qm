@@ -1,9 +1,13 @@
 import { basename } from "node:path/posix";
+import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import {
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CopyObjectCommand,
   CreateMultipartUploadCommand,
+  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -64,6 +68,7 @@ export interface HomeSnapshotStore {
   open(scope: string): Promise<StoredSnapshot | null>;
   put(scope: string, data: Uint8Array): Promise<void>;
   createUpload(scope: string): Promise<SnapshotUpload>;
+  delete?(scope: string): Promise<void>;
   adoptFromS3?(scope: string, ref: { bucket: string; key: string }): Promise<void>;
 }
 
@@ -100,6 +105,82 @@ export function createMemorySnapshotStore(): HomeSnapshotStore {
         abort: async () => {},
       };
     },
+    delete: async (scope) => {
+      map.delete(scope);
+    },
+  };
+}
+
+export function createLocalSnapshotStore(dir: string): HomeSnapshotStore {
+  const keyFor = (scope: string): string => createHash("sha256").update(scope).digest("hex");
+  const pathFor = (scope: string): string => join(dir, `${keyFor(scope)}.tar`);
+  const createUpload = async (scope: string): Promise<SnapshotUpload> => {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const temporary = join(dir, `${keyFor(scope)}.${randomUUID()}.part`);
+    const file = await open(temporary, "wx", 0o600);
+    let closed = false;
+    const close = async (): Promise<void> => {
+      if (!closed) {
+        closed = true;
+        await file.close();
+      }
+    };
+    return {
+      async addPart(bytes) {
+        if (closed) throw new Error("snapshot upload is closed");
+        await file.writeFile(bytes);
+      },
+      async complete() {
+        if (closed) throw new Error("snapshot upload is closed");
+        await file.sync();
+        await close();
+        await rename(temporary, pathFor(scope));
+      },
+      async abort() {
+        await close();
+        await rm(temporary, { force: true });
+      },
+    };
+  };
+  return {
+    async open(scope) {
+      const file = await open(pathFor(scope), "r").catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      });
+      if (!file) return null;
+      try {
+        const stat = await file.stat();
+        return { size: stat.size, parts: file.createReadStream() };
+      } catch (error) {
+        await file.close();
+        throw error;
+      }
+    },
+    async put(scope, data) {
+      const upload = await createUpload(scope);
+      try {
+        await upload.addPart(data);
+        await upload.complete();
+      } catch (error) {
+        await upload.abort();
+        throw error;
+      }
+    },
+    createUpload,
+    async delete(scope) {
+      await rm(pathFor(scope), { force: true });
+      const names = await readdir(dir).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      });
+      const prefix = `${keyFor(scope)}.`;
+      await Promise.all(
+        names
+          .filter((name) => name.startsWith(prefix) && name.endsWith(".part"))
+          .map((name) => rm(join(dir, name), { force: true })),
+      );
+    },
   };
 }
 
@@ -129,6 +210,9 @@ export function createS3SnapshotStore(opts: S3SnapshotStoreOptions): HomeSnapsho
     },
     async put(scope, data): Promise<void> {
       await s3.send(new PutObjectCommand({ Bucket, Key: keyFor(scope), Body: data }));
+    },
+    async delete(scope): Promise<void> {
+      await s3.send(new DeleteObjectCommand({ Bucket, Key: keyFor(scope) }));
     },
     async createUpload(scope): Promise<SnapshotUpload> {
       const Key = keyFor(scope);

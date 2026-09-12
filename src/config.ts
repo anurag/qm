@@ -49,8 +49,9 @@ export interface Config {
   securityPosture: SecurityPosture;
   sandboxResourcesEnabled: boolean;
   sharingPosture: SharingPosture;
-  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
-  sandboxSecondaryBackend?: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
+  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "render";
+  sandboxSecondaryBackend?:
+    "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "render";
   deployProvider: "docker" | "aws" | "fly" | "porter";
   egressServiceHosts?: string[];
   brandingDefault?: OrgBranding;
@@ -176,6 +177,7 @@ export interface Config {
   e2bSandbox: E2bSandboxEnv;
   modalSandbox: ModalSandboxEnv;
   porterSandbox: PorterSandboxEnv;
+  renderSandbox: RenderSandboxEnv;
   porterDeploy: PorterDeployEnv;
   awsDeploy: AwsDeployEnv;
   deployAppsDomain?: string;
@@ -370,6 +372,41 @@ function e2bSandboxEnv(env: NodeJS.ProcessEnv): E2bSandboxEnv {
     ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
       ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
       : {}),
+  };
+}
+
+interface RenderSandboxEnv {
+  apiKey?: string;
+  workspaceId?: string;
+  region: string;
+  plan: "starter" | "standard" | "pro";
+  ttlSec: number;
+  defaultTimeoutSec?: number;
+}
+
+function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
+  const plan = env.RENDER_SANDBOX_PLAN?.trim() || "starter";
+  if (plan !== "starter" && plan !== "standard" && plan !== "pro") {
+    throw new Error("RENDER_SANDBOX_PLAN must be starter, standard, or pro");
+  }
+  const ttlSec = numEnvStrict("RENDER_SANDBOX_TTL_SEC", env.RENDER_SANDBOX_TTL_SEC) ?? 7200;
+  if (!Number.isSafeInteger(ttlSec) || ttlSec <= 0) {
+    throw new Error("RENDER_SANDBOX_TTL_SEC must be a positive integer");
+  }
+  const defaultTimeoutSec = numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC);
+  if (
+    (env.SANDBOX_BACKEND?.trim() === "render" || (env.RENDER_API_KEY?.trim() && env.RENDER_WORKSPACE_ID?.trim())) &&
+    ttlSec <= (defaultTimeoutSec ?? 600) + 60
+  ) {
+    throw new Error("RENDER_SANDBOX_TTL_SEC must exceed SANDBOX_TIMEOUT_SEC (default 600) by more than 60 seconds");
+  }
+  return {
+    ...(env.RENDER_API_KEY?.trim() ? { apiKey: env.RENDER_API_KEY.trim() } : {}),
+    ...(env.RENDER_WORKSPACE_ID?.trim() ? { workspaceId: env.RENDER_WORKSPACE_ID.trim() } : {}),
+    region: env.RENDER_REGION?.trim() || "oregon",
+    plan,
+    ttlSec,
+    ...(defaultTimeoutSec !== undefined ? { defaultTimeoutSec } : {}),
   };
 }
 
@@ -849,6 +886,7 @@ export function enabledSandboxBackends(config: Config): Array<Config["sandboxBac
     modal: Boolean(config.modalSandbox?.tokenId && config.modalSandbox?.tokenSecret),
     aws: Boolean(config.awsSandbox?.s3Bucket),
     porter: Boolean(config.porterSandbox?.token),
+    render: Boolean(config.renderSandbox?.apiKey && config.renderSandbox?.workspaceId),
   };
   const enabled = new Set<Config["sandboxBackend"]>([config.sandboxBackend]);
   for (const [name, on] of Object.entries(credentialed)) {
@@ -868,11 +906,12 @@ function sandboxBackendEnvStrict(value: string | undefined, name = "SANDBOX_BACK
     backend === "e2b" ||
     backend === "modal" ||
     backend === "agent37" ||
-    backend === "porter"
+    backend === "porter" ||
+    backend === "render"
   )
     return backend;
   throw new Error(
-    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, or agent37, or unset it.`,
+    `${name}=${JSON.stringify(value)} is not recognized. Use aws, local, sprites, smolmachines, e2b, modal, porter, agent37, or render.`,
   );
 }
 
@@ -1063,10 +1102,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (env.NODE_ENV === "production" && !env.SANDBOX_BACKEND?.trim()) {
     throw new Error(
-      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, aws, or local.",
+      "SANDBOX_BACKEND must be set explicitly in production. Use sprites, smolmachines, e2b, modal, porter, agent37, render, aws, or local.",
     );
   }
   const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
+  if (sandboxBackend === "render") {
+    if (!env.RENDER_WORKSPACE_ID?.trim()) throw new Error("Render providers require RENDER_WORKSPACE_ID");
+  }
   if (env.SANDBOX_SECONDARY_BACKEND?.trim()) {
     console.warn(
       `[config] SANDBOX_SECONDARY_BACKEND=${JSON.stringify(env.SANDBOX_SECONDARY_BACKEND.trim())} is retired and ignored — every backend whose credential is present is constructed; per-scope routes pick between them. Remove the variable.`,
@@ -1399,6 +1441,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     smolmachinesSandbox: smolmachinesSandboxEnv(env),
     agent37Sandbox: agent37SandboxEnv(env),
     porterSandbox: porterSandboxEnv(env),
+    renderSandbox: renderSandboxEnv(env),
     porterDeploy: porterDeployEnv(env),
     e2bSandbox: e2bSandboxEnv(env),
     modalSandbox: modalSandboxEnv(env),

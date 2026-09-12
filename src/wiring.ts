@@ -176,10 +176,12 @@ import { createSmolmachinesSandbox } from "./sandbox/smolmachines-sandbox.ts";
 import { createAgent37Sandbox } from "./sandbox/agent37-sandbox.ts";
 import { createE2bSandbox, type StoredE2bSandbox } from "./sandbox/e2b-sandbox.ts";
 import { createSdkE2bClient } from "./sandbox/e2b-client.ts";
-import { createS3SnapshotStore } from "./sandbox/home-snapshot.ts";
+import { createLocalSnapshotStore, createS3SnapshotStore } from "./sandbox/home-snapshot.ts";
 import { createModalSandbox, type StoredModalSandbox } from "./sandbox/modal-sandbox.ts";
 import { createSdkModalClient } from "./sandbox/modal-client.ts";
 import { createPorterSandbox } from "./sandbox/porter-sandbox.ts";
+import { createRenderSandbox, type StoredRenderSandbox } from "./sandbox/render-sandbox.ts";
+import { createSdkRenderClient } from "./sandbox/render-client.ts";
 import {
   createSandboxRouter,
   ROUTE_CACHE_TTL_MS,
@@ -781,6 +783,7 @@ export function buildApp(
   const e2bBodies = artifactMap<StoredE2bSandbox>("e2b_sandbox_bodies");
   const modalBodies = artifactMap<StoredModalSandbox>("modal_sandbox_bodies");
   const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
+  const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
   const buildE2b = (): Sandbox => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey) throw new Error("SANDBOX_BACKEND=e2b requires E2B_API_KEY");
@@ -898,6 +901,40 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       onError: sandboxOnError,
     });
+  const buildRender = (): Sandbox => {
+    const render = config.renderSandbox;
+    if (!render.apiKey || !render.workspaceId) {
+      throw new Error("SANDBOX_BACKEND=render requires RENDER_API_KEY and RENDER_WORKSPACE_ID");
+    }
+    return createRenderSandbox(workspace, {
+      client: createSdkRenderClient({
+        apiKey: render.apiKey,
+        workspaceId: render.workspaceId,
+        region: render.region,
+        plan: render.plan,
+        ttlSec: render.ttlSec,
+      }),
+      ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
+      store: renderBodies,
+      snapshots:
+        config.snapshotStore === "s3" && config.s3Bucket
+          ? createS3SnapshotStore({
+              bucket: config.s3Bucket,
+              prefix: `${config.s3Prefix ?? ""}render-home`,
+              ...(config.s3Region ? { region: config.s3Region } : {}),
+            })
+          : createLocalSnapshotStore(join(config.dataDir, "render-home")),
+      advisoryLock,
+      extraTools: deploymentLayer.advertisedTools,
+      credentialPaths: deploymentLayer.credentialPaths,
+      layerToolFiles: () => deploymentLayer.installFiles,
+      blobTransfer,
+      ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+      ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
+      ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+      onError: sandboxOnError,
+    });
+  };
   const buildBackend: Record<Config["sandboxBackend"], () => Sandbox> = {
     local: buildLocal,
     sprites: buildSprites,
@@ -907,6 +944,7 @@ export function buildApp(
     aws: buildAws,
     porter: buildPorter,
     agent37: buildAgent37,
+    render: buildRender,
   };
   const enabledBackends = new Set(enabledSandboxBackends(config));
   const sandboxBackends: Partial<Record<SandboxBackendName, Sandbox>> = {
@@ -921,11 +959,17 @@ export function buildApp(
     rollout: artifactMap<SandboxResourceRollout>("sandbox_resource_rollout"),
     legacyScopes: async () => (await sessions.distinctScopes()).map((scope) => scope.scopeId),
     legacySandboxes: async () => {
-      const [e2b, modal, aws] = await Promise.all([e2bBodies.entries(), modalBodies.entries(), awsBodies.entries()]);
+      const [e2b, modal, aws, render] = await Promise.all([
+        e2bBodies.entries(),
+        modalBodies.entries(),
+        awsBodies.entries(),
+        renderBodies.entries(),
+      ]);
       return [
         ...e2b.map(([scopeId, body]) => ({ scopeId, backend: "e2b" as const, machineId: body.sandboxId })),
         ...modal.map(([scopeId, body]) => ({ scopeId, backend: "modal" as const, machineId: body.sandboxId })),
         ...aws.map(([scopeId, body]) => ({ scopeId, backend: "aws" as const, machineId: body.microvmId })),
+        ...render.map(([scopeId, body]) => ({ scopeId, backend: "render" as const, machineId: body.sandboxId })),
       ];
     },
     records: artifactMap<SandboxResource>("sandbox_resources"),

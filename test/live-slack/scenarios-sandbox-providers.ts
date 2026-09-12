@@ -13,6 +13,7 @@ const providerCoverage: Record<SandboxBackendName, true> = {
   modal: true,
   porter: true,
   agent37: true,
+  render: true,
 };
 
 export const sandboxProviders = Object.keys(providerCoverage) as SandboxBackendName[];

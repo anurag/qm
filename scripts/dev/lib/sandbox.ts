@@ -7,7 +7,7 @@ import { ensureDockerDaemon } from "./postgres.ts";
 import { bestEffortValue, sleep } from "./util.ts";
 
 export interface SandboxResolution {
-  backend: "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37";
+  backend: "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "render";
   env: Record<string, string>;
   detail: string;
   publicApiUrl: string | null;
@@ -24,7 +24,7 @@ async function localImagePresent(image: string): Promise<boolean> {
 
 export async function resolveSandbox(opts: {
   worktree: string;
-  requested: "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "auto";
+  requested: "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "render" | "auto";
   corePort: number;
   lock: string;
   baseEnv: Record<string, string>;
@@ -61,6 +61,26 @@ export async function resolveSandbox(opts: {
       publicApiUrl,
       warnings,
     };
+  }
+
+  if (backend === "render") {
+    const apiKey = opts.baseEnv.RENDER_API_KEY;
+    const workspaceId = opts.baseEnv.RENDER_WORKSPACE_ID;
+    if (!apiKey || !workspaceId) {
+      throw new Error("--sandbox render requires RENDER_API_KEY and RENDER_WORKSPACE_ID in the environment");
+    }
+    const publicApiUrl = opts.baseEnv.PUBLIC_API_URL || (await startQuickTunnel(opts.corePort, opts.lock, opts.log));
+    if (!publicApiUrl) throw new Error("Render sandbox requires a reachable PUBLIC_API_URL; the tunnel failed");
+    const env: Record<string, string> = {
+      SANDBOX_BACKEND: "render",
+      RENDER_API_KEY: apiKey,
+      RENDER_WORKSPACE_ID: workspaceId,
+      PUBLIC_API_URL: publicApiUrl,
+    };
+    for (const key of ["RENDER_REGION", "RENDER_SANDBOX_PLAN", "RENDER_SANDBOX_TTL_SEC"]) {
+      if (opts.baseEnv[key]) env[key] = opts.baseEnv[key];
+    }
+    return { backend: "render", env, detail: "Render Sandboxes", publicApiUrl, warnings };
   }
 
   if (backend === "e2b") {
