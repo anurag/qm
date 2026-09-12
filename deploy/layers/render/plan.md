@@ -468,13 +468,19 @@ version)` returns an endpoint (`host`, `port`, `tls`, `publicUrl`), plus `destro
 platform scales to zero and where `DATA_DIR` lives. Apps are private by default and served
 signed-in through the portal at `/d/<app>/`; a wildcard `DEPLOY_APPS_DOMAIN` you control
 upgrades them to per-app origins (shared platform suffixes such as `onrender.com` are
-rejected on purpose).
+rejected on purpose). In every provider the body's own address — a flycast host on Fly,
+the sandbox-ingress host on Porter, a loopback port on Docker — is only the upstream core
+dials from its `/d/` route; `DeployEndpoint.publicUrl` plays no part in routing, and
+Porter's `PORTER_DEPLOY_VISIBILITY=public` is documented as bypassing qm's gate for exactly
+that reason. Each app also runs in its own body, not in the publisher's agent sandbox.
 
 Render has no primitive that fits this exactly yet:
 
-- **Sandboxes with inbound ports** would make it a 250-line provider identical in shape to
-  `src/deploy/porter-deploy-provider.ts` (Porter's sandboxes expose a port and a host, and
-  Render's do not, per the current API).
+- **A sandbox address core can dial** — a hostname and port for a process listening inside
+  a sandbox, reachable from core; the private network is sufficient, and public ingress is
+  neither required nor wanted as the user-facing URL. With it, the provider is a 250-line
+  sibling of `src/deploy/porter-deploy-provider.ts` (Porter's sandboxes expose a port and
+  a host; Render's do not, per the current API).
 - **Real Render services** are the most native answer (autoscaling, custom domains, logs,
   zero-downtime), but a build source is git- or image-based, so qm would push each app's
   repository (it already keeps one per app in `deploy-git-store.ts`) to a git host and
@@ -485,8 +491,8 @@ Render has no primitive that fits this exactly yet:
   make the second option work for every app.
 
 Recommendation: do not block Phases 1–2 on this. Spike the "promote to a Render service"
-flow now; ship the default provider when either sandboxes expose ports or archive builds
-exist.
+flow now; ship the default provider when either a sandbox's port becomes dialable from
+core or archive builds exist.
 
 ## 7. Operating qm on Render
 
@@ -521,9 +527,12 @@ Ordered by how much each unlocks for qm (and, by extension, any agent harness wi
 per-user computer):
 
 1. Domain or host allow rules on `sandboxNetworkPolicy`, applied at create time.
-2. Sandbox access to the workspace private network (outbound is enough; inbound is better).
-3. Inbound port and hostname exposure for sandboxes, which unlocks `DEPLOY_PROVIDER=render`
-   almost for free.
+2. Sandbox access to the workspace private network in both directions: outbound from the
+   sandbox, so `PUBLIC_API_URL` and the egress proxy can be Private Services (Phase 1);
+   and inbound to a port a sandbox listens on (Phase 3).
+3. A dialable address for that inbound case — a hostname and port core can reach, private
+   is enough — which unlocks `DEPLOY_PROVIDER=render` almost for free. qm fronts every app
+   through its own gateway, so per-sandbox public URLs are not the ask.
 4. Snapshot lifetime control (pin or extend `expiresAt`), plus names or labels on
    sandboxes for operator recognition.
 5. S3-compatible credentials for Object Storage, so the existing AWS-SDK-based stores work
