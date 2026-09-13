@@ -263,6 +263,11 @@ function requireSecrets(ctx: DeployContext, values: ReadonlyMap<string, string>)
       `Required secrets are missing: ${missing.map((secret) => secret.name).join(", ")}; run qm setup`,
     );
 }
+async function requestArray<T>(request: RenderRequest, path: string): Promise<T[]> {
+  const page = (await request<unknown>(path)) ?? [];
+  if (!Array.isArray(page)) throw new CliError(`Render GET ${path.split("?")[0]} returned an invalid list response`);
+  return page as T[];
+}
 async function list<T>(request: RenderRequest, path: string, key: string): Promise<T[]> {
   const out: T[] = [];
   const seen = new Set<string>();
@@ -271,7 +276,7 @@ async function list<T>(request: RenderRequest, path: string, key: string): Promi
     const url = new URL(path, "https://api.render.com");
     url.searchParams.set("limit", "100");
     if (cursor) url.searchParams.set("cursor", cursor);
-    const page = await request<Array<Record<string, unknown>>>(`${url.pathname}${url.search}`);
+    const page = await requestArray<Record<string, unknown>>(request, `${url.pathname}${url.search}`);
     out.push(...page.map((item) => item[key] as T));
     if (page.length < 100) return out;
     const next = page.at(-1)?.cursor;
@@ -463,7 +468,7 @@ async function waitDeploy(
   await poll(service.name, async () => {
     const deploy = id
       ? await request<RenderDeploy>(`/services/${service.id}/deploys/${id}`)
-      : (await request<Array<{ deploy: RenderDeploy }>>(`/services/${service.id}/deploys?limit=1`))[0]?.deploy;
+      : (await requestArray<{ deploy: RenderDeploy }>(request, `/services/${service.id}/deploys?limit=1`))[0]?.deploy;
     if (!deploy || deploy.id === previousId) return false;
     id = deploy.id;
     if (failedDeployStatuses.includes(deploy.status))
@@ -780,7 +785,7 @@ async function reconcileWorkflow(
   const path = `/workflowversions?${new URLSearchParams({ workflowId: workflow.id, limit: "1" })}`;
   if (state.workflowBootstrap && !state.workflowBootstrap.drained) {
     await poll(`${workflow.name} bootstrap`, async () => {
-      const version = (await request<Array<{ workflowVersion: { id: string; status: string } }>>(path))[0]
+      const version = (await requestArray<{ workflowVersion: { id: string; status: string } }>(request, path))[0]
         ?.workflowVersion;
       return !!version && ["ready", "build_failed", "registration_failed"].includes(version.status);
     });
@@ -789,12 +794,12 @@ async function reconcileWorkflow(
   }
   await request(`/workflows/${workflow.id}`, "PATCH", { buildConfig, runCommand, autoDeployTrigger: "off" });
   await request(`/services/${workflow.id}/env-vars`, "PUT", pairs(workerEnv));
-  const previous = (await request<Array<{ workflowVersion: { id: string; status: string } }>>(path))[0]
+  const previous = (await requestArray<{ workflowVersion: { id: string; status: string } }>(request, path))[0]
     ?.workflowVersion;
   await request("/workflowversions", "POST", { workflowId: workflow.id, commit: state.sourceCommit });
   let versionId: string | undefined;
   await poll(`${workflow.name} workflow`, async () => {
-    const version = (await request<Array<{ workflowVersion: { id: string; status: string } }>>(path))[0]
+    const version = (await requestArray<{ workflowVersion: { id: string; status: string } }>(request, path))[0]
       ?.workflowVersion;
     if (!version || version.id === previous?.id) return false;
     if (["build_failed", "registration_failed"].includes(version.status))
@@ -1248,7 +1253,10 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             await envVars(request, service.id),
           );
           const latest = (
-            await request<Array<{ deploy: { id: string; status: string } }>>(`/services/${service.id}/deploys?limit=1`)
+            await requestArray<{ deploy: { id: string; status: string } }>(
+              request,
+              `/services/${service.id}/deploys?limit=1`,
+            )
           )[0]?.deploy;
           if (
             changed ||
@@ -1292,8 +1300,9 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         const release: Record<string, string> = {};
         for (const workload of desired.filter((item) => !item.diskSizeGB)) {
           const service = services.get(workload.name)!;
-          const current = (await request<Array<{ deploy: RenderDeploy }>>(`/services/${service.id}/deploys?limit=1`))[0]
-            ?.deploy;
+          const current = (
+            await requestArray<{ deploy: RenderDeploy }>(request, `/services/${service.id}/deploys?limit=1`)
+          )[0]?.deploy;
           if (!current || current.status !== "live") throw new CliError(`${workload.name} has no live deployment`);
           release[workload.name] = current.id;
         }
@@ -1324,7 +1333,10 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       if (bound.workflow) note(`workflow: ${bound.workflow.slug} (${bound.workflow.id})`);
       if (bound.postgres) note(`postgres: ${bound.postgres.status} (${bound.postgres.id})`);
       for (const [name, service] of bound.services) {
-        const recent = await request<Array<{ deploy: { status: string } }>>(`/services/${service.id}/deploys?limit=1`);
+        const recent = await requestArray<{ deploy: { status: string } }>(
+          request,
+          `/services/${service.id}/deploys?limit=1`,
+        );
         note(
           `${name}: ${service.suspended}, ${recent[0]?.deploy.status ?? "no deploy"} (${service.id}) ${service.serviceDetails.url}`,
         );

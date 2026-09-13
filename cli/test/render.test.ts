@@ -383,6 +383,50 @@ function cloud(t: TestContext, d: Deployment) {
   });
   return state;
 }
+
+test("Render accepts null empty lists for projects, Postgres, services, and workflows", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  const resources = new Set(["/projects", "/postgres", "/services", "/workflows"]);
+  const received = new Set<string>();
+  c.intercept = ({ path, method }) => {
+    if (method !== "GET" || !resources.has(path)) return undefined;
+    received.add(path);
+    return Response.json(null);
+  };
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(received, resources);
+  assert.equal(c.projects.size, 1);
+  assert.ok(c.database);
+  assert.equal(c.services.size, 3);
+  assert.ok(c.workflow);
+});
+
+for (const path of ["/projects", "/postgres", "/services", "/workflows"]) {
+  test(`Render rejects a non-array ${path} list with a clear error`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    c.intercept = (call) =>
+      call.path === path && call.method === "GET" ? Response.json({ unexpected: true }) : undefined;
+    await assert.rejects(d.backend.up({ dryRun: false }), {
+      message: `Render GET ${path} returned an invalid list response`,
+    });
+  });
+}
+
+test("Render waits for a workflow version when its initial list is null", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  let initial = true;
+  c.intercept = ({ path, method }) => {
+    if (path !== "/workflowversions" || method !== "GET" || !initial) return undefined;
+    initial = false;
+    return Response.json(null);
+  };
+  await d.backend.up({ dryRun: false });
+  assert.equal(initial, false);
+  assert.ok(d.saved().releaseWorkflowTaskId);
+});
 const writes = (calls: Call[]) =>
   calls.filter((call) => call.url.origin === "https://api.render.com" && call.method !== "GET");
 

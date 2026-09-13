@@ -5,7 +5,7 @@ import type { DurableMap } from "../persistence/durable-map.ts";
 
 const PRINCIPAL_PREFIX = "render-deploy:";
 
-export interface RenderDeployArtifactAccess {
+interface RenderDeployArtifactAccess {
   url: string;
   token: string;
   commit: string;

@@ -11,7 +11,7 @@ import { createRenderAppNetwork } from "./render-app-network.ts";
 
 const FAILED = new Set(["build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"]);
 const OWNER_MARKER = "QM_DEPLOYMENT_ID";
-export const RENDER_APP_AUTH_HEADER = "x-qm-render-app-token";
+const RENDER_APP_AUTH_HEADER = "x-qm-render-app-token";
 
 interface Service {
   id: string;
