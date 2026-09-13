@@ -787,7 +787,7 @@ async function reconcileWorkflow(
     await poll(`${workflow.name} bootstrap`, async () => {
       const version = (await requestArray<{ workflowVersion: { id: string; status: string } }>(request, path))[0]
         ?.workflowVersion;
-      return !!version && ["ready", "build_failed", "registration_failed"].includes(version.status);
+      return !version || ["ready", "build_failed", "registration_failed"].includes(version.status);
     });
     state.workflowBootstrap.drained = true;
     saveState(ctx, state);

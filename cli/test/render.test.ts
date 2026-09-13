@@ -145,7 +145,7 @@ function cloud(t: TestContext, d: Deployment) {
       state.workflowEnv = Object.fromEntries(
         body.envVars.map((pair: { key: string; value: string }) => [pair.key, pair.value]),
       );
-      state.workflowVersion = { id: `wfv-${++state.next}`, status: "ready" };
+      state.workflowVersion = undefined;
       return Response.json(state.workflow);
     }
     if (path === "/workflows/wfl-acme") {
@@ -188,7 +188,7 @@ function cloud(t: TestContext, d: Deployment) {
         state.workflowVersion = { id: `wfv-${++state.next}`, status: "ready" };
         return empty();
       }
-      return Response.json(state.workflowVersion ? [{ workflowVersion: state.workflowVersion }] : []);
+      return Response.json(state.workflowVersion ? [{ workflowVersion: state.workflowVersion }] : null);
     }
 
     if (path === "/projects") {
@@ -414,18 +414,23 @@ for (const path of ["/projects", "/postgres", "/services", "/workflows"]) {
   });
 }
 
-test("Render waits for a workflow version when its initial list is null", async (t) => {
+test("Render creates the first pinned workflow version when automatic deployment is off", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
-  let initial = true;
-  c.intercept = ({ path, method }) => {
-    if (path !== "/workflowversions" || method !== "GET" || !initial) return undefined;
-    initial = false;
-    return Response.json(null);
+  let emptyReads = 0;
+  c.intercept = ({ path, method, body }) => {
+    if (path === "/workflowversions" && method === "GET" && !c.workflowVersion) emptyReads++;
+    if (path === "/workflowversions" && method === "POST") {
+      assert.equal(c.workflowVersion, undefined);
+      assert.deepEqual(body, { workflowId: "wfl-acme", commit: "a".repeat(40) });
+    }
+    return undefined;
   };
   await d.backend.up({ dryRun: false });
-  assert.equal(initial, false);
+  assert.equal(emptyReads, 2);
+  assert.equal(c.calls.filter((call) => call.path === "/workflowversions" && call.method === "POST").length, 1);
   assert.ok(d.saved().releaseWorkflowTaskId);
+  assert.equal(d.saved().workflowBootstrap, undefined);
 });
 
 test("Render accepts a successful workflow attachment when GET omits its environment", async (t) => {
@@ -1326,7 +1331,7 @@ test("Render waits for the initial workflow registration to fail before adding c
     if (path === "/workflowversions" && method === "GET" && reads < 2) {
       assert.deepEqual(c.workflowEnv, { NODE_VERSION: "24.18.0" });
       const status = ++reads === 1 ? "registration_in_progress" : "registration_failed";
-      return Response.json([{ workflowVersion: { ...c.workflowVersion, status } }]);
+      return Response.json([{ workflowVersion: { id: "wfv-bootstrap", status } }]);
     }
     if (path === "/services/wfl-acme/env-vars") assert.equal(reads, 2);
     return undefined;

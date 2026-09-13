@@ -28,8 +28,10 @@ portal use their existing Dockerfiles. MinIO uses
 are not supported. Automatic deploys are off so `qm up` controls the update order.
 Render starts an initial build when a service is created or resumed. The CLI
 uses a command that exits and supplies no credentials until this build stops.
-It uses the same process for the initial Workflow registration, then deploys
-the selected commit with the runtime credentials.
+Workflow creation starts no version when automatic deploys are off. The CLI
+completes the safe setup, then registers the selected commit with the runtime
+credentials. If a Workflow version already exists during this setup, the CLI
+waits for its build and registration to finish before it adds credentials.
 
 The CLI initializes MinIO before it deploys the Workflow and core. The CLI resolves the branch once and pins the service builds and Workflow version
 to that commit. Each routine update builds the diskless services. It retains MinIO without a redeploy when the
