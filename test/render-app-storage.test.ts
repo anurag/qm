@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
 import { test } from "node:test";
+import { S3Client, UploadPartCommand } from "@aws-sdk/client-s3";
 import {
   createRenderAppStorage,
   renderAppStoragePolicy,
@@ -47,6 +53,7 @@ test("Render app storage keeps credentials through archive and restore and only 
   const id = randomUUID();
   const first = await storage.ensure(id);
   assert.equal(first.S3_PREFIX, `app-data/${id}/`);
+  assert.equal(first.AWS_REQUEST_CHECKSUM_CALCULATION, "WHEN_REQUIRED");
   assert.equal(JSON.stringify(await store.get(id)).includes(first.AWS_SECRET_ACCESS_KEY!), false);
   assert.deepEqual(await createRenderAppStorage(opts).ensure(id), first);
   assert.equal(calls.filter((call) => call.method === "POST").length, 1);
@@ -58,6 +65,82 @@ test("Render app storage keeps credentials through archive and restore and only 
   const another = await storage.ensure(randomUUID());
   assert.notEqual(another.AWS_ACCESS_KEY_ID, first.AWS_ACCESS_KEY_ID);
   assert.notEqual(another.S3_PREFIX, first.S3_PREFIX);
+});
+
+test("Render app storage settings send S3 stream bytes without checksum trailers", async () => {
+  const storage = createRenderAppStorage({
+    apiKey: "key",
+    workspaceId: "tea-test",
+    environmentId: "env-test",
+    minioServiceId: "srv-minio",
+    endpoint: "https://minio.example.test",
+    bucket: "qm-storage",
+    store: createMemoryMap<StoredRenderAppStorage>(),
+    keyMaterial: "test-key",
+    api: {
+      async request<T>(method: string, path: string): Promise<T> {
+        if (path === "/services/srv-minio")
+          return { ownerId: "tea-test", environmentId: "env-test", type: "web_service" } as T;
+        return (method === "POST" ? { id: "job-test" } : { status: "succeeded" }) as T;
+      },
+    },
+  });
+  const env = await storage.ensure(randomUUID());
+  const directory = await mkdtemp(join(tmpdir(), "qm-render-s3-"));
+  const file = join(directory, "part");
+  const input = Buffer.from("Render streamed object bytes\n".repeat(1024));
+  const previous = process.env.AWS_REQUEST_CHECKSUM_CALCULATION;
+  try {
+    await writeFile(file, input);
+    const requests: Array<{ headers: Record<string, string>; bytes: Buffer }> = [];
+    for (const checksum of ["WHEN_SUPPORTED", env.AWS_REQUEST_CHECKSUM_CALCULATION!]) {
+      process.env.AWS_REQUEST_CHECKSUM_CALCULATION = checksum;
+      const client = new S3Client({
+        endpoint: env.AWS_ENDPOINT_URL_S3,
+        region: env.AWS_REGION,
+        forcePathStyle: true,
+        credentials: { accessKeyId: env.AWS_ACCESS_KEY_ID!, secretAccessKey: env.AWS_SECRET_ACCESS_KEY! },
+        maxAttempts: 1,
+        requestHandler: {
+          async handle(request: { headers: Record<string, string>; body: AsyncIterable<Uint8Array> }) {
+            const chunks: Buffer[] = [];
+            for await (const chunk of request.body) chunks.push(Buffer.from(chunk));
+            requests.push({ headers: request.headers, bytes: Buffer.concat(chunks) });
+            return { response: { statusCode: 200, headers: { etag: '"part"' }, body: Readable.from([]) } };
+          },
+        },
+      });
+      const body = createReadStream(file);
+      try {
+        await client.send(
+          new UploadPartCommand({
+            Bucket: env.S3_BUCKET,
+            Key: env.S3_PREFIX + "part",
+            UploadId: "test-upload",
+            PartNumber: 1,
+            Body: body,
+            ContentLength: input.length,
+          }),
+        );
+      } finally {
+        body.destroy();
+        client.destroy();
+      }
+    }
+    const [defaultRequest, renderRequest] = requests;
+    assert.equal(defaultRequest!.headers["content-encoding"], "aws-chunked");
+    assert.equal(defaultRequest!.headers["x-amz-trailer"], "x-amz-checksum-crc32");
+    assert.notDeepEqual(defaultRequest!.bytes, input);
+    assert.equal(renderRequest!.headers["content-length"], String(input.length));
+    assert.equal(renderRequest!.headers["content-encoding"], undefined);
+    assert.equal(renderRequest!.headers["transfer-encoding"], undefined);
+    assert.equal(renderRequest!.headers["x-amz-trailer"], undefined);
+    assert.deepEqual(renderRequest!.bytes, input);
+  } finally {
+    if (previous === undefined) delete process.env.AWS_REQUEST_CHECKSUM_CALCULATION;
+    else process.env.AWS_REQUEST_CHECKSUM_CALCULATION = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("Failed Render storage transitions retain intent so cleanup and retry repair the actual account", async () => {

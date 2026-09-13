@@ -231,6 +231,7 @@ run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(
         AWS_SECRET_ACCESS_KEY: decryptSecret(record.secretKeyEnc, key),
         AWS_REGION: opts.region ?? "us-east-1",
         AWS_ENDPOINT_URL_S3: endpoint.toString(),
+        AWS_REQUEST_CHECKSUM_CALCULATION: "WHEN_REQUIRED",
         S3_FORCE_PATH_STYLE: "true",
         S3_BUCKET: opts.bucket,
         S3_PREFIX: prefixFor(deploymentId),

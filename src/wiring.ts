@@ -721,6 +721,7 @@ export function buildApp(
     ...(config.s3Region ? { region: config.s3Region } : {}),
     ...(config.s3Endpoint ? { endpoint: config.s3Endpoint } : {}),
     forcePathStyle: config.s3ForcePathStyle,
+    ...(renderSelected ? { requestChecksumCalculation: "WHEN_REQUIRED" as const } : {}),
   });
   const workspace = renderSelected
     ? createRenderWorkspaceStore(config.dataDir, config.databaseUrl!)
