@@ -62,7 +62,9 @@ a shared lock and retains existing entries. It does not add a public catch-all
 rule. Keep database credentials on the server and do not disable TLS checks.
 
 Core applies QM access checks before it sends authenticated requests over HTTPS
-to the owner's gateway. The gateway routes them to private apps and does not run
+to the owner's gateway. Each app route requires its own token and app ID. The
+gateway removes these headers before it forwards the request. App tokens cannot
+authorize other apps or the gateway's control endpoint. The gateway does not run
 app code. Anyone with write access to an app can run code on its owner's private
 network and reach that owner's other apps. Treat all app editors in an owner
 scope as trusted with every app in that scope. Read-only shares still use core

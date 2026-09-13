@@ -177,6 +177,8 @@ Sandboxes when an agent needs one. The CLI supplies `RENDER_PROJECT_ID` to core.
 Published apps for each owner scope use a separate isolated environment in that
 project, with private app services and a trusted gateway that runs stock Caddy.
 Core applies QM access checks before it routes requests through that gateway.
+Each app has a distinct gateway token. The gateway checks the app ID and token,
+then removes both headers before it forwards the request to the app.
 Anyone with write access to an app can run code on its owner's private network
 and reach that owner's other apps. Treat all app editors in an owner scope as
 trusted with every app in that scope. Read-only shares still use core access

@@ -166,7 +166,10 @@ these, not through them.
   Render creates a separate isolated environment for each app owner scope. Its
   private app services cannot connect directly to another owner's private apps
   or QM's shared services over the private network. Core checks access before
-  it sends authenticated HTTPS requests through the owner's Caddy gateway.
+  it sends HTTPS requests through the owner's Caddy gateway with an app-specific
+  token. The gateway checks both the app ID and token and removes them before it
+  forwards the request. App tokens cannot authorize other apps or gateway control
+  requests.
   Apps within the same owner scope can still connect directly to each other.
   Anyone with write access to an app can run code in that environment, so all
   app editors in an owner scope must be trusted with every app in that scope.

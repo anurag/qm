@@ -162,9 +162,14 @@ cannot use the Render private network to reach the shared stack or another
 owner's environment.
 
 The gateway runs the stock Caddy image with a configuration that core controls.
-Core applies the existing QM access checks, then sends authenticated requests
-over HTTPS to the owner's gateway. The gateway routes them to that owner's
-private apps. It does not run app code. Anyone with write access to an app can
+Core applies the existing QM access checks, then sends the app ID and that app's
+token over HTTPS to the owner's gateway. The gateway requires both values to
+match one app route and removes them before it forwards the request. An app token
+cannot authorize another app or read the gateway's control endpoint. The control
+endpoint uses a separate owner token. These internal app tokens have no time-based
+expiry and remain stable across restart and redeploy. Removing the route blocks
+access; restoring the same app under the same owner restores the same token.
+The gateway does not run app code. Anyone with write access to an app can
 run code on its owner's private network and reach that owner's other apps.
 Treat all app editors in an owner scope as trusted with every app in that scope.
 Read-only shares still use core access checks. Ownership transfers retain the

@@ -123,7 +123,9 @@ The CLI supplies the project ID to core as `RENDER_PROJECT_ID`. Core creates an
 isolated environment for each app owner scope in that project. Private apps for
 one owner share that environment with a trusted gateway that runs stock Caddy.
 Core, Postgres, and MinIO stay in `production`. App traffic passes through QM's
-access checks and the owner's gateway. Anyone with write access to an app can
+access checks and the owner's gateway. Each app route requires its own token
+and app ID; the gateway removes both headers before it forwards the request.
+Anyone with write access to an app can
 run code on its owner's private network and reach that owner's other apps.
 Treat all app editors in an owner scope as trusted with every app in that scope.
 Read-only shares still use core access checks. Ownership transfers retain the

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 export const RENDER_GATEWAY_IMAGE =
   "docker.io/library/caddy@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648";
@@ -7,6 +7,21 @@ export const RENDER_GATEWAY_COMMAND =
 export const RENDER_GATEWAY_AUTH_HEADER = "X-Qm-Gateway-Token";
 export const RENDER_GATEWAY_APP_HEADER = "X-Qm-App-Id";
 
+function gatewayTokenBytes(token: string): Buffer {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token) || Buffer.from(token, "base64url").toString("base64url") !== token) {
+    throw new Error("Render gateway token must contain 32 bytes encoded as base64url");
+  }
+  return Buffer.from(token, "base64url");
+}
+
+export function renderGatewayAppToken(ownerToken: string, appId: string): string {
+  const key = gatewayTokenBytes(ownerToken);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(appId)) {
+    throw new Error("Render gateway app ID must be a UUID");
+  }
+  return createHmac("sha256", key).update(`qm-render-app\0${appId}`).digest("base64url");
+}
+
 export function renderGatewayConfigHash(token: string, routes: Record<string, { host: string; port: number }>): string {
   return createHash("sha256")
     .update(
@@ -14,22 +29,18 @@ export function renderGatewayConfigHash(token: string, routes: Record<string, { 
         token,
         Object.entries(routes)
           .sort(([a], [b]) => a.localeCompare(b))
-          .map(([id, { host, port }]) => [id, host, port]),
+          .map(([id, { host, port }]) => [id, host, port, renderGatewayAppToken(token, id)]),
       ]),
     )
     .digest("hex");
 }
 
 export function renderGatewayConfig(token: string, routes: Record<string, { host: string; port: number }>): string {
-  if (!/^[A-Za-z0-9_-]{43}$/.test(token) || Buffer.from(token, "base64url").toString("base64url") !== token) {
-    throw new Error("Render gateway token must contain 32 bytes encoded as base64url");
-  }
+  gatewayTokenBytes(token);
   const appRoutes = Object.entries(routes)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([appId, { host, port }]) => {
-      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(appId)) {
-        throw new Error("Render gateway app ID must be a UUID");
-      }
+      const appToken = renderGatewayAppToken(token, appId);
       if (
         host.length > 253 ||
         !host.split(".").every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) ||
@@ -39,7 +50,11 @@ export function renderGatewayConfig(token: string, routes: Record<string, { host
       }
       if (port !== 8080) throw new Error("Render gateway upstream port must be 8080");
       return {
-        match: [{ vars: { [`{http.request.header.${RENDER_GATEWAY_APP_HEADER}}`]: [appId] } }],
+        match: [
+          {
+            expression: `{http.request.header.${RENDER_GATEWAY_APP_HEADER}} == ${JSON.stringify(appId)} && {http.request.header.${RENDER_GATEWAY_AUTH_HEADER}} == ${JSON.stringify(appToken)}`,
+          },
+        ],
         handle: [
           { handler: "log_append", key: "app_id", value: appId },
           {
@@ -88,12 +103,13 @@ export function renderGatewayConfig(token: string, routes: Record<string, { host
                 terminal: true,
               },
               {
-                match: [{ not: [{ vars: { [`{http.request.header.${RENDER_GATEWAY_AUTH_HEADER}}`]: [token] } }] }],
-                handle: [forbidden],
-                terminal: true,
-              },
-              {
-                match: [{ path: ["/__qm_gateway_config"], header: { [RENDER_GATEWAY_APP_HEADER]: null } }],
+                match: [
+                  {
+                    path: ["/__qm_gateway_config"],
+                    header: { [RENDER_GATEWAY_APP_HEADER]: null },
+                    vars: { [`{http.request.header.${RENDER_GATEWAY_AUTH_HEADER}}`]: [token] },
+                  },
+                ],
                 handle: [
                   { handler: "static_response", status_code: 200, body: renderGatewayConfigHash(token, routes) },
                 ],

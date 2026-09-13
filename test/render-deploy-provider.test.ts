@@ -21,7 +21,11 @@ import { scopeId } from "../src/types.ts";
 import { fetch as undiciFetch, getGlobalDispatcher, MockAgent, setGlobalDispatcher } from "undici";
 import { createFakeRenderGateways } from "./support/fake-render-gateways.ts";
 import { createRenderDeployGateways, type StoredRenderGateway } from "../src/deploy/render-deploy-gateways.ts";
-import { RENDER_GATEWAY_APP_HEADER, RENDER_GATEWAY_AUTH_HEADER } from "../src/deploy/render-caddy.ts";
+import {
+  RENDER_GATEWAY_APP_HEADER,
+  RENDER_GATEWAY_AUTH_HEADER,
+  renderGatewayAppToken,
+} from "../src/deploy/render-caddy.ts";
 
 const ID = "550e8400-e29b-41d4-a716-446655440000";
 const WORKSPACE = "tea-qm";
@@ -330,7 +334,10 @@ function fakeRender(
     endpoint: () => {
       const gatewayService = [...gateway.services.values()][0]!;
       const config = JSON.parse(gateway.configs.get(gatewayService.id)!);
-      const token = (Object.values(config.apps.http.servers.gateway.routes[1].match[0].not[0].vars)[0] as string[])[0]!;
+      const control = config.apps.http.servers.gateway.routes.find((route: { match?: Array<{ path?: string[] }> }) =>
+        route.match?.[0]?.path?.includes("/__qm_gateway_config"),
+      );
+      const token = renderGatewayAppToken((Object.values(control.match[0].vars)[0] as string[])[0]!, ID);
       return {
         host: new URL(gatewayService.serviceDetails.url).hostname,
         port: 443,

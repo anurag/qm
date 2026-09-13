@@ -9,6 +9,7 @@ import {
   RENDER_GATEWAY_APP_HEADER,
   renderGatewayConfig,
   renderGatewayConfigHash,
+  renderGatewayAppToken,
 } from "./render-caddy.ts";
 
 const CONFIG_FILE = "qm-render-gateway.json";
@@ -266,7 +267,7 @@ export function createRenderDeployGateways(opts: RenderDeployGatewaysOptions) {
     return ownedService(matches[0].service, record, deadline);
   }
 
-  function endpointOf(service: Service, record: StoredRenderGateway, appId: string): DeployEndpoint {
+  function gatewayUrl(service: Service): URL {
     const url = new URL(service.serviceDetails.url ?? "http://invalid");
     if (
       url.protocol !== "https:" ||
@@ -279,22 +280,27 @@ export function createRenderDeployGateways(opts: RenderDeployGatewaysOptions) {
       url.hash
     )
       throw new Error("Render gateway returned an invalid public address");
+    return url;
+  }
+
+  function endpointOf(service: Service, record: StoredRenderGateway, appId: string): DeployEndpoint {
+    const url = gatewayUrl(service);
     return {
       host: url.hostname,
       port: 443,
       tls: true,
       proxyHeaders: {
         connection: "close",
-        [RENDER_GATEWAY_AUTH_HEADER]: record.token,
+        [RENDER_GATEWAY_AUTH_HEADER]: renderGatewayAppToken(record.token, appId),
         [RENDER_GATEWAY_APP_HEADER]: appId,
       },
     };
   }
 
   async function configIsLive(service: Service, record: StoredRenderGateway, hash: string, deadline: number) {
-    const endpoint = endpointOf(service, record, "");
+    const url = gatewayUrl(service);
     try {
-      const response = await fetchImpl(`https://${endpoint.host}${CONFIG_PATH}`, {
+      const response = await fetchImpl(`https://${url.host}${CONFIG_PATH}`, {
         headers: { [RENDER_GATEWAY_AUTH_HEADER]: record.token },
         redirect: "error",
         signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, deadline - Date.now()))),
@@ -521,7 +527,8 @@ export function createRenderDeployGateways(opts: RenderDeployGatewaysOptions) {
       !record.gatewayServiceId ||
       !record.environmentId ||
       !record.appliedDeployId ||
-      record.appliedConfigHash !== record.desiredConfigHash
+      record.appliedConfigHash !== record.desiredConfigHash ||
+      record.desiredConfigHash !== renderGatewayConfigHash(record.token, record.routes)
     )
       return null;
     const deadline = deadlineOf();

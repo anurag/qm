@@ -1,4 +1,8 @@
-import { RENDER_GATEWAY_AUTH_HEADER, RENDER_GATEWAY_APP_HEADER } from "../../src/deploy/render-caddy.ts";
+import {
+  RENDER_GATEWAY_AUTH_HEADER,
+  RENDER_GATEWAY_APP_HEADER,
+  renderGatewayAppToken,
+} from "../../src/deploy/render-caddy.ts";
 
 export interface GatewayCall {
   method: string;
@@ -216,12 +220,24 @@ export function createFakeRenderGateways(
     if (!service || service.suspended === "suspended" || !controls.healthy)
       return new Response("Unavailable", { status: 503 });
     const config = JSON.parse(configs.get(service.id)!);
-    const token = Object.values(config.apps.http.servers.gateway.routes[1].match[0].not[0].vars)[0] as string[];
+    const routes = config.apps.http.servers.gateway.routes;
+    const control = routes.find((route: { match?: Array<{ path?: string[] }> }) =>
+      route.match?.[0]?.path?.includes("/__qm_gateway_config"),
+    );
+    const token = (Object.values(control.match[0].vars)[0] as string[])[0]!;
     const headers = new Headers(init?.headers);
-    if (headers.get(RENDER_GATEWAY_AUTH_HEADER) !== token[0]) return new Response("Forbidden", { status: 403 });
-    if (url.pathname === "/__qm_gateway_config" && !headers.has(RENDER_GATEWAY_APP_HEADER))
+    const appId = headers.get(RENDER_GATEWAY_APP_HEADER);
+    if (url.pathname === "/__qm_gateway_config" && appId === null && headers.get(RENDER_GATEWAY_AUTH_HEADER) === token)
       return new Response(controls.healthHash ?? liveHashes.get(service.id));
-    return new Response("OK");
+    if (
+      appId !== null &&
+      routes.some((route: { match?: Array<{ expression?: string }> }) =>
+        route.match?.[0]?.expression?.includes(JSON.stringify(appId)),
+      ) &&
+      headers.get(RENDER_GATEWAY_AUTH_HEADER) === renderGatewayAppToken(token, appId)
+    )
+      return new Response("OK");
+    return new Response("Forbidden", { status: 403 });
   };
 
   return {

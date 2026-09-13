@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import {
   RENDER_GATEWAY_AUTH_HEADER,
   RENDER_GATEWAY_COMMAND,
   RENDER_GATEWAY_IMAGE,
+  renderGatewayAppToken,
   renderGatewayConfig,
   renderGatewayConfigHash,
 } from "../src/deploy/render-caddy.ts";
@@ -20,13 +21,26 @@ const token = Buffer.alloc(32, 7).toString("base64url");
 const appId = "11111111-1111-4111-8111-111111111111";
 const secondAppId = "22222222-2222-4222-8222-222222222222";
 const routes = { [appId]: { host: "qm-upstream", port: 8080 } };
+const appToken = renderGatewayAppToken(token, appId);
+const secondAppToken = renderGatewayAppToken(token, secondAppId);
+
+test("Render app tokens are stable and specific to the owner secret and app ID", () => {
+  assert.equal(appToken, "TxY3GNRL3mOGDRvMLGazoJCwICJpqvNImTZzsukJn6U");
+  assert.equal(Buffer.from(appToken, "base64url").length, 32);
+  assert.equal(renderGatewayAppToken(token, appId), appToken);
+  assert.notEqual(appToken, secondAppToken);
+  assert.notEqual(appToken, token);
+  assert.notEqual(renderGatewayAppToken(Buffer.alloc(32, 8).toString("base64url"), appId), appToken);
+});
 
 test("Render gateway validates secrets and fixed route addresses before it creates Caddy config", () => {
   for (const invalid of ["", "short", `${token}=`, "a".repeat(43), `${token}\n`, `{env.SECRET}${token}`]) {
     assert.throws(() => renderGatewayConfig(invalid, routes), /token must contain 32 bytes/);
+    assert.throws(() => renderGatewayAppToken(invalid, appId), /token must contain 32 bytes/);
   }
   for (const id of ["", "app", `${appId}*`, `{env.APP_ID}`, `${appId}\n`, `other"${appId}`]) {
     assert.throws(() => renderGatewayConfig(token, { [id]: routes[appId]! }), /app ID must be a UUID/);
+    assert.throws(() => renderGatewayAppToken(token, id), /app ID must be a UUID/);
   }
   for (const host of [
     "",
@@ -68,6 +82,12 @@ test("Render gateway hashes route values in a stable order and detects all confi
     renderGatewayConfigHash(token, routes),
     renderGatewayConfigHash(token, { [appId]: { host: "qm-other", port: 8080 } }),
   );
+  assert.notEqual(
+    renderGatewayConfigHash(token, routes),
+    createHash("sha256")
+      .update(JSON.stringify([token, [[appId, "qm-upstream", 8080]]]))
+      .digest("hex"),
+  );
   assert.match(RENDER_GATEWAY_IMAGE, /^docker\.io\/library\/caddy@sha256:[0-9a-f]{64}$/);
 });
 
@@ -87,7 +107,7 @@ const server = createServer(async (req, res) => {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   res.writeHead(200, { "content-type": "application/json", "set-cookie": "app=response-cookie", "x-app-secret": process.env.TEST_SECRET });
-  res.end(JSON.stringify({ url: req.url, method: req.method, headers: req.headers, body: Buffer.concat(chunks).toString(), remotePort: req.socket.remotePort }));
+  res.end(JSON.stringify({ app: process.env.TEST_APP, url: req.url, method: req.method, headers: req.headers, body: Buffer.concat(chunks).toString(), remotePort: req.socket.remotePort }));
 });
 server.on("upgrade", (req, socket) => {
   const accept = createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
@@ -108,10 +128,13 @@ test(
   async () => {
     const name = `qm-caddy-test-${randomUUID()}`;
     const upstream = `${name}-upstream`;
+    const secondUpstream = `${name}-second`;
     const directory = mkdtempSync(join(tmpdir(), "qm-caddy-test-"));
     const configPath = join(directory, "gateway.json");
     const upstreamPath = join(directory, "upstream.mjs");
-    const auth = { [RENDER_GATEWAY_AUTH_HEADER]: token, [RENDER_GATEWAY_APP_HEADER]: appId };
+    const auth = { [RENDER_GATEWAY_AUTH_HEADER]: appToken, [RENDER_GATEWAY_APP_HEADER]: appId };
+    const secondAuth = { [RENDER_GATEWAY_AUTH_HEADER]: secondAppToken, [RENDER_GATEWAY_APP_HEADER]: secondAppId };
+    const liveRoutes = { ...routes, [secondAppId]: { host: "qm-second", port: 8080 } };
     const shellPrefix = "/bin/sh -c ";
     assert.ok(RENDER_GATEWAY_COMMAND.startsWith(shellPrefix));
     const invokeDocker = (args: string[]) => {
@@ -135,26 +158,33 @@ test(
         req.end();
       });
     try {
-      writeFileSync(configPath, renderGatewayConfig(token, routes));
+      writeFileSync(configPath, renderGatewayConfig(token, liveRoutes));
       writeFileSync(upstreamPath, upstreamSource);
       docker("network", "create", name);
-      docker(
-        "run",
-        "-d",
-        "--name",
-        upstream,
-        "--network",
-        name,
-        "--network-alias",
-        "qm-upstream",
-        "-e",
-        `TEST_SECRET=${token}`,
-        "-v",
-        `${upstreamPath}:/upstream.mjs:ro`,
-        "node:24-alpine",
-        "node",
-        "/upstream.mjs",
-      );
+      for (const [container, host, id, secret] of [
+        [upstream, "qm-upstream", appId, token],
+        [secondUpstream, "qm-second", secondAppId, secondAppToken],
+      ]) {
+        docker(
+          "run",
+          "-d",
+          "--name",
+          container!,
+          "--network",
+          name,
+          "--network-alias",
+          host!,
+          "-e",
+          `TEST_SECRET=${secret}`,
+          "-e",
+          `TEST_APP=${id}`,
+          "-v",
+          `${upstreamPath}:/upstream.mjs:ro`,
+          "node:24-alpine",
+          "node",
+          "/upstream.mjs",
+        );
+      }
       docker(
         "run",
         "--rm",
@@ -210,15 +240,26 @@ test(
       const config = await fetch(`${endpoint}/__qm_gateway_config`, {
         headers: { [RENDER_GATEWAY_AUTH_HEADER]: token },
       });
-      assert.equal(await config.text(), renderGatewayConfigHash(token, routes));
+      assert.equal(await config.text(), renderGatewayConfigHash(token, liveRoutes));
       assert.equal((await fetch(`${endpoint}/__qm_gateway_config`)).status, 403);
+      for (const secret of [appToken, secondAppToken]) {
+        assert.equal(
+          (await fetch(`${endpoint}/__qm_gateway_config`, { headers: { [RENDER_GATEWAY_AUTH_HEADER]: secret } }))
+            .status,
+          403,
+        );
+      }
       for (const headers of [
         {},
         { [RENDER_GATEWAY_APP_HEADER]: appId },
         { [RENDER_GATEWAY_AUTH_HEADER]: token },
+        { ...auth, [RENDER_GATEWAY_AUTH_HEADER]: token },
+        { ...secondAuth, [RENDER_GATEWAY_AUTH_HEADER]: token },
+        { ...auth, [RENDER_GATEWAY_AUTH_HEADER]: secondAppToken },
+        { ...secondAuth, [RENDER_GATEWAY_AUTH_HEADER]: appToken },
         { ...auth, [RENDER_GATEWAY_AUTH_HEADER]: "wrong" },
         { ...auth, [RENDER_GATEWAY_APP_HEADER]: randomUUID() },
-        { ...auth, [RENDER_GATEWAY_AUTH_HEADER]: `${token},${token}` },
+        { ...auth, [RENDER_GATEWAY_AUTH_HEADER]: `${appToken},${appToken}` },
         { ...auth, [RENDER_GATEWAY_APP_HEADER]: `${appId},${appId}` },
         { ...auth, [RENDER_GATEWAY_AUTH_HEADER]: "{env.TEST_SECRET}" },
         { ...auth, [RENDER_GATEWAY_APP_HEADER]: "http://qm-upstream:8080" },
@@ -226,7 +267,7 @@ test(
         assert.equal((await fetch(`${endpoint}/`, { headers })).status, 403);
       }
       for (const [field, value] of [
-        [RENDER_GATEWAY_AUTH_HEADER, token],
+        [RENDER_GATEWAY_AUTH_HEADER, appToken],
         [RENDER_GATEWAY_APP_HEADER, appId],
       ]) {
         for (const extra of [value!, "", "wrong"]) {
@@ -235,6 +276,28 @@ test(
             403,
           );
         }
+      }
+      for (const extra of [token, "", "wrong", appToken]) {
+        assert.equal(
+          await rawRequest(`${endpoint}/__qm_gateway_config`, [
+            RENDER_GATEWAY_AUTH_HEADER,
+            token,
+            RENDER_GATEWAY_AUTH_HEADER.toLowerCase(),
+            extra,
+          ]),
+          403,
+        );
+      }
+      for (const [headers, id] of [
+        [auth, appId],
+        [secondAuth, secondAppId],
+      ] as const) {
+        const response = await fetch(`${endpoint}/identity`, { headers });
+        assert.equal(response.status, 200);
+        const seen = (await response.json()) as { app: string; headers: Record<string, string> };
+        assert.equal(seen.app, id);
+        assert.equal(seen.headers[RENDER_GATEWAY_AUTH_HEADER.toLowerCase()], undefined);
+        assert.equal(seen.headers[RENDER_GATEWAY_APP_HEADER.toLowerCase()], undefined);
       }
       const ordinary = await fetch(`${endpoint}/nested/a%2Fb?x=one&x=two`, {
         method: "POST",
@@ -333,14 +396,20 @@ test(
       );
       const badResponse = await fetch(`${endpoint}/bad-response?secret=${token}`, { headers: auth });
       assert.equal(badResponse.status, 502);
+      assert.equal(
+        (await fetch(`${endpoint}/bad-response?secret=${secondAppToken}`, { headers: secondAuth })).status,
+        502,
+      );
       const admin = invokeDocker(["exec", name, "wget", "-q", "-O", "-", "http://127.0.0.1:2019/config/"]);
       assert.notEqual(admin.status, 0);
       assert.match(admin.stderr, /Connection refused/);
       docker("stop", "--time", "1", upstream);
-      assert.equal((await fetch(`${endpoint}/offline?secret=${token}`, { headers: auth })).status, 502);
+      assert.equal((await fetch(`${endpoint}/offline?secret=${appToken}`, { headers: auth })).status, 502);
       docker("stop", "--time", "1", name);
       const logs = docker("logs", name);
       assert.ok(!logs.includes(token), "The gateway secret must not occur in access or error logs");
+      assert.ok(!logs.includes(appToken), "The first app secret must not occur in access or error logs");
+      assert.ok(!logs.includes(secondAppToken), "The second app secret must not occur in access or error logs");
       assert.ok(!logs.includes("app-token"));
       assert.ok(!logs.includes("request-cookie"));
       const entries = logs
@@ -353,7 +422,7 @@ test(
       );
       assert.ok(entries.every((entry) => !entry.request && !entry.resp_headers));
     } finally {
-      invokeDocker(["rm", "-f", name, upstream]);
+      invokeDocker(["rm", "-f", name, upstream, secondUpstream]);
       invokeDocker(["network", "rm", name]);
       rmSync(directory, { recursive: true, force: true });
     }

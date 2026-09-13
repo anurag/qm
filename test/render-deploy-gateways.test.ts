@@ -8,6 +8,7 @@ import {
   RENDER_GATEWAY_AUTH_HEADER,
   RENDER_GATEWAY_APP_HEADER,
   renderGatewayConfigHash,
+  renderGatewayAppToken,
 } from "../src/deploy/render-caddy.ts";
 import { createFakeRenderGateways } from "./support/fake-render-gateways.ts";
 
@@ -58,6 +59,8 @@ test("gateway shares its service across the owner's apps and separates other own
   const other = await f.gateway.upsert(OTHER, APP, UPSTREAM);
   assert.equal(first.host, second.host);
   assert.notEqual(first.host, other.host);
+  assert.notEqual(first.proxyHeaders![RENDER_GATEWAY_AUTH_HEADER], second.proxyHeaders![RENDER_GATEWAY_AUTH_HEADER]);
+  assert.notEqual(first.proxyHeaders![RENDER_GATEWAY_AUTH_HEADER], other.proxyHeaders![RENDER_GATEWAY_AUTH_HEADER]);
   assert.equal(f.services.size, 2);
   assert.equal(f.environments.size, 2);
   const one = (await f.store.get(OWNER))!;
@@ -70,8 +73,13 @@ test("gateway shares its service across the owner's apps and separates other own
     host: first.host,
     port: 443,
     tls: true,
-    proxyHeaders: { connection: "close", [RENDER_GATEWAY_AUTH_HEADER]: one.token, [RENDER_GATEWAY_APP_HEADER]: APP },
+    proxyHeaders: {
+      connection: "close",
+      [RENDER_GATEWAY_AUTH_HEADER]: renderGatewayAppToken(one.token, APP),
+      [RENDER_GATEWAY_APP_HEADER]: APP,
+    },
   });
+  assert.notEqual(first.proxyHeaders![RENDER_GATEWAY_AUTH_HEADER], one.token);
 });
 
 test("gateway service uses only the stock image, owner marker, port, and its config secret", async () => {
@@ -116,6 +124,14 @@ test("gateway repeated publish waits for health without a new deploy", async () 
   f.controls.healthy = false;
   await assert.rejects(f.gateway.upsert(OWNER, APP, UPSTREAM), /not live/);
   assert.equal(f.calls.filter(({ method }) => method !== "GET").length, writes);
+  assert.equal(await f.gateway.endpoint(OWNER, APP), null);
+});
+
+test("gateway rejects a saved configuration hash that does not cover its current routes", async () => {
+  const f = fixture();
+  await f.gateway.upsert(OWNER, APP, UPSTREAM);
+  const record = (await f.store.get(OWNER))!;
+  await f.store.put(OWNER, { ...record, routes: { [APP]: UPSTREAM2 } });
   assert.equal(await f.gateway.endpoint(OWNER, APP), null);
 });
 
