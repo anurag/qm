@@ -778,7 +778,7 @@ async function reconcileWorkflow(
     await request(`/environments/${state.environmentId}/resources`, "POST", { resourceIds: [workflow.id] });
     workflow = (await inventory(ctx, request, state)).workflow!;
   }
-  if (workflow.environmentId !== state.environmentId || !workflow.slug)
+  if ((workflow.environmentId && workflow.environmentId !== state.environmentId) || !workflow.slug)
     throw new CliError("Render workflow was not attached to this deployment environment");
   state.workflowSlug = workflow.slug;
   saveState(ctx, state);

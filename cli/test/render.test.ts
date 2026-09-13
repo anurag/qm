@@ -427,6 +427,37 @@ test("Render waits for a workflow version when its initial list is null", async 
   assert.equal(initial, false);
   assert.ok(d.saved().releaseWorkflowTaskId);
 });
+
+test("Render accepts a successful workflow attachment when GET omits its environment", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path !== "/workflows/wfl-acme" || method !== "GET") return undefined;
+    const workflow = { ...c.workflow };
+    delete workflow.environmentId;
+    return Response.json(workflow);
+  };
+  await d.backend.up({ dryRun: false });
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.workflow?.environmentId, "evm-acme");
+  assert.equal(d.saved().workflowSlug, "acme-worker");
+  assert.equal(
+    c.calls.filter((call) => call.path === "/environments/evm-acme/resources" && call.method === "POST").length,
+    2,
+  );
+  assert.equal(c.calls.filter((call) => call.path === "/workflows" && call.method === "POST").length, 1);
+});
+
+test("Render rejects a conflicting workflow environment after attachment", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) =>
+    path === "/workflows/wfl-acme" && method === "GET"
+      ? Response.json({ ...c.workflow, environmentId: "evm-other" })
+      : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /The saved Render workflow does not match this deployment/);
+  assert.equal(d.saved().release, undefined);
+});
 const writes = (calls: Call[]) =>
   calls.filter((call) => call.url.origin === "https://api.render.com" && call.method !== "GET");
 
