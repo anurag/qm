@@ -160,9 +160,18 @@ these, not through them.
 - **Egress enforcement is conditional.** Force-through egress depends on backend
   network enforcement, and core does not yet reject every backend that is too coarse
   for the requested policy. Deployment-runtime egress enforcement is not built.
-  Fly and Render app services share a private network with other services.
-  A published app can connect directly to peer app ports and bypass access checks
-  at the core proxy. These providers do not isolate mutually untrusted app authors.
+  Fly app services share a private network with other services. A published Fly
+  app can connect directly to peer app ports and bypass access checks at the core
+  proxy. Fly does not isolate mutually untrusted app authors.
+  Render creates a separate isolated environment for each app owner scope. Its
+  private app services cannot connect directly to another owner's private apps
+  or QM's shared services over the private network. Core checks access before
+  it sends authenticated HTTPS requests through the owner's Caddy gateway.
+  Apps within the same owner scope can still connect directly to each other.
+  Anyone with write access to an app can run code in that environment, so all
+  app editors in an owner scope must be trusted with every app in that scope.
+  Render isolation is per owner scope, not
+  per app or editor. See [Render published apps](docs/render.md#published-apps).
 - **Admins can read sensitive content.** A scope-authorized admin can directly read
   transcripts, captured provider requests, documents, memory, connector and keychain
   metadata, mirrored message bodies, ambient-judge inputs, user details, and skill
