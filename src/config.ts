@@ -427,6 +427,7 @@ interface RenderDeployEnv {
   workflowTaskId: string;
   source?: { repo: string; branch: string; commit: string };
   region: string;
+  appRegion: string;
   plan?: string;
   appPrefix?: string;
   registryCredentialId?: string;
@@ -483,6 +484,7 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
   const environmentId = env.RENDER_ENVIRONMENT_ID?.trim();
   if (environmentId && !/^evm-[a-z0-9]+$/.test(environmentId))
     throw new Error("RENDER_ENVIRONMENT_ID must be an environment ID (evm-...)");
+  const region = env.RENDER_REGION?.trim() || "oregon";
   return {
     projectId,
     postgresId,
@@ -494,7 +496,8 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
     workflowSlug,
     workflowTaskId,
     ...(repo && branch && commit ? { source: { repo, branch, commit } } : {}),
-    region: env.RENDER_REGION?.trim() || "oregon",
+    region,
+    appRegion: env.RENDER_APP_REGION?.trim() || region,
     ...(env.RENDER_DEPLOY_PLAN?.trim() ? { plan: env.RENDER_DEPLOY_PLAN.trim() } : {}),
     ...(env.RENDER_DEPLOY_APP_PREFIX?.trim() ? { appPrefix: env.RENDER_DEPLOY_APP_PREFIX.trim() } : {}),
     ...(env.RENDER_REGISTRY_CREDENTIAL_ID?.trim()

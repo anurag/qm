@@ -123,6 +123,7 @@ export function renderServiceEnv(
       DEPLOY_PROVIDER: "render",
       RENDER_WORKSPACE_ID: render.workspaceId,
       RENDER_REGION: render.region,
+      RENDER_APP_REGION: render.appRegion ?? render.region,
       ...(connections.projectId ? { RENDER_PROJECT_ID: connections.projectId } : {}),
       ...(connections.workflowTaskId ? { RENDER_WORKFLOW_TASK_ID: connections.workflowTaskId } : {}),
       ...(connections.workflowSlug ? { RENDER_WORKFLOW_SLUG: connections.workflowSlug } : {}),

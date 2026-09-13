@@ -19,6 +19,14 @@ Each published app has a network-isolated environment in the same project.
 Native Render Sandboxes are workspace resources because the Sandbox API has no
 project or environment field. Do not create a second project for sandboxes.
 
+`render.appRegion` optionally selects the region for new published apps. It
+defaults to `render.region`. Each app retains the region selected at creation.
+Changing this default does not move existing apps, core services, or Postgres.
+If a legacy Oregon workspace has no fixed outbound IP ranges, set
+`render.appRegion` to `virginia` before creating an app. Apps remain in the same
+project and connect across regions to Postgres with verified TLS and MinIO with
+HTTPS.
+
 ## Git builds and updates
 
 Render builds every service from the configured repository. Core, web UI, and

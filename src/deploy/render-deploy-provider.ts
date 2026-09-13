@@ -31,6 +31,7 @@ interface Deploy {
 
 export interface StoredRenderDeploy {
   deploymentId: string;
+  appRegion?: string;
   serviceId?: string;
   environmentId?: string;
   environmentCreatePending?: boolean;
@@ -50,6 +51,7 @@ export interface RenderDeployProviderOptions {
   postgresId: string;
   source: { repo: string; branch: string; commit: string };
   region?: string;
+  appRegion?: string;
   plan?: string;
   appPrefix?: string;
   store: DurableMap<StoredRenderDeploy>;
@@ -119,7 +121,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       service.ownerId !== opts.workspaceId ||
       service.environmentId !== record?.environmentId ||
       service.type !== "web_service" ||
-      service.serviceDetails.region !== region ||
+      service.serviceDetails.region !== (record?.appRegion ?? region) ||
       service.serviceDetails.disk ||
       service.serviceDetails.numInstances !== 1
     )
@@ -273,6 +275,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     if (!record)
       record = await opts.store.putIfAbsent(deployment.id, {
         deploymentId: deployment.id,
+        appRegion: opts.appRegion ?? region,
         token: randomBytes(32).toString("base64url"),
         suspended: false,
       });
@@ -327,7 +330,12 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
               ...source,
               envVars,
               secretFiles: [],
-              serviceDetails: { ...serviceDetails, plan: opts.plan ?? "0.5c-512mb", region, numInstances: 1 },
+              serviceDetails: {
+                ...serviceDetails,
+                plan: opts.plan ?? "0.5c-512mb",
+                region: record.appRegion ?? region,
+                numInstances: 1,
+              },
             });
             service = created?.service ?? null;
             record = {

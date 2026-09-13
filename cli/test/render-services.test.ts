@@ -84,6 +84,8 @@ test("Render uses Git builds for all services and rejects image overrides", (t) 
   const core = renderServiceEnv(config, "core", new Map(), connections);
   assert.equal(core.RENDER_DEPLOY_REPO, config.render!.source.repo);
   assert.equal(core.RENDER_DEPLOY_BRANCH, "main");
+  assert.equal(config.render!.appRegion, undefined);
+  assert.equal(core.RENDER_APP_REGION, config.render!.region);
   assert.equal(core.RENDER_DEPLOY_IMAGE, undefined);
   config.imageOverrides.core = "example.test/core:custom";
   assert.throws(() => renderWorkloads(config, dir), /remove imageOverrides/);
@@ -104,6 +106,24 @@ test("Render init selects managed MinIO without generated infrastructure files o
     false,
   );
   assert.match(renderMinioImage, /@sha256:[a-f0-9]{64}$/);
+});
+
+test("Render appRegion accepts supported regions without changing the core region", (t) => {
+  const { path, raw } = deployment(t);
+  for (const appRegion of ["oregon", "ohio", "virginia", "frankfurt", "singapore"]) {
+    writeFileSync(path, JSON.stringify({ ...raw, render: { ...raw.render, appRegion } }));
+    const config = loadConfigAt(path).config;
+    assert.equal(config.render!.appRegion, appRegion);
+    assert.equal(config.render!.region, "oregon");
+    const core = renderServiceEnv(config, "core", new Map(), connections);
+    assert.equal(core.RENDER_APP_REGION, appRegion);
+    assert.equal(core.RENDER_REGION, "oregon");
+    assert.equal(renderServiceEnv(config, "web-ui", new Map(), connections).RENDER_APP_REGION, undefined);
+  }
+  for (const appRegion of ["us-east-1", "Virginia", "", null, 3, {}]) {
+    writeFileSync(path, JSON.stringify({ ...raw, render: { ...raw.render, appRegion } }));
+    assert.throws(() => loadConfigAt(path), /render.appRegion must be a Render region/);
+  }
 });
 
 test("Render core receives scoped storage credentials and assigned URLs", (t) => {

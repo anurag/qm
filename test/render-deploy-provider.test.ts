@@ -14,10 +14,11 @@ import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { createDeployStore, type Deployment } from "../src/deploy/deploy-store.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import { scopeId } from "../src/types.ts";
+import { loadConfig } from "../src/config.ts";
 
 const sha = "a".repeat(40);
 
-function fixture() {
+function fixture(appRegion?: string) {
   const store = createMemoryMap<StoredRenderDeploy>();
   const calls: Array<{ method: string; path: string; body: any }> = [];
   let service: any = null;
@@ -30,6 +31,7 @@ function fixture() {
   let activeEnv: any[] = [];
   const data = new Map<string, string>();
   let resourceSuspended = false;
+  let savedRegionBeforeCreate: string | undefined;
   const artifacts = {
     prepare: async (d: Deployment, v: Deployment["versions"][number]) => ({
       url: `https://core.example/v1/deployments/${d.id}/git`,
@@ -48,6 +50,7 @@ function fixture() {
     projectId: "prj-test",
     environmentId: "env-test",
     postgresId: "dpg-test",
+    appRegion,
     source: { repo: "https://github.com/test/qm", branch: "anurag/render-source", commit: sha },
     store,
     artifacts,
@@ -73,6 +76,7 @@ function fixture() {
       if (path === "/projects/prj-test") return response({ owner: { id: "tea-test" } });
       if (path.startsWith("/environments?")) return response(environment ? [{ environment }] : []);
       if (path === "/environments" && method === "POST") {
+        savedRegionBeforeCreate = (await store.get(deployment.id))?.appRegion;
         environment = { ...body, id: "env-app" };
         return response(environment);
       }
@@ -162,6 +166,9 @@ function fixture() {
     get resourceSuspended() {
       return resourceSuspended;
     },
+    get savedRegionBeforeCreate() {
+      return savedRegionBeforeCreate;
+    },
     set outcome(value: string) {
       outcome = value;
     },
@@ -177,14 +184,75 @@ function fixture() {
     get environment() {
       return environment;
     },
-    restart(commit: string) {
-      return createRenderDeployProvider({ ...options, source: { ...options.source, commit } });
+    restart(commit: string, nextAppRegion = options.appRegion) {
+      return createRenderDeployProvider({
+        ...options,
+        appRegion: nextAppRegion,
+        source: { ...options.source, commit },
+      });
     },
     finishPending() {
       deploys[0].status = "live";
     },
   };
 }
+
+test("Render app region defaults to the core region and accepts a separate creation region", () => {
+  assert.equal(loadConfig({}).renderDeploy.appRegion, "oregon");
+  assert.equal(loadConfig({ RENDER_REGION: "ohio" }).renderDeploy.appRegion, "ohio");
+  const config = loadConfig({ RENDER_REGION: "oregon", RENDER_APP_REGION: " virginia " });
+  assert.equal(config.renderDeploy.region, "oregon");
+  assert.equal(config.renderDeploy.appRegion, "virginia");
+  assert.equal(config.renderSandbox.region, "oregon");
+});
+
+test("Render retains the app region through pending recovery, update, rollback, and archive after a default change", async () => {
+  const f = fixture("virginia");
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  f.outcome = "build_in_progress";
+  await assert.rejects(f.provider.apply(d, v1), /unconfirmed deployment/);
+  assert.equal(f.savedRegionBeforeCreate, "virginia");
+  assert.equal((await f.store.get(d.id))!.appRegion, "virginia");
+  assert.equal(f.service.serviceDetails.region, "virginia");
+  f.finishPending();
+  f.outcome = "live";
+  const restarted = f.restart(sha, "ohio");
+  const endpoint = await restarted.apply(d, v1);
+  d.status = "running";
+  d.appliedVersion = 1;
+  assert.deepEqual(await restarted.resolveEndpoint!(d, v1), endpoint);
+  assert.deepEqual(await restarted.apply(d, { ...v1, version: 2 }), endpoint);
+  d.appliedVersion = 2;
+  assert.deepEqual(await restarted.apply(d, v1), endpoint);
+  await restarted.destroy(d);
+  assert.equal(f.resourceSuspended, true);
+  assert.deepEqual(await restarted.apply(d, v1), endpoint);
+  assert.equal(f.resourceSuspended, false);
+  assert.equal((await f.store.get(d.id))!.appRegion, "virginia");
+  assert.equal(f.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
+  assert.ok(f.calls.some((call) => call.method === "PATCH" && call.path === "/postgres/dpg-test"));
+  f.service.serviceDetails.region = "ohio";
+  await assert.rejects(restarted.apply(d, { ...v1, version: 2 }), /expected diskless gated service/);
+});
+
+test("Legacy Render apps stay in the core region after the new app default changes", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  const endpoint = await f.provider.apply(d, v1);
+  const record = (await f.store.get(d.id))!;
+  delete record.appRegion;
+  await f.store.put(d.id, record);
+  const restarted = f.restart(sha, "virginia");
+  assert.deepEqual(await restarted.apply(d, { ...v1, version: 2 }), endpoint);
+  await restarted.destroy(d);
+  assert.equal(f.resourceSuspended, true);
+  assert.deepEqual(await restarted.apply(d, v1), endpoint);
+  assert.equal(f.resourceSuspended, false);
+  assert.equal(f.service.serviceDetails.region, "oregon");
+  assert.equal(f.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
+});
 
 test("Render app create, update, rollback, and archive retain one diskless service and scoped data", async () => {
   const f = fixture();

@@ -992,6 +992,7 @@ export function renderConfigErrors(
     DEPLOY_PROVIDER: "render",
     RENDER_WORKSPACE_ID: config.render?.workspaceId ?? "",
     RENDER_REGION: config.render?.region ?? "",
+    RENDER_APP_REGION: config.render?.appRegion ?? config.render?.region ?? "",
   };
   for (const [key, value] of Object.entries(managed)) {
     if (config.env.core?.[key] !== undefined && config.env.core[key] !== value)

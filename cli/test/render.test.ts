@@ -402,6 +402,27 @@ test("Render accepts null empty lists for projects, Postgres, services, and work
   assert.ok(c.workflow);
 });
 
+test("Render appRegion changes the app creation default without moving deployment resources", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const resources = { ...d.saved().services };
+  d.ctx.config.render!.appRegion = "virginia";
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(d.saved().services, resources);
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_APP_REGION, "virginia");
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_REGION, "oregon");
+  assert.equal(c.workflowEnv.RENDER_APP_REGION, "virginia");
+  assert.equal(c.workflow?.region, "oregon");
+  assert.equal(c.database?.region, "oregon");
+  for (const service of c.services.values()) assert.equal(service.serviceDetails.region, "oregon");
+  d.ctx.config.env.core = { ...d.ctx.config.env.core, RENDER_APP_REGION: "ohio" };
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /RENDER_APP_REGION=virginia/.test(error.message)));
+  delete d.ctx.config.env.core.RENDER_APP_REGION;
+  d.ctx.config.secretEnv = { core: { RENDER_APP_REGION: "CUSTOM_APP_REGION" } };
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /RENDER_APP_REGION.*secretEnv/.test(error.message)));
+});
+
 for (const path of ["/projects", "/postgres", "/services", "/workflows"]) {
   test(`Render rejects a non-array ${path} list with a clear error`, async (t) => {
     const d = deployment(t);

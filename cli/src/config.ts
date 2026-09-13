@@ -84,6 +84,7 @@ export interface RenderConfig {
   storage: { type: "minio"; plan: string; diskSizeGB: number };
   workspaceId: string;
   region: "oregon" | "ohio" | "virginia" | "frankfurt" | "singapore";
+  appRegion?: RenderConfig["region"];
   corePlan: string;
   servicePlan: string;
   postgresPlan: string;
@@ -1444,6 +1445,7 @@ function validateRender(raw: unknown, path: string): RenderConfig {
   const allowed = new Set([
     "workspaceId",
     "region",
+    "appRegion",
     "corePlan",
     "servicePlan",
     "postgresPlan",
@@ -1472,9 +1474,13 @@ function validateRender(raw: unknown, path: string): RenderConfig {
     throw new CliError(`${path}: render.workspaceId must be a Render workspace ID (tea-... or usr-...)`);
   }
   const region = raw.region ?? "oregon";
-  if (typeof region !== "string" || !["oregon", "ohio", "virginia", "frankfurt", "singapore"].includes(region)) {
+  const regions = ["oregon", "ohio", "virginia", "frankfurt", "singapore"];
+  if (typeof region !== "string" || !regions.includes(region)) {
     throw new CliError(`${path}: render.region must be a Render region`);
   }
+  const appRegion = raw.appRegion;
+  if (appRegion !== undefined && (typeof appRegion !== "string" || !regions.includes(appRegion)))
+    throw new CliError(`${path}: render.appRegion must be a Render region`);
   const plan = (key: string, fallback: string): string => {
     const value = raw[key] ?? fallback;
     if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free") {
@@ -1499,6 +1505,7 @@ function validateRender(raw: unknown, path: string): RenderConfig {
     storage,
     workspaceId,
     region: region as RenderConfig["region"],
+    ...(appRegion === undefined ? {} : { appRegion: appRegion as RenderConfig["region"] }),
     corePlan: plan("corePlan", "1c-2g"),
     servicePlan: plan("servicePlan", "0.5c-512mb"),
     postgresPlan: plan("postgresPlan", "0.5c-1g"),
