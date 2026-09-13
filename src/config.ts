@@ -1,4 +1,5 @@
 import { existsSync, readdirSync } from "node:fs";
+import { parseRenderAppDatabaseEndpoint } from "./deploy/render-app-database.ts";
 import {
   parseProviderBaseUrl,
   providerBaseUrlsFromEnv,
@@ -49,9 +50,10 @@ export interface Config {
   securityPosture: SecurityPosture;
   sandboxResourcesEnabled: boolean;
   sharingPosture: SharingPosture;
-  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
-  sandboxSecondaryBackend?: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
-  deployProvider: "docker" | "aws" | "fly" | "porter";
+  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "render";
+  sandboxSecondaryBackend?:
+    "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "render";
+  deployProvider: "docker" | "aws" | "fly" | "porter" | "render";
   egressServiceHosts?: string[];
   brandingDefault?: OrgBranding;
   modelId?: string;
@@ -125,10 +127,13 @@ export interface Config {
   deploymentLayerDir?: string;
   layerEnv?: Readonly<Record<string, string | undefined>>;
   filesDirectUploadsEnabled: boolean;
+  workspaceStore: "local" | "s3";
   snapshotStore: "local" | "s3";
   transferStore: "local" | "s3";
   s3Bucket?: string;
   s3Region?: string;
+  s3Endpoint?: string;
+  s3ForcePathStyle?: boolean;
   s3Prefix?: string;
   deployIdleTtlMs?: number;
   deployGitDir: string;
@@ -176,6 +181,8 @@ export interface Config {
   e2bSandbox: E2bSandboxEnv;
   modalSandbox: ModalSandboxEnv;
   porterSandbox: PorterSandboxEnv;
+  renderSandbox: RenderSandboxEnv;
+  renderDeploy: RenderDeployEnv;
   porterDeploy: PorterDeployEnv;
   awsDeploy: AwsDeployEnv;
   deployAppsDomain?: string;
@@ -369,6 +376,129 @@ function e2bSandboxEnv(env: NodeJS.ProcessEnv): E2bSandboxEnv {
       : {}),
     ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
       ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+  };
+}
+
+interface RenderSandboxEnv {
+  apiKey?: string;
+  workspaceId?: string;
+  region: string;
+  plan: "starter" | "standard" | "pro";
+  ttlSec: number;
+  defaultTimeoutSec?: number;
+}
+
+function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
+  const plan = env.RENDER_SANDBOX_PLAN?.trim() || "starter";
+  if (plan !== "starter" && plan !== "standard" && plan !== "pro") {
+    throw new Error("RENDER_SANDBOX_PLAN must be starter, standard, or pro");
+  }
+  const ttlSec = numEnvStrict("RENDER_SANDBOX_TTL_SEC", env.RENDER_SANDBOX_TTL_SEC) ?? 7200;
+  if (!Number.isSafeInteger(ttlSec) || ttlSec <= 0) {
+    throw new Error("RENDER_SANDBOX_TTL_SEC must be a positive integer");
+  }
+  const defaultTimeoutSec = numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC);
+  if (
+    (env.SANDBOX_BACKEND?.trim() === "render" || (env.RENDER_API_KEY?.trim() && env.RENDER_WORKSPACE_ID?.trim())) &&
+    ttlSec <= (defaultTimeoutSec ?? 600) + 60
+  ) {
+    throw new Error("RENDER_SANDBOX_TTL_SEC must exceed SANDBOX_TIMEOUT_SEC (default 600) by more than 60 seconds");
+  }
+  return {
+    ...(env.RENDER_API_KEY?.trim() ? { apiKey: env.RENDER_API_KEY.trim() } : {}),
+    ...(env.RENDER_WORKSPACE_ID?.trim() ? { workspaceId: env.RENDER_WORKSPACE_ID.trim() } : {}),
+    region: env.RENDER_REGION?.trim() || "oregon",
+    plan,
+    ttlSec,
+    ...(defaultTimeoutSec !== undefined ? { defaultTimeoutSec } : {}),
+  };
+}
+
+interface RenderDeployEnv {
+  projectId: string;
+  postgresId: string;
+  appDatabaseEndpoint: string;
+  environmentId?: string;
+  apiKey: string;
+  workspaceId: string;
+  minioServiceId: string;
+  workflowSlug: string;
+  workflowTaskId: string;
+  source?: { repo: string; branch: string; commit: string };
+  region: string;
+  plan?: string;
+  appPrefix?: string;
+  registryCredentialId?: string;
+}
+
+function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
+  const repo = env.RENDER_DEPLOY_REPO?.trim()
+    .replace(/\/$/, "")
+    .replace(/\.git$/, "");
+  const branch = env.RENDER_DEPLOY_BRANCH?.trim();
+  const commit = env.RENDER_DEPLOY_COMMIT?.trim();
+  const minioServiceId = env.RENDER_MINIO_SERVICE_ID?.trim() || "";
+  const workflowSlug = env.RENDER_WORKFLOW_SLUG?.trim() || "";
+  const workflowTaskId = env.RENDER_WORKFLOW_TASK_ID?.trim() || "";
+  if (Boolean(repo) !== Boolean(branch))
+    throw new Error("RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH must be set together");
+  if (
+    repo &&
+    (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ||
+      repo.split("/").some((part) => part === "." || part === ".."))
+  )
+    throw new Error("RENDER_DEPLOY_REPO must be an HTTPS GitHub repository URL without credentials");
+  if (
+    branch &&
+    (/[\x00-\x20\x7f~^:?*[\\]/.test(branch) ||
+      branch.includes("..") ||
+      branch.includes("@{") ||
+      branch === "@" ||
+      branch.startsWith("-") ||
+      branch.endsWith(".") ||
+      branch.split("/").some((part) => !part || part.startsWith(".") || part.endsWith(".lock")))
+  )
+    throw new Error("RENDER_DEPLOY_BRANCH must be a valid Git branch name");
+  if (env.DEPLOY_PROVIDER === "render" && (!repo || !branch || !/^[a-f0-9]{40}$/.test(commit ?? "")))
+    throw new Error(
+      "DEPLOY_PROVIDER=render requires RENDER_DEPLOY_REPO, RENDER_DEPLOY_BRANCH, and RENDER_DEPLOY_COMMIT",
+    );
+  if (env.DEPLOY_PROVIDER === "render" && !/^srv-[a-z0-9]+$/.test(minioServiceId))
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_MINIO_SERVICE_ID");
+  const projectId = env.RENDER_PROJECT_ID?.trim() || "";
+  if (env.DEPLOY_PROVIDER === "render" && !projectId)
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_PROJECT_ID");
+  if (projectId && !/^prj-[a-z0-9]+$/.test(projectId))
+    throw new Error("RENDER_PROJECT_ID must be a project ID (prj-...)");
+  const postgresId = env.RENDER_POSTGRES_ID?.trim() || "";
+  if (env.DEPLOY_PROVIDER === "render" && !postgresId)
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_POSTGRES_ID");
+  if (postgresId && !/^dpg-[a-z0-9]+(?:-a)?$/.test(postgresId))
+    throw new Error("RENDER_POSTGRES_ID must be a PostgreSQL ID (dpg-...)");
+  const appDatabaseEndpoint = env.RENDER_APP_DATABASE_ENDPOINT?.trim() || "";
+  if (env.DEPLOY_PROVIDER === "render" && !appDatabaseEndpoint)
+    throw new Error("Render app isolation requires RENDER_APP_DATABASE_ENDPOINT");
+  if (appDatabaseEndpoint) parseRenderAppDatabaseEndpoint(appDatabaseEndpoint);
+  const environmentId = env.RENDER_ENVIRONMENT_ID?.trim();
+  if (environmentId && !/^evm-[a-z0-9]+$/.test(environmentId))
+    throw new Error("RENDER_ENVIRONMENT_ID must be an environment ID (evm-...)");
+  return {
+    projectId,
+    postgresId,
+    appDatabaseEndpoint,
+    ...(environmentId ? { environmentId } : {}),
+    apiKey: env.RENDER_API_KEY?.trim() || "",
+    workspaceId: env.RENDER_WORKSPACE_ID?.trim() || "",
+    minioServiceId,
+    workflowSlug,
+    workflowTaskId,
+    ...(repo && branch && commit ? { source: { repo, branch, commit } } : {}),
+    region: env.RENDER_REGION?.trim() || "oregon",
+    ...(env.RENDER_DEPLOY_PLAN?.trim() ? { plan: env.RENDER_DEPLOY_PLAN.trim() } : {}),
+    ...(env.RENDER_DEPLOY_APP_PREFIX?.trim() ? { appPrefix: env.RENDER_DEPLOY_APP_PREFIX.trim() } : {}),
+    ...(env.RENDER_REGISTRY_CREDENTIAL_ID?.trim()
+      ? { registryCredentialId: env.RENDER_REGISTRY_CREDENTIAL_ID.trim() }
       : {}),
   };
 }
@@ -849,6 +979,7 @@ export function enabledSandboxBackends(config: Config): Array<Config["sandboxBac
     modal: Boolean(config.modalSandbox?.tokenId && config.modalSandbox?.tokenSecret),
     aws: Boolean(config.awsSandbox?.s3Bucket),
     porter: Boolean(config.porterSandbox?.token),
+    render: Boolean(config.renderSandbox?.apiKey && config.renderSandbox?.workspaceId),
   };
   const enabled = new Set<Config["sandboxBackend"]>([config.sandboxBackend]);
   for (const [name, on] of Object.entries(credentialed)) {
@@ -868,11 +999,12 @@ function sandboxBackendEnvStrict(value: string | undefined, name = "SANDBOX_BACK
     backend === "e2b" ||
     backend === "modal" ||
     backend === "agent37" ||
-    backend === "porter"
+    backend === "porter" ||
+    backend === "render"
   )
     return backend;
   throw new Error(
-    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, or agent37, or unset it.`,
+    `${name}=${JSON.stringify(value)} is not recognized. Use aws, local, sprites, smolmachines, e2b, modal, porter, agent37, or render.`,
   );
 }
 
@@ -985,6 +1117,34 @@ function modelProviderEnvStrict(env: NodeJS.ProcessEnv): ModelProvider | undefin
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const fileStores = {} as Record<"WORKSPACE_STORE" | "SNAPSHOT_STORE" | "TRANSFER_STORE", "local" | "s3">;
+  for (const name of ["WORKSPACE_STORE", "SNAPSHOT_STORE", "TRANSFER_STORE"] as const) {
+    const value = env[name]?.trim() || "local";
+    if (value !== "local" && value !== "s3") throw new Error(`${name} must be local or s3`);
+    if (value === "s3" && !env.S3_BUCKET?.trim()) throw new Error(`${name}=s3 requires S3_BUCKET`);
+    fileStores[name] = value;
+  }
+  if (fileStores.WORKSPACE_STORE === "s3" && (!env.DATABASE_URL?.trim() || fileStores.SNAPSHOT_STORE !== "s3"))
+    throw new Error("WORKSPACE_STORE=s3 requires DATABASE_URL and SNAPSHOT_STORE=s3");
+  const s3Endpoint = env.AWS_ENDPOINT_URL_S3?.trim();
+  if (s3Endpoint) {
+    let endpoint: URL;
+    try {
+      endpoint = new URL(s3Endpoint);
+    } catch {
+      throw new Error("AWS_ENDPOINT_URL_S3 must be an HTTP or HTTPS URL");
+    }
+    if (
+      !["http:", "https:"].includes(endpoint.protocol) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.search ||
+      endpoint.hash
+    )
+      throw new Error(
+        "AWS_ENDPOINT_URL_S3 must be an HTTP or HTTPS URL without credentials, query parameters, or a fragment",
+      );
+  }
   const harness = harnessEnvStrict(env.HARNESS);
   const codexAuthCredential = env.CODEX_AUTH_CREDENTIAL?.trim() || undefined;
   const claudeAuthCredential = env.CLAUDE_AUTH_CREDENTIAL?.trim() || undefined;
@@ -1063,10 +1223,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (env.NODE_ENV === "production" && !env.SANDBOX_BACKEND?.trim()) {
     throw new Error(
-      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, aws, or local.",
+      "SANDBOX_BACKEND must be set explicitly in production. Use sprites, smolmachines, e2b, modal, porter, agent37, render, aws, or local.",
     );
   }
   const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
+  if (sandboxBackend === "render" || env.DEPLOY_PROVIDER === "render") {
+    if (!env.RENDER_WORKSPACE_ID?.trim()) throw new Error("Render providers require RENDER_WORKSPACE_ID");
+  }
   if (env.SANDBOX_SECONDARY_BACKEND?.trim()) {
     console.warn(
       `[config] SANDBOX_SECONDARY_BACKEND=${JSON.stringify(env.SANDBOX_SECONDARY_BACKEND.trim())} is retired and ignored — every backend whose credential is present is constructed; per-scope routes pick between them. Remove the variable.`,
@@ -1131,10 +1294,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     deployProvider !== "aws" &&
     deployProvider !== "docker" &&
     deployProvider !== "fly" &&
-    deployProvider !== "porter"
+    deployProvider !== "porter" &&
+    deployProvider !== "render"
   ) {
     throw new Error(
-      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, or porter)`,
+      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, porter, or render)`,
     );
   }
   let runStore: "memory" | "postgres" = env.SESSION_STORE === "postgres" ? "postgres" : "memory";
@@ -1354,10 +1518,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       ? { memoryCaptureMaxTurns: numEnvStrict("MEMORY_CAPTURE_MAX_TURNS", env.MEMORY_CAPTURE_MAX_TURNS) }
       : {}),
     filesDirectUploadsEnabled: boolEnvStrict("FILES_DIRECT_UPLOADS_ENABLED", env.FILES_DIRECT_UPLOADS_ENABLED) ?? false,
-    snapshotStore: env.SNAPSHOT_STORE === "s3" ? "s3" : "local",
-    transferStore: env.TRANSFER_STORE === "s3" ? "s3" : "local",
-    ...(env.S3_BUCKET ? { s3Bucket: env.S3_BUCKET } : {}),
+    workspaceStore: fileStores.WORKSPACE_STORE,
+    snapshotStore: fileStores.SNAPSHOT_STORE,
+    transferStore: fileStores.TRANSFER_STORE,
+    ...(env.S3_BUCKET?.trim() ? { s3Bucket: env.S3_BUCKET.trim() } : {}),
     ...(env.S3_REGION ? { s3Region: env.S3_REGION } : {}),
+    ...(s3Endpoint ? { s3Endpoint } : {}),
+    s3ForcePathStyle: boolEnvStrict("S3_FORCE_PATH_STYLE", env.S3_FORCE_PATH_STYLE) ?? false,
     ...(env.S3_PREFIX ? { s3Prefix: env.S3_PREFIX } : {}),
     ...(numEnvStrict("DEPLOY_IDLE_TTL_MS", env.DEPLOY_IDLE_TTL_MS) !== undefined
       ? { deployIdleTtlMs: numEnvStrict("DEPLOY_IDLE_TTL_MS", env.DEPLOY_IDLE_TTL_MS) }
@@ -1399,6 +1566,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     smolmachinesSandbox: smolmachinesSandboxEnv(env),
     agent37Sandbox: agent37SandboxEnv(env),
     porterSandbox: porterSandboxEnv(env),
+    renderSandbox: renderSandboxEnv(env),
+    renderDeploy: renderDeployEnv(env),
     porterDeploy: porterDeployEnv(env),
     e2bSandbox: e2bSandboxEnv(env),
     modalSandbox: modalSandboxEnv(env),

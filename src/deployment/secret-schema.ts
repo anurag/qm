@@ -10,6 +10,7 @@ type SecretGate =
   | "modal"
   | "porter"
   | "agent37"
+  | "render"
   | "porter-deploy"
   | "fly-deploy"
   | "aws-deploy-gate"
@@ -40,6 +41,7 @@ export const CORE_SECRET_SPECS: readonly RuntimeSecretSpec[] = [
   { name: "SPRITES_TOKEN", requiredWhen: "sprites" },
   { name: "SMOLMACHINES_TOKEN", requiredWhen: "smolmachines" },
   { name: "AGENT37_API_KEY", requiredWhen: "agent37" },
+  { name: "RENDER_API_KEY", requiredWhen: "render" },
   { name: "E2B_API_KEY", requiredWhen: "e2b" },
   { name: "MODAL_TOKEN_ID", requiredWhen: "modal" },
   { name: "MODAL_TOKEN_SECRET", requiredWhen: "modal" },
@@ -61,6 +63,7 @@ const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => b
   modal: (env) => env.SANDBOX_BACKEND === "modal",
   porter: (env) => env.SANDBOX_BACKEND === "porter",
   agent37: (env) => env.SANDBOX_BACKEND === "agent37",
+  render: (env) => env.SANDBOX_BACKEND?.trim() === "render" || env.DEPLOY_PROVIDER?.trim() === "render",
   "porter-deploy": (env) => env.DEPLOY_PROVIDER === "porter",
   "fly-deploy": (env) => env.DEPLOY_PROVIDER === "fly",
   "aws-deploy-gate": (env) => Boolean(env.AWS_DEPLOY_APPS_DOMAIN || env.DEPLOY_APPS_DOMAIN),

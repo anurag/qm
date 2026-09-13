@@ -1,3 +1,21 @@
+import { createRenderDeployService } from "./deploy/render-deploy-service.ts";
+import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/render-deploy-provider.ts";
+import {
+  createRenderDeployArtifacts,
+  isRenderDeployPrincipal,
+  type StoredRenderDeployCredential,
+} from "./deploy/render-deploy-artifacts.ts";
+import { createRenderAppDatabase, type StoredRenderAppDatabase } from "./deploy/render-app-database.ts";
+import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/render-app-storage.ts";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createRenderWorkflowWorker, type RenderWorkflowDispatch } from "./render/workflow-worker.ts";
+import { processRun } from "./runs/worker.ts";
+import { S3Client } from "@aws-sdk/client-s3";
+import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
+import { createRenderAdvisoryLock } from "./persistence/render-advisory-lock.ts";
+import { createRenderSnapshotStore } from "./sandbox/render-snapshot-store.ts";
+import { createRenderSandbox, type StoredRenderSandbox } from "./sandbox/render-sandbox.ts";
+import { createSdkRenderClient } from "./sandbox/render-client.ts";
 import { createRuntimeService } from "./harness/runtime-control.ts";
 import { createPostgresBrokerSessions, type BrokerSessionStore } from "./auth/broker-sessions.ts";
 import { createDirectFileUploads, type DirectFileUploads } from "./files/direct-file-upload.ts";
@@ -395,6 +413,7 @@ export function stopWithBackstop(
 }
 
 export interface BuiltApp {
+  processRenderRun(runId: string): Promise<void>;
   app: App;
   screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
@@ -563,8 +582,9 @@ export function buildApp(
   const leaderLease: LeaderLease = pgArtifactMap
     ? createPostgresLeaderLease(pgArtifactMap.pool)
     : createNoopLeaderLease();
+  const renderSelected = enabledSandboxBackends(config).includes("render") || config.deployProvider === "render";
   const advisoryLock: AdvisoryLock = pgArtifactMap
-    ? createPostgresAdvisoryLock(pgArtifactMap.pool)
+    ? (renderSelected ? createRenderAdvisoryLock : createPostgresAdvisoryLock)(pgArtifactMap.pool)
     : createMemoryAdvisoryLock();
   const configStore = createMemoryConfigStore(config.orgId, {
     connectorClients: artifactMap<StoredConnectorClient>("connector_clients"),
@@ -695,10 +715,20 @@ export function buildApp(
       : createBudgetTracker(budgetOpts);
   const resolution = createResolutionService(config.orgId, configStore, acl);
 
-  const workspace = createLocalWorkspaceStore(config.dataDir);
+  if (renderSelected && !config.databaseUrl) throw new Error("Render requires DATABASE_URL");
+  const renderLock = advisoryLock;
+  const s3 = new S3Client({
+    ...(config.s3Region ? { region: config.s3Region } : {}),
+    ...(config.s3Endpoint ? { endpoint: config.s3Endpoint } : {}),
+    forcePathStyle: config.s3ForcePathStyle,
+  });
+  const workspace = renderSelected
+    ? createRenderWorkspaceStore(config.dataDir, config.databaseUrl!)
+    : createLocalWorkspaceStore(config.dataDir);
   const blobTransfer: BlobTransferStore =
     config.transferStore === "s3" && config.s3Bucket
       ? createS3BlobTransferStore({
+          ...(renderSelected ? { _client: s3 } : {}),
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -707,6 +737,7 @@ export function buildApp(
   const fileBytes: DurableByteStore =
     config.snapshotStore === "s3" && config.s3Bucket
       ? createS3DurableByteStore({
+          ...(renderSelected ? { _client: s3 } : {}),
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -718,6 +749,9 @@ export function buildApp(
   const fileUploads =
     config.databaseUrl && config.snapshotStore === "s3" && config.s3Bucket
       ? createDirectFileUploads({
+          ...(renderSelected
+            ? { client: s3, presign: (command, expiresIn) => getSignedUrl(s3, command, { expiresIn }) }
+            : {}),
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -781,6 +815,7 @@ export function buildApp(
   const e2bBodies = artifactMap<StoredE2bSandbox>("e2b_sandbox_bodies");
   const modalBodies = artifactMap<StoredModalSandbox>("modal_sandbox_bodies");
   const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
+  const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
   const buildE2b = (): Sandbox => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey) throw new Error("SANDBOX_BACKEND=e2b requires E2B_API_KEY");
@@ -898,6 +933,39 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       onError: sandboxOnError,
     });
+  const buildRender = (): Sandbox => {
+    const render = config.renderSandbox;
+    if (!render.apiKey || !render.workspaceId) {
+      throw new Error("SANDBOX_BACKEND=render requires RENDER_API_KEY and RENDER_WORKSPACE_ID");
+    }
+    if (!config.s3Bucket || config.snapshotStore !== "s3")
+      throw new Error("Render Sandboxes require S3_BUCKET and SNAPSHOT_STORE=s3");
+    return createRenderSandbox(workspace, {
+      client: createSdkRenderClient({
+        apiKey: render.apiKey,
+        workspaceId: render.workspaceId,
+        region: render.region,
+        plan: render.plan,
+        ttlSec: render.ttlSec,
+      }),
+      ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
+      store: renderBodies,
+      snapshots: createRenderSnapshotStore({
+        bucket: config.s3Bucket,
+        prefix: `${config.s3Prefix ?? ""}render-home`,
+        s3,
+      }),
+      advisoryLock: renderLock,
+      extraTools: deploymentLayer.advertisedTools,
+      credentialPaths: deploymentLayer.credentialPaths,
+      layerToolFiles: () => deploymentLayer.installFiles,
+      blobTransfer,
+      ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+      ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
+      ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+      onError: sandboxOnError,
+    });
+  };
   const buildBackend: Record<Config["sandboxBackend"], () => Sandbox> = {
     local: buildLocal,
     sprites: buildSprites,
@@ -907,6 +975,7 @@ export function buildApp(
     aws: buildAws,
     porter: buildPorter,
     agent37: buildAgent37,
+    render: buildRender,
   };
   const enabledBackends = new Set(enabledSandboxBackends(config));
   const sandboxBackends: Partial<Record<SandboxBackendName, Sandbox>> = {
@@ -921,11 +990,17 @@ export function buildApp(
     rollout: artifactMap<SandboxResourceRollout>("sandbox_resource_rollout"),
     legacyScopes: async () => (await sessions.distinctScopes()).map((scope) => scope.scopeId),
     legacySandboxes: async () => {
-      const [e2b, modal, aws] = await Promise.all([e2bBodies.entries(), modalBodies.entries(), awsBodies.entries()]);
+      const [e2b, modal, aws, render] = await Promise.all([
+        e2bBodies.entries(),
+        modalBodies.entries(),
+        awsBodies.entries(),
+        renderBodies.entries(),
+      ]);
       return [
         ...e2b.map(([scopeId, body]) => ({ scopeId, backend: "e2b" as const, machineId: body.sandboxId })),
         ...modal.map(([scopeId, body]) => ({ scopeId, backend: "modal" as const, machineId: body.sandboxId })),
         ...aws.map(([scopeId, body]) => ({ scopeId, backend: "aws" as const, machineId: body.microvmId })),
+        ...render.map(([scopeId, body]) => ({ scopeId, backend: "render" as const, machineId: body.sandboxId })),
       ];
     },
     records: artifactMap<SandboxResource>("sandbox_resources"),
@@ -1287,6 +1362,7 @@ export function buildApp(
       ...(config.snapshotStore === "s3" && config.s3Bucket
         ? {
             archiveBytes: createS3DurableByteStore({
+              ...(renderSelected ? { _client: s3 } : {}),
               bucket: config.s3Bucket,
               ...(config.s3Region ? { region: config.s3Region } : {}),
               prefix: `${config.s3Prefix ?? ""}deploy-git/`,
@@ -1295,6 +1371,65 @@ export function buildApp(
         : {}),
     },
   });
+  const renderDeployBodies = artifactMap<StoredRenderDeploy>("render_deploy_bodies");
+  const renderArtifacts =
+    config.deployProvider === "render"
+      ? createRenderDeployArtifacts({
+          baseUrl: config.apiBaseUrl ?? "",
+          signingSecret: config.signingSecret ?? "",
+          store: artifactMap<StoredRenderDeployCredential>("render_deploy_credentials"),
+          deployStore,
+        })
+      : undefined;
+  const buildRenderDeploy = (): DeployProvider => {
+    const render = config.renderDeploy;
+    if (
+      !config.databaseUrl ||
+      !pgArtifactMap ||
+      !config.s3Bucket ||
+      !config.s3Endpoint ||
+      !render.source ||
+      !render.environmentId ||
+      !renderArtifacts ||
+      !config.connectorSecretKey
+    )
+      throw new Error(
+        "Render app deployment requires durable database, storage, Git source, environment, and credential keys",
+      );
+    const database = createRenderAppDatabase({
+      adminUrl: config.databaseUrl,
+      appEndpoint: render.appDatabaseEndpoint,
+      store: artifactMap<StoredRenderAppDatabase>("render_app_databases"),
+      keyMaterial: config.connectorSecretKey,
+    });
+    const storage = createRenderAppStorage({
+      apiKey: render.apiKey,
+      workspaceId: render.workspaceId,
+      environmentId: render.environmentId,
+      minioServiceId: render.minioServiceId,
+      endpoint: config.s3Endpoint,
+      bucket: config.s3Bucket,
+      prefix: config.s3Prefix,
+      region: config.s3Region,
+      store: artifactMap<StoredRenderAppStorage>("render_app_storage"),
+      keyMaterial: config.connectorSecretKey,
+    });
+    return createRenderDeployProvider({
+      ...render,
+      source: render.source,
+      environmentId: render.environmentId,
+      store: renderDeployBodies,
+      artifacts: renderArtifacts,
+      advisoryLock: renderLock,
+      resources: {
+        ensure: async (id) => ({ ...(await database.ensure(id)), ...(await storage.ensure(id)) }),
+        suspend: async (id) => {
+          await database.suspend(id);
+          await storage.suspend(id);
+        },
+      },
+    });
+  };
   const buildAwsDeploy = (): DeployProvider =>
     createAwsDeployProvider({
       ...config.awsDeploy,
@@ -1304,6 +1439,7 @@ export function buildApp(
     });
   const buildDeployProvider: Record<Config["deployProvider"], () => DeployProvider> = {
     aws: buildAwsDeploy,
+    render: buildRenderDeploy,
     docker: createDockerDeployProvider,
     fly: () => createFlyDeployProvider(config.flyDeploy),
     porter: () =>
@@ -1356,14 +1492,15 @@ export function buildApp(
   membership.managesArtifactHome = managesArtifactHome;
   const deployGitSecret = config.signingSecret;
   const deployGitBase = config.apiBaseUrl;
-  const deployService = createDeployService({
+  const deployService = (config.deployProvider === "render" ? createRenderDeployService : createDeployService)({
+    renderStore: renderDeployBodies,
     deployStore,
     provider: deployProvider,
     deployDir: join(config.dataDir, "deployments"),
     auditLog,
     acl,
     leaderLease,
-    advisoryLock,
+    advisoryLock: renderLock,
     canReadScope,
     canWriteScope,
     managesArtifactHome,
@@ -1738,6 +1875,15 @@ export function buildApp(
     modelProviders: modelProviderAvailabilityFor(config.harness, providerKeys),
     runWaitMs: config.runWaitMs,
   });
+  if (renderArtifacts) {
+    const authorizes = app.authorizesDeploymentGitAccess.bind(app);
+    app.authorizesDeploymentGitAccess = async (id, principalId, permission) => {
+      if (!isRenderDeployPrincipal(principalId)) return authorizes(id, principalId, permission);
+      const deployment = await deployService.getDeployment(id);
+      return deployment ? renderArtifacts.authorizes(deployment, principalId, permission) : false;
+    };
+  }
+
   const inboxRealtime = createInboxRealtime({
     loops: loopStore,
     items: loopItems,
@@ -1964,19 +2110,38 @@ export function buildApp(
     protection: taskProtection,
     busy: () => workers.some((w) => w.busy()),
   });
-  const workers: Worker[] = Array.from({ length: Math.max(1, config.workers) }, () =>
-    createWorker({
-      runs,
-      sessions,
-      orchestrator,
-      leaseTtlMs,
-      heartbeatIntervalMs: config.heartbeatIntervalMs,
-      errors,
-      pollMs: 250,
-      canClaim: () => drain.canClaim(),
-      onClaimed: () => drain.noteBusy(),
-    }),
-  );
+  const workers: Worker[] =
+    config.deployProvider === "render" && (config.renderDeploy.workflowTaskId || config.renderDeploy.workflowSlug)
+      ? [
+          createRenderWorkflowWorker({
+            apiKey: config.renderDeploy.apiKey,
+            task: config.renderDeploy.workflowTaskId || `${config.renderDeploy.workflowSlug}/qm_run`,
+            runs,
+            store: artifactMap<RenderWorkflowDispatch>("render_workflow_dispatches"),
+            lock: renderLock,
+            canClaim: () => drain.canClaim(),
+            onError: (error) =>
+              errors.record({
+                category: "render",
+                code: "workflow_dispatch_failed",
+                message: errMessage(error),
+                scopeLabel: scopeId("org", config.orgId),
+              }),
+          }),
+        ]
+      : Array.from({ length: Math.max(1, config.workers) }, () =>
+          createWorker({
+            runs,
+            sessions,
+            orchestrator,
+            leaseTtlMs,
+            heartbeatIntervalMs: config.heartbeatIntervalMs,
+            errors,
+            pollMs: 250,
+            canClaim: () => drain.canClaim(),
+            onClaimed: () => drain.noteBusy(),
+          }),
+        );
   const processReaper: ProcessReaper | null = processes
     ? createProcessReaper(processes, {
         intervalMs: config.processReaperIntervalMs,
@@ -2010,14 +2175,14 @@ export function buildApp(
   const sweepFractions = [deepIdleMachineMs, devIdleMachineMs]
     .filter((w): w is number => !!w && w > 0)
     .map((w) => Math.floor(w / 24));
-  const deepIdleReapEnabled = Boolean(sandbox.reapDeepIdle && sweepFractions.length);
+  const deepIdleReapEnabled = Boolean(sandbox.reapDeepIdle && (sweepFractions.length || enabledBackends.has("render")));
   const deepIdleSweeper = deepIdleReapEnabled
     ? createSweeper(
         () =>
           leaderLease.hold("sandbox:deep-idle-reaper", () =>
             sandbox.reapDeepIdle!(deepIdleMachineMs, devIdleMachineMs),
           ),
-        Math.max(60_000, Math.min(...sweepFractions)),
+        enabledBackends.has("render") ? 60_000 : Math.max(60_000, Math.min(...sweepFractions)),
         { immediate: true },
       )
     : null;
@@ -2071,6 +2236,16 @@ export function buildApp(
   };
 
   return {
+    async processRenderRun(runId) {
+      if (!renderSelected) throw new Error("Render Workflow runs require a Render deployment");
+      const run = await runs.claimById(runId, `render-workflow:${randomUUID()}`, leaseTtlMs);
+      if (run)
+        await processRun(
+          { runs, orchestrator, leaseTtlMs, heartbeatIntervalMs: config.heartbeatIntervalMs, errors },
+          run,
+          { background: true },
+        );
+    },
     app,
     ...(screenSecurity ? { screenSecurity } : {}),
     deploymentLayer,
@@ -2154,6 +2329,7 @@ export function buildApp(
     sessionShareBytes:
       config.snapshotStore === "s3" && config.s3Bucket
         ? createS3DurableByteStore({
+            ...(renderSelected ? { _client: s3 } : {}),
             bucket: config.s3Bucket,
             ...(config.s3Region ? { region: config.s3Region } : {}),
             prefix: `${config.s3Prefix ?? ""}session-shares/`,
