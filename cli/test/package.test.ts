@@ -47,35 +47,42 @@ test(
       const tarball = join(dir, packed[0]!.filename);
       const deployment = join(dir, "deployment");
       const awsDeployment = join(dir, "aws-deployment");
+      const renderDeployment = join(dir, "render-deployment");
       const tarballBytes = readFileSync(tarball);
       const packageManifest = JSON.parse(readFileSync(join(cliDir, "package.json"), "utf8")) as Record<string, unknown>;
       const version = packageManifest["version"] as string;
+      const packages = [{ manifest: packageManifest, bytes: tarballBytes }];
       registry = createServer((request, response) => {
         const origin = `http://${request.headers.host}`;
-        if (request.url && decodeURIComponent(request.url) === "/@yc-software/qm") {
-          response.setHeader("content-type", "application/json");
-          response.end(
-            JSON.stringify({
-              name: "@yc-software/qm",
-              "dist-tags": { latest: version },
-              versions: {
-                [version]: {
-                  ...packageManifest,
-                  dist: {
-                    tarball: `${origin}/@yc-software/qm/-/qm-${version}.tgz`,
-                    shasum: createHash("sha1").update(tarballBytes).digest("hex"),
-                    integrity: `sha512-${createHash("sha512").update(tarballBytes).digest("base64")}`,
+        for (const item of packages) {
+          const name = item.manifest.name as string;
+          const packageVersion = item.manifest.version as string;
+          const tarballPath = `/${name}/-/${name.split("/").at(-1)}-${packageVersion}.tgz`;
+          if (request.url && decodeURIComponent(request.url) === `/${name}`) {
+            response.setHeader("content-type", "application/json");
+            response.end(
+              JSON.stringify({
+                name,
+                "dist-tags": { latest: packageVersion },
+                versions: {
+                  [packageVersion]: {
+                    ...item.manifest,
+                    dist: {
+                      tarball: `${origin}${tarballPath}`,
+                      shasum: createHash("sha1").update(item.bytes).digest("hex"),
+                      integrity: `sha512-${createHash("sha512").update(item.bytes).digest("base64")}`,
+                    },
                   },
                 },
-              },
-            }),
-          );
-          return;
-        }
-        if (request.url === `/@yc-software/qm/-/qm-${version}.tgz`) {
-          response.setHeader("content-type", "application/octet-stream");
-          response.end(tarballBytes);
-          return;
+              }),
+            );
+            return;
+          }
+          if (request.url === tarballPath) {
+            response.setHeader("content-type", "application/octet-stream");
+            response.end(item.bytes);
+            return;
+          }
         }
         response.statusCode = 404;
         response.end();
@@ -85,6 +92,7 @@ test(
       const consumers = [
         { dir: deployment, org: "acme", target: "fly" },
         { dir: awsDeployment, org: "acme-aws", target: "aws" },
+        { dir: renderDeployment, org: "acme-render", target: "render" },
       ] as const;
       for (const consumer of consumers) {
         mkdirSync(consumer.dir, { recursive: true });
@@ -123,9 +131,14 @@ test(
         assert.ok(realpathSync(installed).startsWith(`${realpathSync(consumer.dir)}/`));
         const imageManifest = JSON.parse(readFileSync(join(installed, "manifest.json"), "utf8")) as {
           sandboxBase: string;
+          renderDeployRunner: string;
           services: Record<string, string>;
         };
-        for (const reference of [imageManifest.sandboxBase, ...Object.values(imageManifest.services)]) {
+        for (const reference of [
+          imageManifest.sandboxBase,
+          imageManifest.renderDeployRunner,
+          ...Object.values(imageManifest.services),
+        ]) {
           assert.match(reference, /@sha256:[a-f0-9]{64}$/, "every package-selected runtime image is immutable");
         }
         const consumerPackage = JSON.parse(readFileSync(join(consumer.dir, "package.json"), "utf8")) as {
@@ -141,6 +154,17 @@ test(
       registry = undefined;
       const bin = join(deployment, "node_modules", ".bin", "qm");
       const awsBin = join(awsDeployment, "node_modules", ".bin", "qm");
+      const renderBin = join(renderDeployment, "node_modules", ".bin", "qm");
+      assert.equal(existsSync(join(renderDeployment, "render.yaml")), false);
+      assert.match(
+        readFileSync(join(renderDeployment, ".env.example"), "utf8"),
+        /^# AWS_SECRET_ACCESS_KEY= {2}# supplied by qm up on Render$/m,
+      );
+      assert.match(
+        execFileSync(renderBin, ["check"], { cwd: renderDeployment, encoding: "utf8", env }),
+        /check passed/,
+      );
+
       rmSync(tarball);
 
       assert.ok(existsSync(join(deployment, "deployment.md")));
@@ -278,6 +302,7 @@ else if (command === "secretsmanager get-secret-value") {
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/deployment/references/fly.md"));
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/deployment/references/porter.md"));
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/fly/core.toml"));
+
       assert.ok(!packed[0]!.files.some(({ path }) => path === "src/contract.ts" || path === "bin/qm.ts"));
     } finally {
       if (registry) await new Promise<void>((resolve) => registry!.close(() => resolve()));

@@ -4,6 +4,7 @@ import type { ServiceName } from "./services.ts";
 
 interface ImageManifest {
   sandboxBase: string;
+  renderDeployRunner?: string;
   services: Record<string, string>;
 }
 
@@ -49,6 +50,15 @@ export function manifestRef(service: ServiceName): string {
 
 export function sandboxBaseRef(): string {
   return immutableRef(loadManifest().sandboxBase, "sandbox base");
+}
+
+export function renderDeployRunnerRef(): string {
+  const ref = loadManifest().renderDeployRunner;
+  if (!ref)
+    throw new Error(
+      "This CLI release has no Render app runner image. Set env.core.RENDER_DEPLOY_IMAGE to a published runner image or use a release with Render support",
+    );
+  return immutableRef(ref, "Render app runner");
 }
 
 function immutableRef(ref: string, name: string): string {

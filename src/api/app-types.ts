@@ -1,3 +1,4 @@
+import type { RenderDeployArtifacts } from "../deploy/render-deploy-artifacts.ts";
 import type { ModelOverlayStore } from "../model/model-overlay-store.ts";
 import type {
   DeliveryProvenance,
@@ -595,6 +596,7 @@ export interface AppDeps {
   emailAuthMembers?: DirectoryMember[];
   projects?: ProjectStore;
   deploy: DeployService;
+  renderDeployArtifacts?: Pick<RenderDeployArtifacts, "authorizes">;
   deploymentLayer?: DeploymentLayerRuntime;
   files: FileArtifactStore;
   approvals?: DurableMap<PendingApprovalRecord>;

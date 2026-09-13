@@ -46,7 +46,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "local" | "sprites" | "aws" | "agent37";
+  backend?: "local" | "sprites" | "aws" | "agent37" | "render";
   app?: string;
   image?: string;
   baseImage?: string;
@@ -77,6 +77,17 @@ export interface AwsServiceConfig {
   publicPaths?: string[];
   logGroup?: string;
   stopTimeout?: number;
+}
+
+export interface RenderConfig {
+  source?: { repo: string; branch: string };
+  storage: { type: "minio"; plan: string; diskSizeGB: number } | { type: "external" };
+  workspaceId: string;
+  region: "oregon" | "ohio" | "virginia" | "frankfurt" | "singapore";
+  corePlan: string;
+  servicePlan: string;
+  postgresPlan: string;
+  postgresDiskSizeGB: number;
 }
 
 export interface AwsConfig {
@@ -163,6 +174,7 @@ export interface QmConfig {
   imageFrom?: string;
   deployAppPrefix?: string;
   aws?: AwsConfig;
+  render?: RenderConfig;
 }
 
 export function securityScreenEnv(config: Pick<QmConfig, "securityScreen">): Record<string, string> {
@@ -222,8 +234,8 @@ export function sandboxCoreEnv(
     if (sb.image) env.LOCAL_SANDBOX_IMAGE = sb.image;
     return { env, missingSecrets };
   }
-  if (sb.backend === "agent37") {
-    env.SANDBOX_BACKEND = "agent37";
+  if (sb.backend === "agent37" || sb.backend === "render") {
+    env.SANDBOX_BACKEND = sb.backend;
     return { env, missingSecrets };
   }
   for (const [k, v] of Object.entries(sb.env ?? {})) env[`FLY_RESIDENT_ENV_${k}`] = v;
@@ -499,6 +511,7 @@ const VALID_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   "imageFrom",
   "deployAppPrefix",
   "aws",
+  "render",
 ]);
 
 function validate(raw: unknown, path: string): QmConfig {
@@ -733,6 +746,12 @@ function validate(raw: unknown, path: string): QmConfig {
     ];
     out.aws = validateAws(o["aws"], path, runnableServices(services), configuredSecretNames);
   }
+  if (o["render"] !== undefined) out.render = validateRender(o["render"], path);
+  if (out.render?.storage.type === "minio") {
+    const collision = out.plugins.find((plugin) => plugin.name === "minio");
+    if (collision) throw new CliError(`${path}: plugin ${collision.name} conflicts with bundled Render storage`);
+  }
+  if (target === "render" && !out.render) throw new CliError(`${path}: target "render" requires a "render" block`);
   if (target === "aws" && !out.aws) throw new CliError(`${path}: target "aws" requires an "aws" block`);
   validateModelProvider(out, path);
   validatePortalTrust(out, path);
@@ -1387,6 +1406,129 @@ function validateAws(
   return out;
 }
 
+export function renderSource(raw: unknown, path: string): NonNullable<RenderConfig["source"]> {
+  if (!isPlainObject(raw) || Object.keys(raw).some((key) => !["repo", "branch"].includes(key)))
+    throw new CliError(`${path}: render.source must contain repo and branch`);
+  const repo =
+    typeof raw.repo === "string"
+      ? raw.repo
+          .trim()
+          .replace(/\/$/, "")
+          .replace(/\.git$/, "")
+      : "";
+  if (
+    !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ||
+    repo
+      .split("/")
+      .slice(-2)
+      .some((part) => [".", ".."].includes(part))
+  )
+    throw new CliError(`${path}: render.source.repo must be an HTTPS GitHub repository URL without credentials`);
+  const branch = typeof raw.branch === "string" ? raw.branch.trim() : "";
+  if (
+    !branch ||
+    branch === "@" ||
+    /[\x00-\x20\x7f~^:?*[\\]/.test(branch) ||
+    branch.startsWith("-") ||
+    branch.includes("..") ||
+    branch.includes("@{") ||
+    branch.endsWith(".") ||
+    branch.split("/").some((part) => !part || part.startsWith(".") || part.endsWith(".lock"))
+  )
+    throw new CliError(`${path}: render.source.branch must be a Git branch name`);
+  return { repo, branch };
+}
+
+function validateRender(raw: unknown, path: string): RenderConfig {
+  if (!isPlainObject(raw)) throw new CliError(`${path}: "render" must be an object`);
+  const allowed = new Set([
+    "workspaceId",
+    "region",
+    "corePlan",
+    "servicePlan",
+    "postgresPlan",
+    "postgresDiskSizeGB",
+    "storage",
+    "source",
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) throw new CliError(`${path}: unknown render.${key}`);
+  }
+  let storage: RenderConfig["storage"] = { type: "external" };
+  if (raw.storage !== undefined) {
+    if (!isPlainObject(raw.storage) || !["minio", "external"].includes(String(raw.storage.type)))
+      throw new CliError(`${path}: render.storage.type must be minio or external`);
+    const storageKeys = raw.storage.type === "minio" ? ["type", "plan", "diskSizeGB"] : ["type"];
+    for (const key of Object.keys(raw.storage)) {
+      if (!storageKeys.includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
+    }
+    if (raw.storage.type === "minio") {
+      const plan = raw.storage.plan ?? "0.5c-512mb";
+      if (typeof plan !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(plan) || plan === "free")
+        throw new CliError(`${path}: render.storage.plan must name a paid Render plan`);
+      const diskSizeGB = raw.storage.diskSizeGB ?? 10;
+      if (typeof diskSizeGB !== "number" || !Number.isInteger(diskSizeGB) || diskSizeGB < 1 || diskSizeGB > 1000)
+        throw new CliError(`${path}: render.storage.diskSizeGB must be an integer from 1 to 1000`);
+      storage = { type: "minio", plan, diskSizeGB };
+    }
+  }
+  const workspaceId = raw.workspaceId;
+  if (typeof workspaceId !== "string" || !/^(tea|usr)-[a-z0-9]+$/.test(workspaceId)) {
+    throw new CliError(`${path}: render.workspaceId must be a Render workspace ID (tea-... or usr-...)`);
+  }
+  const region = raw.region ?? "oregon";
+  if (typeof region !== "string" || !["oregon", "ohio", "virginia", "frankfurt", "singapore"].includes(region)) {
+    throw new CliError(`${path}: render.region must be a Render region`);
+  }
+  const plan = (key: string, fallback: string): string => {
+    const value = raw[key] ?? fallback;
+    if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free") {
+      throw new CliError(`${path}: render.${key} must name a paid Render plan`);
+    }
+    return value;
+  };
+  const postgresDiskSizeGB = raw.postgresDiskSizeGB ?? 10;
+  if (
+    typeof postgresDiskSizeGB !== "number" ||
+    !Number.isInteger(postgresDiskSizeGB) ||
+    postgresDiskSizeGB < 1 ||
+    postgresDiskSizeGB > 1000
+  ) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be an integer from 1 to 1000`);
+  }
+  if (postgresDiskSizeGB !== 1 && postgresDiskSizeGB % 5 !== 0) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be 1 or a multiple of 5`);
+  }
+  return {
+    ...(raw.source !== undefined ? { source: renderSource(raw.source, path) } : {}),
+    storage,
+    workspaceId,
+    region: region as RenderConfig["region"],
+    corePlan: plan("corePlan", "1c-2g"),
+    servicePlan: plan("servicePlan", "0.5c-512mb"),
+    postgresPlan: plan("postgresPlan", "0.5c-1g"),
+    postgresDiskSizeGB,
+  };
+}
+
+export function updateConfigUrls(raw: string, updates: { publicUrl: string; apiUrl: string }): string {
+  const root = objectProps(stripJsonComments(raw), 0);
+  const edits: Array<{ start: number; end: number; text: string }> = [];
+  for (const [key, value] of Object.entries(updates)) {
+    const property = root.props.find((entry) => entry.key === key);
+    if (property) edits.push({ start: property.valueStart, end: property.valueEnd, text: JSON.stringify(value) });
+    else
+      edits.push({
+        start: root.openBrace + 1,
+        end: root.openBrace + 1,
+        text: `\n  ${JSON.stringify(key)}: ${JSON.stringify(value)},`,
+      });
+  }
+  for (const edit of edits.sort((a, b) => b.start - a.start))
+    raw = raw.slice(0, edit.start) + edit.text + raw.slice(edit.end);
+  return raw;
+}
+
 function validateSandbox(raw: unknown, path: string, target: Target): SandboxConfig | undefined {
   if (raw === undefined) return undefined;
   if (!isPlainObject(raw)) {
@@ -1404,10 +1546,11 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       o["backend"] !== "local" &&
       o["backend"] !== "sprites" &&
       o["backend"] !== "aws" &&
-      o["backend"] !== "agent37"
+      o["backend"] !== "agent37" &&
+      o["backend"] !== "render"
     ) {
       throw new CliError(
-        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), or "agent37"`,
+        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), "agent37", or "render"`,
       );
     }
     out.backend = o["backend"];
@@ -1419,6 +1562,8 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
     out.app = o["app"];
   }
   if (o["image"] !== undefined) {
+    if (o["backend"] === "render")
+      throw new CliError(`${path}: Render Sandboxes use the Render base image; remove sandbox.image`);
     if (o["backend"] === "local") {
       if (typeof o["image"] !== "string" || !o["image"].trim()) {
         throw new CliError(`${path}: "sandbox.image" must be a non-empty runnable image ref for the local backend`);
@@ -1471,11 +1616,11 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
-  if (out.backend === "agent37") {
+  if (out.backend === "agent37" || out.backend === "render") {
     const stray = (["app", "image", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
     if (stray.length) {
       throw new CliError(
-        `${path}: "sandbox.backend": "agent37" ignores ${stray.map((key) => `"sandbox.${key}"`).join(", ")} — remove them`,
+        `${path}: "sandbox.backend": ${JSON.stringify(out.backend)} ignores ${stray.map((key) => `"sandbox.${key}"`).join(", ")} — remove them`,
       );
     }
   }

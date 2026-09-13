@@ -205,12 +205,17 @@ test("hydrate coalesces a stream of small chunks into partBytes writes", async (
   assert.ok(Buffer.from(readFileSync(join(b.home, "f.bin"))).equals(data));
 });
 
-test("the whole snapshot is bounded by one deadline", async () => {
+test("the whole snapshot is bounded by one deadline", async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
   const a = box();
   fill(a.home, "data.bin", 4096 * 4);
   const slow: HomeSnapshotSessionIo<Box> = {
     ...io,
-    readFileBytes: (b, abs) => new Promise((res) => setTimeout(() => res(io.readFileBytes(b, abs)), 40)),
+    async readFileBytes(b, abs) {
+      now += 40;
+      return io.readFileBytes(b, abs);
+    },
   };
   const rec = recordingStore();
   const snap = createHomeSnapshotOps<Box>({

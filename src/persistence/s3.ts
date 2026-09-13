@@ -5,8 +5,24 @@ export interface S3Send {
   send(command: unknown): Promise<unknown>;
 }
 
-export function s3Client(region?: string): S3Send {
-  return new S3Client(region ? { region } : {}) as S3Send;
+export interface S3ConnectionOptions {
+  region?: string;
+  endpoint?: string;
+  forcePathStyle?: boolean;
+}
+
+export function s3Client(options: S3ConnectionOptions = {}): S3Client {
+  return new S3Client({
+    ...(options.region ? { region: options.region } : {}),
+    ...(options.endpoint
+      ? {
+          endpoint: options.endpoint,
+          requestChecksumCalculation: "WHEN_REQUIRED",
+          responseChecksumValidation: "WHEN_REQUIRED",
+        }
+      : {}),
+    ...(options.forcePathStyle !== undefined ? { forcePathStyle: options.forcePathStyle } : {}),
+  });
 }
 
 export function bodyToReadable(body: unknown): Readable {

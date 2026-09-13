@@ -20,6 +20,8 @@ COPY plugins/admin/public /admin/public
 COPY plugins/chassis/src /chassis/src
 COPY --from=build /app/dist-web ./dist-web
 
+COPY deploy/render/start.mjs ./deploy/render/start.mjs
+
 ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080

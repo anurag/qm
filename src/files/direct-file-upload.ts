@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
-  S3Client,
   AbortMultipartUploadCommand,
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
@@ -11,7 +10,7 @@ import {
   type Part,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { isNoSuchKey, type S3Send } from "../persistence/s3.ts";
+import { isNoSuchKey, s3Client, type S3ConnectionOptions, type S3Send } from "../persistence/s3.ts";
 import {
   FileArtifactDeletedError,
   artifactPath,
@@ -57,17 +56,18 @@ export interface DirectFileUploads {
   stop(): void;
 }
 
-export function createDirectFileUploads(options: {
-  bucket: string;
-  prefix?: string;
-  region?: string;
-  store: FileUploadStore;
-  files: FileArtifactStore;
-  client?: S3Send;
-  presign?: (command: UploadPartCommand, expiresIn: number) => Promise<string>;
-  now?: () => number;
-}): DirectFileUploads {
-  const nativeClient = new S3Client(options.region ? { region: options.region } : {});
+export function createDirectFileUploads(
+  options: S3ConnectionOptions & {
+    bucket: string;
+    prefix?: string;
+    store: FileUploadStore;
+    files: FileArtifactStore;
+    client?: S3Send;
+    presign?: (command: UploadPartCommand, expiresIn: number) => Promise<string>;
+    now?: () => number;
+  },
+): DirectFileUploads {
+  const nativeClient = s3Client(options);
   const client = options.client ?? nativeClient;
   const presign =
     options.presign ??
@@ -90,7 +90,13 @@ export function createDirectFileUploads(options: {
   }
   async function verifyObject(row: FileUpload): Promise<boolean> {
     try {
-      const head = (await client.send(new HeadObjectCommand({ ...target(row), ChecksumMode: "ENABLED" }))) as {
+      const head = (await client.send(
+        new HeadObjectCommand({
+          ...target(row),
+          ChecksumMode: "ENABLED",
+          ResponseContentType: "application/octet-stream",
+        }),
+      )) as {
         ContentLength?: number;
         ChecksumSHA256?: string;
         Metadata?: Record<string, string>;

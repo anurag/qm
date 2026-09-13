@@ -1,4 +1,3 @@
-import { relative } from "node:path";
 import type { ScopeId } from "../../types.ts";
 import type { HarnessModelUtilities } from "../../harness/harness.ts";
 import type { WorkspaceStore } from "../../workspace/workspace-store.ts";
@@ -139,21 +138,25 @@ export function createScratchPromote(deps: ScratchPromoteDeps): { strategy: Memo
         const clean = facts.map((f) => f.replace(/\s+/g, " ").trim()).filter(Boolean);
         if (!clean.length) return 0;
         const path = logPath(at);
-        const existing = (await workspace.read(scopeId, path)) ?? "";
-        const seen = new Set(bullets(existing).map(normalize));
         const date = dateStr(at);
         const added: string[] = [];
-        for (const f of clean) {
-          const key = normalize(f);
-          if (!key || seen.has(key)) continue;
-          seen.add(key);
-          added.push(`- (${date}) ${f}`);
-        }
+        await workspace.update(scopeId, path, (current) => {
+          added.length = 0;
+          const existing = current ?? "";
+          const seen = new Set(bullets(existing).map(normalize));
+          for (const f of clean) {
+            const key = normalize(f);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            added.push(`- (${date}) ${f}`);
+          }
+          if (!added.length) return null;
+          const body = existing.trim()
+            ? `${existing.replace(/\s+$/, "")}\n${added.join("\n")}`
+            : `# Scratch log ${date}\n\n${added.join("\n")}`;
+          return `${body}\n`;
+        });
         if (!added.length) return 0;
-        const body = existing.trim()
-          ? `${existing.replace(/\s+$/, "")}\n${added.join("\n")}`
-          : `# Scratch log ${date}\n\n${added.join("\n")}`;
-        await workspace.write(scopeId, path, `${body}\n`);
 
         const count = await bumpMarker(scopeId, added.length);
         if (deps.consolidateAfter > 0 && count >= deps.consolidateAfter) {
@@ -219,8 +222,7 @@ export function createScratchPromote(deps: ScratchPromoteDeps): { strategy: Memo
         }
       }
       const cutoff = dateStr(now - LOG_RETENTION_DAYS * 86_400_000);
-      for (const abs of await workspace.list(scopeId)) {
-        const rel = relative(workspace.scopeDir(scopeId), abs);
+      for (const rel of await workspace.list(scopeId)) {
         const m = rel.match(/^memory\/log\/(\d{4}-\d\d-\d\d)\.md$/);
         if (m && m[1]! < cutoff) await workspace.remove(scopeId, rel);
       }

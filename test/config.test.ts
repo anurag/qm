@@ -702,3 +702,55 @@ test("sandbox resource rollout requires explicit activation", () => {
     /not a recognized boolean/,
   );
 });
+
+test("S3-compatible storage accepts an endpoint and strict path style configuration", () => {
+  const config = loadConfig({
+    S3_BUCKET: "qm-files",
+    S3_REGION: "auto",
+    AWS_ENDPOINT_URL_S3: "https://objects.example.com",
+    S3_FORCE_PATH_STYLE: "on",
+    SNAPSHOT_STORE: "s3",
+    TRANSFER_STORE: "s3",
+  });
+  assert.equal(config.s3Endpoint, "https://objects.example.com");
+  assert.equal(config.s3ForcePathStyle, true);
+  assert.equal(config.s3Region, "auto");
+  assert.equal(config.snapshotStore, "s3");
+  assert.equal(config.transferStore, "s3");
+  assert.equal(config.workspaceStore, "local");
+  assert.equal(loadConfig({}).s3Endpoint, undefined);
+  assert.equal(loadConfig({}).s3ForcePathStyle, false);
+  assert.equal(loadConfig({ S3_FORCE_PATH_STYLE: "off" }).s3ForcePathStyle, false);
+  assert.throws(() => loadConfig({ S3_FORCE_PATH_STYLE: "enabled" }), /not a recognized boolean/);
+  for (const endpoint of [
+    "objects.example.com",
+    "file:///tmp/objects",
+    "https://user:secret@objects.example.com",
+    "https://objects.example.com?token=secret",
+    "https://objects.example.com#key",
+  ]) {
+    assert.throws(
+      () => loadConfig({ AWS_ENDPOINT_URL_S3: endpoint }),
+      /AWS_ENDPOINT_URL_S3 must be an HTTP or HTTPS URL/,
+    );
+  }
+});
+
+test("file stores reject unsupported or incomplete S3 configuration", () => {
+  for (const name of ["WORKSPACE_STORE", "SNAPSHOT_STORE", "TRANSFER_STORE"] as const) {
+    assert.throws(() => loadConfig({ [name]: "s3" }), new RegExp(`${name}=s3 requires S3_BUCKET`));
+    assert.throws(() => loadConfig({ [name]: "unknown" }), new RegExp(`${name} must be local or s3`));
+  }
+  const shared = { WORKSPACE_STORE: "s3", S3_BUCKET: "qm-files" };
+  assert.throws(() => loadConfig(shared), /requires DATABASE_URL and SNAPSHOT_STORE=s3/);
+  assert.throws(
+    () => loadConfig({ ...shared, DATABASE_URL: "postgres://test" }),
+    /requires DATABASE_URL and SNAPSHOT_STORE=s3/,
+  );
+  assert.throws(() => loadConfig({ ...shared, SNAPSHOT_STORE: "s3" }), /requires DATABASE_URL and SNAPSHOT_STORE=s3/);
+  assert.equal(loadConfig({ ...shared, DATABASE_URL: "postgres://test", SNAPSHOT_STORE: "s3" }).workspaceStore, "s3");
+  assert.equal(
+    loadConfig({ DATABASE_URL: "postgres://test", S3_BUCKET: "qm-files", SNAPSHOT_STORE: "s3" }).workspaceStore,
+    "local",
+  );
+});

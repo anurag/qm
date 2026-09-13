@@ -17,7 +17,7 @@ import {
 import { shq } from "../util/shell.ts";
 import { swallowAs } from "../util/errors.ts";
 import { sleep, withTimeout } from "../util/async.ts";
-import { bodyToReadable, isNoSuchKey, s3Client, type S3Send } from "../persistence/s3.ts";
+import { bodyToReadable, isNoSuchKey, s3Client, type S3ConnectionOptions, type S3Send } from "../persistence/s3.ts";
 import { displacedPruneGlobs } from "../credentials/resident-paths.ts";
 import type { TeardownOptions } from "./sandbox.ts";
 
@@ -184,23 +184,24 @@ export function createLocalSnapshotStore(dir: string): HomeSnapshotStore {
   };
 }
 
-export interface S3SnapshotStoreOptions {
+export interface S3SnapshotStoreOptions extends S3ConnectionOptions {
   bucket: string;
   prefix: string;
-  region?: string;
   s3?: S3Send;
   keyFor?: (scope: string) => string;
 }
 
 export function createS3SnapshotStore(opts: S3SnapshotStoreOptions): HomeSnapshotStore {
-  const s3 = opts.s3 ?? s3Client(opts.region);
+  const s3 = opts.s3 ?? s3Client(opts);
   const keyFor = opts.keyFor ?? ((scope: string): string => `${opts.prefix}/${encodeURIComponent(scope)}.tar`);
   const Bucket = opts.bucket;
   return {
     async open(scope): Promise<StoredSnapshot | null> {
       let got: { Body?: unknown; ContentLength?: number };
       try {
-        got = (await s3.send(new GetObjectCommand({ Bucket, Key: keyFor(scope) }))) as typeof got;
+        got = (await s3.send(
+          new GetObjectCommand({ Bucket, Key: keyFor(scope), ResponseContentType: "application/octet-stream" }),
+        )) as typeof got;
       } catch (e) {
         if (isNoSuchKey(e)) return null;
         throw e;
@@ -244,7 +245,13 @@ export function createS3SnapshotStore(opts: S3SnapshotStoreOptions): HomeSnapsho
       };
     },
     async adoptFromS3(scope, ref): Promise<void> {
-      const head = (await s3.send(new HeadObjectCommand({ Bucket: ref.bucket, Key: ref.key }))) as {
+      const head = (await s3.send(
+        new HeadObjectCommand({
+          Bucket: ref.bucket,
+          Key: ref.key,
+          ResponseContentType: "application/octet-stream",
+        }),
+      )) as {
         ContentLength?: number;
       };
       const size = head.ContentLength ?? 0;

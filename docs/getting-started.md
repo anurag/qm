@@ -8,11 +8,11 @@ directory, `deploy/layers/<org>/`: its config, sandbox customizations, provider
 coordinates, and generated Slack manifests. The rest of the tree stays identical to
 upstream. See [`../deploy/layers/README.md`](../deploy/layers/README.md).
 
-For a new layer, the agent first asks the operator for Fly.io or AWS (the slug
+For a new layer, the agent first asks the operator for Fly.io, AWS, or Render (the slug
 is a local name derived from the organization, not globally unique), then runs:
 
 ```bash
-node cli/bin/qm.ts init deploy/layers/<org> --org <slug> --target <fly-or-aws>
+node cli/bin/qm.ts init deploy/layers/<org> --org <slug> --target <fly-or-aws-or-render>
 ```
 
 Provider choice is part of initialization because it determines the config,
@@ -28,7 +28,8 @@ everything else. Drop `"auth"` from `services` to use an external identity
 provider instead; that provider must then register the exact
 `<publicUrl>/auth/callback` redirect.
 
-The installed package carries Fly and AWS provider templates and dispatches
-their common lifecycle through the hosting-provider registry. Initialization
+The installed package supports Fly, AWS, and Render through the hosting-provider
+registry. Render creates and updates infrastructure through its API; see
+[Render support](./render.md). Initialization
 does not create deployment CI, and the QM source repository has no production
 deployment workflow.

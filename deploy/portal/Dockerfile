@@ -11,6 +11,8 @@ RUN ln -s /app/node_modules /auth/node_modules
 COPY plugins/chassis/src /chassis/src
 COPY plugins/portal/tsconfig.json ./
 
+COPY deploy/render/start.mjs ./deploy/render/start.mjs
+
 ENV NODE_ENV=production
 ENV PORT=8080
 EXPOSE 8080

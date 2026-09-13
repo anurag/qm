@@ -140,7 +140,7 @@ Create an organization-owned deployment repository that depends on `@yc-software
 
 ```bash
 npm exec --yes --package=@yc-software/qm@latest -- \
-  qm init . --org <slug> --target <fly-or-aws>
+  qm init . --org <slug> --target <fly-or-aws-or-render>
 npm install
 ```
 
@@ -150,6 +150,13 @@ and live verification — no source checkout required. Each deployment runs in t
 operator's own cloud account; initialization does not generate or enable deployment CI,
 and this repository has no production deployment workflow. See
 [`deployment.md`](./deployment.md) for the details.
+
+The Render target runs QM, agent sandboxes, and published apps on Render.
+Use `qm init --target render --repo <HTTPS-GitHub-URL> --branch <name>` to build
+QM and bundled MinIO from a GitHub branch on Render. Install the CLI from that
+branch first; see the [branch deployment guide](./docs/render-branch-deploy.md).
+This path requires no image publication, manifest changes, or local Docker engine.
+See [Render support](./docs/render.md) for configuration and recovery behavior.
 
 ## Contributing
 
@@ -215,6 +222,3 @@ messages, and screenshots for organization identifiers before it pushes. Nothing
 ## License
 
 Except where otherwise noted, QM is available under the [MIT License](./LICENSE).
-
-Render Sandboxes are available through `SANDBOX_BACKEND=render`. See
-[Render Sandboxes](./docs/render-sandboxes.md) for configuration and recovery.

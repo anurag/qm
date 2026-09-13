@@ -23,7 +23,7 @@ export interface SecretSpec {
   required: boolean | { when: SecretCondition; optional?: true; optionalOtherwise?: true };
   description: string;
   generate?: string;
-  managedBy?: "operator" | "terraform";
+  managedBy?: "operator" | "terraform" | "render";
 }
 
 export interface ComputedSecret {
@@ -32,7 +32,7 @@ export interface ComputedSecret {
   description: string;
   required: boolean;
   generate?: string;
-  managedBy: "operator" | "terraform";
+  managedBy: "operator" | "terraform" | "render";
   aliases?: Array<{ service: DeclaredServiceName; name: string }>;
 }
 
@@ -44,8 +44,17 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "RENDER_API_KEY",
     service: "core",
-    required: { when: { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "render" } },
-    description: "Render API key for agent sandboxes.",
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "target", target: "render" },
+          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "render" },
+          { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "render" },
+        ],
+      },
+    },
+    description: "Render API key for this deployment, sandboxes, and published apps.",
   },
   {
     name: "ANTHROPIC_API_KEY",
@@ -192,7 +201,15 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
   {
     name: "DATABASE_URL",
     service: "core",
-    required: { when: { kind: "target", target: "aws" } },
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "target", target: "aws" },
+          { kind: "target", target: "render" },
+        ],
+      },
+    },
     description: "Postgres connection string for durable state.",
     managedBy: "terraform",
   },
@@ -556,9 +573,28 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
       description: spec.description,
       required,
       ...(spec.generate ? { generate: spec.generate } : {}),
-      managedBy: spec.managedBy ?? "operator",
+      managedBy:
+        config.target === "render" && ["PUBLIC_API_URL", "DATABASE_URL"].includes(spec.name)
+          ? "render"
+          : (spec.managedBy ?? "operator"),
       ...(spec.envName ? { aliases: [{ service: spec.service, name: spec.envName }] } : {}),
     });
+  }
+  if (config.target === "render") {
+    for (const [name, required, description] of [
+      ["AWS_ACCESS_KEY_ID", true, "Access key ID for the S3-compatible object store."],
+      ["AWS_SECRET_ACCESS_KEY", true, "Secret access key for the S3-compatible object store."],
+      ["AWS_SESSION_TOKEN", false, "Session token for temporary S3 credentials, if required by the provider."],
+    ] as const) {
+      if (config.render?.storage.type === "minio" && name === "AWS_SESSION_TOKEN") continue;
+      byName.set(name, {
+        name,
+        services: ["core"],
+        required,
+        description,
+        managedBy: config.render?.storage.type === "minio" ? "render" : "operator",
+      });
+    }
   }
   for (const plugin of config.plugins) {
     const signing = byName.get("CORE_SIGNING_SECRET");
@@ -746,7 +782,8 @@ export function renderEnvExample(config: QmConfig): string {
     ].sort();
     lines.push(`# ${secret.description} (${consumers.join(", ")})`);
     if (secret.generate) lines.push(`# Generate with: ${generate(secret.generate)}`);
-    if (secret.managedBy === "terraform") lines.push(`# ${secret.name}=  # populated by Terraform`);
+    if (secret.managedBy === "render") lines.push(`# ${secret.name}=  # supplied by qm up on Render`);
+    else if (secret.managedBy === "terraform") lines.push(`# ${secret.name}=  # populated by Terraform`);
     else if (secret.required) lines.push(`${secret.name}=`);
     else lines.push(`# ${secret.name}=  # optional`);
     lines.push("");

@@ -16,7 +16,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { swallowAs } from "../util/errors.ts";
 import { asChunks, collectBytes, type ByteSource } from "../util/bytes.ts";
-import { bodyToReadable, isNoSuchKey, s3Client, type S3Send } from "../persistence/s3.ts";
+import { bodyToReadable, isNoSuchKey, s3Client, type S3ConnectionOptions, type S3Send } from "../persistence/s3.ts";
 
 export type { ByteSource } from "../util/bytes.ts";
 
@@ -119,9 +119,8 @@ export function createLocalDurableByteStore(dir: string): DurableByteStore {
   };
 }
 
-export interface S3DurableByteOptions {
+export interface S3DurableByteOptions extends S3ConnectionOptions {
   bucket: string;
-  region?: string;
   prefix?: string;
   _client?: S3Send;
 }
@@ -130,7 +129,7 @@ export function createS3DurableByteStore(options: S3DurableByteOptions): Durable
   const bucket = options.bucket;
   const prefix = options.prefix ?? "";
   const s3Key = (blobKey: string): string => prefix + blobKey;
-  const client = options._client ?? s3Client(options.region);
+  const client = options._client ?? s3Client(options);
 
   return {
     async put(source, opts) {
@@ -197,7 +196,13 @@ export function createS3DurableByteStore(options: S3DurableByteOptions): Durable
       if (!BLOB_KEY.test(blobKey)) return null;
       let r: { Body?: unknown; ContentLength?: number };
       try {
-        r = (await client.send(new GetObjectCommand({ Bucket: bucket, Key: s3Key(blobKey) }))) as {
+        r = (await client.send(
+          new GetObjectCommand({
+            Bucket: bucket,
+            Key: s3Key(blobKey),
+            ResponseContentType: "application/octet-stream",
+          }),
+        )) as {
           Body?: unknown;
           ContentLength?: number;
         };

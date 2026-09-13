@@ -1,13 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import type { LeaderLease } from "../src/persistence/leader-lease.ts";
-import type { AdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { createMemoryAdvisoryLock, type AdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import type { DeployProvider } from "../src/deploy/deploy-provider.ts";
 import { scopeId } from "../src/types.ts";
 
@@ -95,14 +95,14 @@ test("withDeployLock: redeploy/rollback/archive each acquire the advisory mutex 
     entrypoint: "x",
     files: [],
   });
-  assert.deepEqual(keys, [], "the initial create takes no deploy lock");
+  assert.deepEqual(keys, [`deploy:${d.id}`], "initial apply and status commit hold the deployment lock");
 
   await deploy.redeploy(d.id, { entrypoint: "y", files: [] });
   await deploy.rollbackDeployment(d.id, 1);
   await deploy.archiveDeployment(d.id);
 
   const want = `deploy:${d.id}`;
-  assert.deepEqual(keys, [want, want, want], "redeploy, rollback, archive each lock deploy:<id>");
+  assert.deepEqual(keys, [want, want, want, want], "create, redeploy, rollback, archive each lock deploy:<id>");
 });
 
 test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)", async () => {
@@ -138,4 +138,51 @@ test("withDeployLock: same-instance lifecycle ops still serialize (no overlap)",
     deploy.redeploy(d.id, { entrypoint: "b", files: [] }),
   ]);
   assert.equal(maxActive, 1, "two redeploys on one deployment never ran apply() concurrently");
+});
+
+test("initial deployment and archive serialize across core instances", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "initial-deploy-lock-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const store = createDeployStore({ git: { repoRoot: join(dir, "git") } });
+  const lock = createMemoryAdvisoryLock();
+  const started = Promise.withResolvers<string>();
+  const release = Promise.withResolvers<void>();
+  let destroyed = false;
+  const provider: DeployProvider = {
+    profile: { managedScaleToZero: false },
+    async apply(d) {
+      started.resolve(d.id);
+      await release.promise;
+      return { host: "app", port: 8080 };
+    },
+    async destroy() {
+      destroyed = true;
+    },
+  };
+  const create = () =>
+    createDeployService({
+      deployStore: store,
+      provider,
+      advisoryLock: lock,
+      acl: createAclStore(),
+      deployDir: join(dir, "apps"),
+      auditLog: { record() {}, events: async () => [], tail: async () => [] },
+    });
+  const first = create();
+  const second = create();
+  const publishing = first.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "node app.js",
+    files: [],
+  });
+  const id = await started.promise;
+  const archiving = second.archiveDeployment(id);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(destroyed, false);
+  release.resolve();
+  await Promise.all([publishing, archiving]);
+  assert.equal(destroyed, true);
+  assert.equal((await store.get(id))!.status, "archived");
+  assert.equal((await store.get(id))!.endpoint, null);
 });

@@ -4,7 +4,6 @@ import type { SessionStore } from "../sessions/session-store.ts";
 import type { GrantedHandle, Principal, ScopeId, TurnOrigin } from "../types.ts";
 import { parseScopeId, personalScope } from "../types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
-import { relative } from "node:path";
 import type { ScopedConfigStore } from "./config-store.ts";
 import type { IsCurrentSharedScopeMember } from "./scope-membership.ts";
 import type { SharingPosture } from "./sharing-posture.ts";
@@ -76,7 +75,7 @@ function handlePath(path: string): string {
 
 export async function carriedFileHandles(
   sourceScopes: readonly ScopeId[],
-  workspace: Pick<WorkspaceStore, "list" | "scopeDir">,
+  workspace: Pick<WorkspaceStore, "list">,
   files: Pick<FileArtifactStore, "listOwnedByScopes">,
 ): Promise<GrantedHandle[]> {
   const handles = new Map<string, GrantedHandle>();
@@ -88,12 +87,7 @@ export async function carriedFileHandles(
       files.listOwnedByScopes([sourceScope], { limit: remaining }),
     ]);
     const artifacts = page.files.map((file) => file.path);
-    const workspaceBase = workspace.scopeDir(sourceScope);
-    const ownedPaths = workspacePaths.map((path) => {
-      const rel = relative(workspaceBase, path);
-      return rel.startsWith("..") ? "" : rel;
-    });
-    for (const ownerPath of [...ownedPaths, ...artifacts]) {
+    for (const ownerPath of [...workspacePaths, ...artifacts]) {
       if (handles.size >= MAX_OPEN_FILES) break;
       const relative = handlePath(ownerPath);
       if (relative === MEMORY_FILE) continue;

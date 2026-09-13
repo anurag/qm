@@ -7,6 +7,7 @@ export type {
   AwsConfig,
   AwsServiceConfig,
   PluginEntry,
+  RenderConfig,
   SandboxConfig,
   SecurityScreenConfig,
   Target,

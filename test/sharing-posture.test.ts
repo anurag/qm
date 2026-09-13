@@ -248,8 +248,7 @@ test("Open excludes memory notebook aliases with Windows separators", async () =
   const handles = await carriedFileHandles(
     [personal],
     {
-      scopeDir: workspace.scopeDir,
-      list: async () => [join(workspace.scopeDir(personal), "memory\\MEMORY.md")],
+      list: async () => ["memory\\MEMORY.md"],
     },
     files,
   );

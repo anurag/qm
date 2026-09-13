@@ -363,8 +363,10 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         ...(input.env ? { env: input.env } : {}),
         ...(input.alwaysOn !== undefined ? { alwaysOn: input.alwaysOn } : {}),
       });
-      const endpoint = await applyVersion(d.id, d.versions[0]!);
-      await markVersionRunning(d.id, d.versions[0]!.version, endpoint);
+      await withDeployLock(d.id, async () => {
+        const endpoint = await applyVersion(d.id, d.versions[0]!);
+        await markVersionRunning(d.id, d.versions[0]!.version, endpoint);
+      });
       deps.auditLog.record({
         at: Date.now(),
         principalId: input.createdBy,

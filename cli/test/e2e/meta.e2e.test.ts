@@ -12,7 +12,17 @@ test("help / --help / -h / no-args all print the full command surface at exit 0"
     for (const dev of ["dev up", "dev status", "dev logs", "dev down", "dev --ci"]) {
       assert.match(r.out, new RegExp(dev.replace(/-/g, "\\-").replace(" ", "\\s")), `help should list ${dev}`);
     }
-    for (const opt of ["--config", "--env-file", "--sandbox-dir", "--build-from", "--dry-run", "--purge", "--tail"]) {
+    for (const opt of [
+      "--config",
+      "--env-file",
+      "--sandbox-dir",
+      "--build-from",
+      "--dry-run",
+      "--purge",
+      "--tail",
+      "--repo",
+      "--branch",
+    ]) {
       assert.match(r.out, new RegExp(opt.replace(/-/g, "\\-")), `help should mention ${opt}`);
     }
   }

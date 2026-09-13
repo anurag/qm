@@ -284,3 +284,100 @@ export const awsScaffold: ProviderScaffold = {
   finalCommand: "terraform -chdir=infra init && terraform -chdir=infra apply",
   finalWhy: "create inert infrastructure; finish the edge + portal steps in AGENTS.md before up",
 };
+
+export const renderScaffold: ProviderScaffold = {
+  renderConfig: (orgId, modelProvider, emailTransport) =>
+    JSON.stringify(
+      {
+        contract: 1,
+        orgId,
+        publicUrl: `https://${orgId}-portal.onrender.com`,
+        apiUrl: `https://${orgId}-core.onrender.com`,
+        target: "render",
+        modelProvider,
+        render: {
+          workspaceId: "tea-replaceme",
+          region: "oregon",
+          corePlan: "1c-2g",
+          servicePlan: "0.5c-512mb",
+          postgresPlan: "0.5c-1g",
+          postgresDiskSizeGB: 10,
+          storage: { type: "minio", plan: "0.5c-512mb", diskSizeGB: 10 },
+        },
+        services: ["core", "slack", "web-ui", "admin", "portal", "auth"],
+        plugins: [],
+        skills: [],
+        sandbox: { backend: "render" },
+        env: {
+          core: {
+            HARNESS: "pi",
+            SANDBOX_BACKEND: "render",
+            DEPLOY_PROVIDER: "render",
+            WORKSPACE_STORE: "s3",
+            SNAPSHOT_STORE: "s3",
+            TRANSFER_STORE: "s3",
+          },
+          slack: { SLACK_IDENTITY_EMAIL: "1" },
+          auth: { AUTH_EMAIL_TRANSPORT: emailTransport },
+        },
+        secretEnv: { core: { ADMIN_GRANTS: "ADMIN_GRANTS" } },
+      },
+      null,
+      2,
+    ) + "\n",
+  ignores: [
+    ".env",
+    "node_modules/",
+    ".generated/",
+    ".render.lock/",
+    "render.resources.json",
+    "render.resources.json.*.tmp",
+  ],
+  agentsAppendix: `
+## Render deployment
+
+Set render.workspaceId and the email access gate in qm.config.jsonc. Run qm setup
+for the Render, model, and email credentials. The CLI generates MinIO credentials.
+No AWS account or AWS credentials are required for bundled storage.
+
+Run qm check and qm plan, then qm up. The CLI uses the Render API to create or
+update one project with a production environment. It provisions the services,
+disks, and Postgres, then uploads the deployment layer after core is healthy.
+The deployment does not need a Blueprint.
+
+Set render.source.repo to an HTTPS GitHub repository URL and render.source.branch
+to a branch name to build QM from that repository on Render.
+qm init --target render --repo <url> --branch <name> sets these fields. Each qm up
+builds the configured branch. Automatic Git deploys are disabled. App deployment
+and restore build the app runner from that branch. Private repositories require
+a Render GitHub connection with repository access. No local Docker or image
+publication is required. Without render.source, QM uses released image digests.
+imageOverrides and published plugin images take precedence over Git builds.
+Local source plugins still require published images. Conversion from images to
+Git builds retains the existing service IDs and disks.
+
+The default stack has QM core, web UI, portal, Postgres, and MinIO from a pinned
+image. Slack runs in core; admin runs in web UI; auth runs in portal. After MinIO
+is ready, QM starts a one-off initialization job to create a private qm-storage
+bucket and a scoped identity. Core gets this identity through its environment.
+MinIO root credentials stay on MinIO.
+
+Core uses temporary files at /data. Postgres stores sessions, runs, and file
+metadata. MinIO stores workspace bytes, portable sandbox backups, and file
+artifacts on its persistent disk. A MinIO deploy interrupts storage briefly.
+
+To use an existing object store, set render.storage.type to external and set
+S3_BUCKET, S3_REGION, AWS_ENDPOINT_URL_S3, and S3_FORCE_PATH_STYLE in env.core as
+required by that service. qm setup then collects its S3-compatible credentials.
+This also supports an existing MinIO deployment without taking ownership of it.
+
+qm down retains Postgres and MinIO data. Storage charges continue. Published apps
+and runtime sandboxes are separate resources. Remove them through QM. Use
+qm down --purge only when the deployment and its stored data can be deleted.
+Do not expire durable objects or automatically move data between storage targets.
+`,
+  files: noFiles,
+  configurationHint: "render: set workspaceId, region, and the email access gate before setup",
+  finalCommand: "npm exec qm -- up",
+  finalWhy: "provision Render services and upload the QM deployment layer",
+};

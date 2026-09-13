@@ -18,10 +18,12 @@ test("Render sandbox configuration uses the SDK defaults", () => {
   assert.ok(enabledSandboxBackends(config).includes("render"));
 });
 
-test("Render sandbox selection requires a workspace and one API key", () => {
-  assert.throws(() => loadConfig({ SANDBOX_BACKEND: "render" }), /RENDER_API_KEY/);
-  assert.throws(() => loadConfig({ SANDBOX_BACKEND: "render", RENDER_API_KEY: "rnd-test" }), /RENDER_WORKSPACE_ID/);
-  assert.deepEqual(validateCoreSecretEnv({ SANDBOX_BACKEND: "render" }), ["RENDER_API_KEY"]);
+test("Render provider selection requires a workspace and one API key", () => {
+  for (const selection of [{ SANDBOX_BACKEND: "render" }, { DEPLOY_PROVIDER: "render" }]) {
+    assert.throws(() => loadConfig(selection), /RENDER_API_KEY/);
+    assert.throws(() => loadConfig({ ...selection, RENDER_API_KEY: "rnd-test" }), /RENDER_WORKSPACE_ID/);
+  }
+  assert.deepEqual(validateCoreSecretEnv({ SANDBOX_BACKEND: "render", DEPLOY_PROVIDER: "render" }), ["RENDER_API_KEY"]);
 });
 
 test("Render sandbox requires both account fields before automatic registration", () => {
@@ -53,4 +55,103 @@ test("Render sandbox settings accept supported plans and reject invalid lifetime
     120,
   );
   assert.doesNotThrow(() => loadConfig({ SANDBOX_TIMEOUT_SEC: "86400" }));
+});
+
+test("Render deployed apps retain data and use the core environment", () => {
+  const config = loadConfig({
+    ...credentials,
+    DEPLOY_PROVIDER: "render",
+    RENDER_ENVIRONMENT_ID: "evm-production",
+    RENDER_DEPLOY_DISK_SIZE_GB: "3",
+  });
+  assert.equal(config.renderDeploy.environmentId, "evm-production");
+  assert.equal(config.renderDeploy.diskSizeGB, 3);
+  assert.equal(loadConfig(credentials).renderDeploy.diskSizeGB, 1);
+  for (const value of ["0", "-1", "NaN", "1.5"])
+    assert.throws(
+      () => loadConfig({ ...credentials, RENDER_DEPLOY_DISK_SIZE_GB: value }),
+      /RENDER_DEPLOY_DISK_SIZE_GB/,
+    );
+  for (const environmentId of ["wrong", "env-production", "evm-", "evm-production/other"])
+    assert.throws(
+      () => loadConfig({ ...credentials, RENDER_ENVIRONMENT_ID: environmentId }),
+      /RENDER_ENVIRONMENT_ID must be an environment ID \(evm-\.\.\.\)/,
+    );
+});
+
+test("Render app runners accept Git builds without a published image", () => {
+  const config = loadConfig({
+    ...credentials,
+    DEPLOY_PROVIDER: "render",
+    RENDER_DEPLOY_REPO: " https://github.com/example/qm.git/ ",
+    RENDER_DEPLOY_BRANCH: " feature/render ",
+    RENDER_DEPLOY_IMAGE: " ",
+  });
+  assert.deepEqual(config.renderDeploy.source, {
+    repo: "https://github.com/example/qm",
+    branch: "feature/render",
+  });
+  assert.equal(config.renderDeploy.baseImage, "");
+  assert.equal(loadConfig(credentials).renderDeploy.source, undefined);
+});
+
+test("Render app runner source fields must select one complete build source", () => {
+  const source = { RENDER_DEPLOY_REPO: "https://github.com/example/qm", RENDER_DEPLOY_BRANCH: "main" };
+  for (const env of [
+    { RENDER_DEPLOY_REPO: source.RENDER_DEPLOY_REPO },
+    { RENDER_DEPLOY_BRANCH: source.RENDER_DEPLOY_BRANCH },
+    { ...source, RENDER_DEPLOY_BRANCH: " " },
+    { ...source, RENDER_DEPLOY_REPO: " " },
+  ])
+    assert.throws(() => loadConfig({ ...credentials, ...env }), /must be set together/);
+  assert.throws(
+    () => loadConfig({ ...credentials, ...source, RENDER_DEPLOY_IMAGE: "example/runner:latest" }),
+    /not both/,
+  );
+});
+
+test("Render app runner sources reject credentials, other hosts, and invalid branch names", () => {
+  const source = { RENDER_DEPLOY_REPO: "https://github.com/example/qm", RENDER_DEPLOY_BRANCH: "main" };
+  for (const repo of [
+    "http://github.com/example/qm",
+    "https://token@github.com/example/qm",
+    "https://github.com.example.com/example/qm",
+    "git@github.com:example/qm.git",
+    "https://github.com/example/qm?token=secret",
+    "https://github.com/example/qm#main",
+    "https://github.com/example/..",
+    "https://github.com/./qm",
+    "https://github.com/example/qm/tree/main",
+  ])
+    assert.throws(
+      () => loadConfig({ ...credentials, ...source, RENDER_DEPLOY_REPO: repo }),
+      /RENDER_DEPLOY_REPO must be an HTTPS GitHub repository URL/,
+    );
+  for (const branch of [
+    "bad\nbranch",
+    "bad branch",
+    "bad~branch",
+    "bad^branch",
+    "bad:branch",
+    "bad?branch",
+    "bad*branch",
+    "bad[branch",
+    "bad\\branch",
+    "bad..branch",
+    "bad@{branch",
+    "@",
+    "-main",
+    ".main",
+    "main.",
+    "feature/.main",
+    "main.lock",
+    "main.lock/feature",
+    "/main",
+    "main/",
+    "feature//main",
+  ])
+    assert.throws(
+      () => loadConfig({ ...credentials, ...source, RENDER_DEPLOY_BRANCH: branch }),
+      /RENDER_DEPLOY_BRANCH must be a valid Git branch name/,
+    );
 });

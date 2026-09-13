@@ -63,7 +63,7 @@ const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => b
   modal: (env) => env.SANDBOX_BACKEND === "modal",
   porter: (env) => env.SANDBOX_BACKEND === "porter",
   agent37: (env) => env.SANDBOX_BACKEND === "agent37",
-  render: (env) => env.SANDBOX_BACKEND?.trim() === "render",
+  render: (env) => env.SANDBOX_BACKEND?.trim() === "render" || env.DEPLOY_PROVIDER?.trim() === "render",
   "porter-deploy": (env) => env.DEPLOY_PROVIDER === "porter",
   "fly-deploy": (env) => env.DEPLOY_PROVIDER === "fly",
   "aws-deploy-gate": (env) => Boolean(env.AWS_DEPLOY_APPS_DOMAIN || env.DEPLOY_APPS_DOMAIN),

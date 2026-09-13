@@ -7,11 +7,11 @@ function read(path: string): string {
   return readFileSync(path, "utf8");
 }
 
-test("package-consumer deployment skill covers both self-owned providers and the completion contract", () => {
+test("package-consumer deployment skill covers hosting providers and the completion contract", () => {
   const root = read("cli/templates/deployment/deployment.md");
   for (const phrase of [
     "Before cloud mutation",
-    "Fly.io, AWS, or Porter",
+    "Fly.io, AWS, Render, or Porter",
     "deployment repository",
     "npm ci",
     "slack render",
@@ -37,6 +37,7 @@ test("package-consumer deployment skill covers both self-owned providers and the
     ".codex/skills/deploy-qm/references/fly.md",
     ".codex/skills/deploy-qm/references/aws.md",
     ".codex/skills/deploy-qm/references/porter.md",
+    ".codex/skills/deploy-qm/references/render.md",
     ".codex/skills/deploy-qm/references/slack.md",
     ".codex/skills/deploy-qm/references/email.md",
   ]) {
@@ -49,6 +50,7 @@ test("package-consumer deployment skill covers both self-owned providers and the
     "cli/templates/deployment/references/fly.md",
     "cli/templates/deployment/references/aws.md",
     "cli/templates/deployment/references/porter.md",
+    "cli/templates/deployment/references/render.md",
     "cli/templates/deployment/references/slack.md",
     "cli/templates/deployment/references/email.md",
   ]) {
@@ -138,6 +140,7 @@ test("each provider has an independent agent-computer proof", () => {
   const root = read("cli/templates/deployment/deployment.md");
   const fly = read("cli/templates/deployment/references/fly.md");
   const aws = read("cli/templates/deployment/references/aws.md");
+  const render = read("cli/templates/deployment/references/render.md");
 
   assert.match(root, /\/root\/workspace\/qm-computer-proof\.txt/);
   assert.match(fly, /## Agent-computer proof/);
@@ -146,4 +149,6 @@ test("each provider has an independent agent-computer proof", () => {
   assert.match(aws, /## Agent-computer proof/);
   assert.match(aws, /deployment-owned S3 home\s+snapshot/);
   assert.match(aws, /workspace\/qm-computer-proof\.txt/);
+  assert.match(render, /## Agent-computer proof/);
+  assert.match(render, /workspace\/qm-computer-proof\.txt/);
 });

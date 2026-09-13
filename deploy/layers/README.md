@@ -12,7 +12,7 @@ enforces that boundary; the `update-qm` skill merges upstream changes in around 
 ## Creating a layer
 
 ```bash
-node cli/bin/qm.ts init deploy/layers/<org> --org <slug> --target <fly-or-aws>
+node cli/bin/qm.ts init deploy/layers/<org> --org <slug> --target <fly-or-aws-or-render>
 ```
 
 `qm init` writes the deployment config, the secret-name example, the sandbox and provider

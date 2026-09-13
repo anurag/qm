@@ -131,6 +131,68 @@ test("init scaffolds a loadable config, generated local secrets, and a valid san
   }
 });
 
+test("init selects Render Git builds before it creates the secret contract", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-render-source-"));
+  try {
+    const dir = join(base, "deployment");
+    const output = captureInit({
+      dir,
+      org: "acme",
+      target: "render",
+      repo: "https://github.com/example/qm.git",
+      branch: "feature/render",
+    });
+    const { config } = loadConfigInDir(dir);
+    assert.deepEqual(config.render?.source, {
+      repo: "https://github.com/example/qm",
+      branch: "feature/render",
+    });
+    assert.equal(config.sandbox?.backend, "render");
+    assert.deepEqual(config.render?.storage, { type: "minio", plan: "0.5c-512mb", diskSizeGB: 10 });
+    assert.equal(readFileSync(join(dir, ".env.example"), "utf8"), renderEnvExample(config));
+    assert.match(readFileSync(join(dir, ".env"), "utf8"), /^CORE_SIGNING_SECRET=[a-f0-9]{64}$/m);
+    assert.match(output, /Render builds https:\/\/github.com\/example\/qm branch feature\/render on each qm up/);
+    assert.doesNotMatch(output, /selects immutable runtime image digests/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init rejects invalid Render source options before it writes deployment files", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-render-source-invalid-"));
+  const valid = { repo: "https://github.com/example/qm", branch: "feature/render" };
+  const cases: Array<Parameters<typeof runInit>[0]> = [
+    { target: "render", repo: valid.repo },
+    { target: "render", branch: valid.branch },
+    { ...valid },
+    { target: "docker", ...valid },
+    { target: "fly", ...valid },
+    { target: "aws", ...valid },
+    { target: "render", ...valid, repo: "https://user:secret@github.com/example/qm" },
+    { target: "render", ...valid, repo: "https://gitlab.com/example/qm" },
+    { target: "render", ...valid, repo: "" },
+    { target: "render", ...valid, branch: "" },
+    { target: "render", ...valid, branch: "refs/../main" },
+  ];
+  try {
+    for (const [index, opts] of cases.entries()) {
+      const dir = join(base, String(index));
+      assert.throws(() => quiet(() => runInit({ ...opts, dir, org: "acme" })), /repo|branch/);
+      assert.equal(existsSync(dir), false, `invalid source options created ${dir}`);
+    }
+    const packagePath = join(base, "package.json");
+    const packageContent = '{"private":true,"dependencies":{"existing":"1.0.0"}}\n';
+    writeFileSync(packagePath, packageContent);
+    writeFileSync(join(base, ".env"), "EXISTING_SECRET=preserve\n");
+    assert.throws(() => quiet(() => runInit({ dir: base, target: "render", ...valid, branch: "" })), /branch/);
+    assert.equal(readFileSync(packagePath, "utf8"), packageContent);
+    assert.equal(readFileSync(join(base, ".env"), "utf8"), "EXISTING_SECRET=preserve\n");
+    assert.equal(existsSync(join(base, CONFIG_FILENAME)), false);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test("init --target fly scaffolds the full hosted topology and both Slack apps", () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-init-fly-"));
   try {

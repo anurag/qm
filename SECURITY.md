@@ -160,6 +160,9 @@ these, not through them.
 - **Egress enforcement is conditional.** Force-through egress depends on backend
   network enforcement, and core does not yet reject every backend that is too coarse
   for the requested policy. Deployment-runtime egress enforcement is not built.
+  Fly and Render app services share a private network with other services.
+  A published app can connect directly to peer app ports and bypass access checks
+  at the core proxy. These providers do not isolate mutually untrusted app authors.
 - **Admins can read sensitive content.** A scope-authorized admin can directly read
   transcripts, captured provider requests, documents, memory, connector and keychain
   metadata, mirrored message bodies, ambient-judge inputs, user details, and skill

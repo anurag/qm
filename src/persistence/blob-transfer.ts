@@ -19,7 +19,14 @@ import {
 } from "@aws-sdk/client-s3";
 import { swallow, swallowAs } from "../util/errors.ts";
 import { asChunks, collectBytes, type ByteSource } from "../util/bytes.ts";
-import { bodyToReadable, isNoSuchKey, isNoSuchLifecycleConfiguration, s3Client, type S3Send } from "./s3.ts";
+import {
+  bodyToReadable,
+  isNoSuchKey,
+  isNoSuchLifecycleConfiguration,
+  s3Client,
+  type S3ConnectionOptions,
+  type S3Send,
+} from "./s3.ts";
 
 export const MAX_BLOB_BYTES = 1_000_000_000;
 export const MAX_STAGE_BLOB_BYTES = 12_000_000_000;
@@ -161,9 +168,8 @@ export function createLocalBlobTransferStore(dir: string): BlobTransferStore {
   };
 }
 
-export interface S3BlobTransferOptions {
+export interface S3BlobTransferOptions extends S3ConnectionOptions {
   bucket: string;
-  region?: string;
   prefix?: string;
   _client?: S3Send;
 }
@@ -172,7 +178,7 @@ export function createS3BlobTransferStore(options: S3BlobTransferOptions): BlobT
   const bucket = options.bucket;
   const prefix = (options.prefix ?? "") + "transfer/";
   const keyFor = (blobId: string): string => prefix + blobId;
-  const client = options._client ?? s3Client(options.region);
+  const client = options._client ?? s3Client(options);
 
   return {
     s3Ref: (blobId) => (/^[0-9a-f]{32}$/.test(blobId) ? { bucket, key: keyFor(blobId) } : null),
@@ -280,7 +286,13 @@ export function createS3BlobTransferStore(options: S3BlobTransferOptions): BlobT
       if (!BLOB_ID.test(blobId)) return null;
       let r: { Body?: unknown; ContentLength?: number };
       try {
-        r = (await client.send(new GetObjectCommand({ Bucket: bucket, Key: keyFor(blobId) }))) as {
+        r = (await client.send(
+          new GetObjectCommand({
+            Bucket: bucket,
+            Key: keyFor(blobId),
+            ResponseContentType: "application/octet-stream",
+          }),
+        )) as {
           Body?: unknown;
           ContentLength?: number;
         };

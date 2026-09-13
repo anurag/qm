@@ -1,3 +1,5 @@
+import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/render-deploy-provider.ts";
+import { createRenderDeployArtifacts, type StoredRenderDeployCredential } from "./deploy/render-deploy-artifacts.ts";
 import { createRuntimeService } from "./harness/runtime-control.ts";
 import { createPostgresBrokerSessions, type BrokerSessionStore } from "./auth/broker-sessions.ts";
 import { createDirectFileUploads, type DirectFileUploads } from "./files/direct-file-upload.ts";
@@ -152,6 +154,7 @@ import {
 } from "./resolution/scope-membership.ts";
 import type { DeployGitArchive } from "./deploy/deploy-git-store.ts";
 import { createLocalWorkspaceStore, type WorkspaceStore } from "./workspace/workspace-store.ts";
+import { createPostgresWorkspaceStore } from "./workspace/postgres-workspace-store.ts";
 import { createMemoryService, type MemoryService } from "./memory/memory-service.ts";
 import { createConfiguredMemoryService } from "./memory/provider-factory.ts";
 import { createPostgresMemoryService } from "./memory/postgres-memory-service.ts";
@@ -517,6 +520,11 @@ export function buildApp(
   }
   mkdirSync(config.dataDir, { recursive: true });
 
+  const requireDbUrl = (kind: string): string => {
+    if (!config.databaseUrl) throw new Error(`${kind} requires DATABASE_URL`);
+    return config.databaseUrl;
+  };
+
   const membership: {
     canReadScope?: CanReadScope;
     canManageScope?: CanManageScope;
@@ -697,12 +705,16 @@ export function buildApp(
       : createBudgetTracker(budgetOpts);
   const resolution = createResolutionService(config.orgId, configStore, acl);
 
-  const workspace = createLocalWorkspaceStore(config.dataDir);
+  const s3Options = {
+    ...(config.s3Region ? { region: config.s3Region } : {}),
+    ...(config.s3Endpoint ? { endpoint: config.s3Endpoint } : {}),
+    ...(config.s3ForcePathStyle !== undefined ? { forcePathStyle: config.s3ForcePathStyle } : {}),
+  };
   const blobTransfer: BlobTransferStore =
     config.transferStore === "s3" && config.s3Bucket
       ? createS3BlobTransferStore({
           bucket: config.s3Bucket,
-          ...(config.s3Region ? { region: config.s3Region } : {}),
+          ...s3Options,
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
         })
       : createLocalBlobTransferStore(join(config.dataDir, "transfer"));
@@ -710,10 +722,21 @@ export function buildApp(
     config.snapshotStore === "s3" && config.s3Bucket
       ? createS3DurableByteStore({
           bucket: config.s3Bucket,
-          ...(config.s3Region ? { region: config.s3Region } : {}),
+          ...s3Options,
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
         })
       : createLocalDurableByteStore(join(config.dataDir, "docstore"));
+  const workspace =
+    config.workspaceStore === "s3"
+      ? createPostgresWorkspaceStore(
+          requireDbUrl("WORKSPACE_STORE=s3"),
+          createS3DurableByteStore({
+            bucket: config.s3Bucket!,
+            ...s3Options,
+            prefix: `${config.s3Prefix ?? ""}workspaces/`,
+          }),
+        )
+      : createLocalWorkspaceStore(config.dataDir);
   const files: FileArtifactStore = config.databaseUrl
     ? createPostgresFileArtifactStore(config.databaseUrl, fileBytes)
     : createMemoryFileArtifactStore(fileBytes);
@@ -721,7 +744,7 @@ export function buildApp(
     config.databaseUrl && config.snapshotStore === "s3" && config.s3Bucket
       ? createDirectFileUploads({
           bucket: config.s3Bucket,
-          ...(config.s3Region ? { region: config.s3Region } : {}),
+          ...s3Options,
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
           store: createPostgresFileUploadStore(config.databaseUrl),
           files,
@@ -807,7 +830,7 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       store: e2bBodies,
       ...(e2b.snapshotS3Bucket
-        ? { snapshots: createS3SnapshotStore({ bucket: e2b.snapshotS3Bucket, prefix: "e2b-home" }) }
+        ? { snapshots: createS3SnapshotStore({ ...s3Options, bucket: e2b.snapshotS3Bucket, prefix: "e2b-home" }) }
         : {}),
       onError: sandboxOnError,
     });
@@ -856,7 +879,7 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       store: modalBodies,
       ...(modal.snapshotS3Bucket
-        ? { snapshots: createS3SnapshotStore({ bucket: modal.snapshotS3Bucket, prefix: "modal-home" }) }
+        ? { snapshots: createS3SnapshotStore({ ...s3Options, bucket: modal.snapshotS3Bucket, prefix: "modal-home" }) }
         : {}),
       onError: sandboxOnError,
     });
@@ -921,7 +944,7 @@ export function buildApp(
           ? createS3SnapshotStore({
               bucket: config.s3Bucket,
               prefix: `${config.s3Prefix ?? ""}render-home`,
-              ...(config.s3Region ? { region: config.s3Region } : {}),
+              ...s3Options,
             })
           : createLocalSnapshotStore(join(config.dataDir, "render-home")),
       advisoryLock,
@@ -1110,19 +1133,15 @@ export function buildApp(
   const secretDrops: SecretDropStore = createSecretDropStore(artifactMap<SecretDropRecord>("secret_drops"));
   const modelGateway = createModelGateway();
 
-  const requireDbUrl = (kind: string): string => {
-    if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
-    return config.databaseUrl;
-  };
   const sessions: SessionStore =
     config.sessionStore === "postgres"
-      ? createPostgresSessionStore(requireDbUrl("SESSION_STORE"))
+      ? createPostgresSessionStore(requireDbUrl("SESSION_STORE=postgres"))
       : createMemorySessionStore();
   memorySessions.store = sessions;
   const runStoreKind = config.runStore;
   const runSignals: RunSignalStore =
     runStoreKind === "postgres"
-      ? createPostgresRunSignalStore(requireDbUrl("RUN_STORE"))
+      ? createPostgresRunSignalStore(requireDbUrl("RUN_STORE=postgres"))
       : createMemoryRunSignalStore();
   const tasks = config.databaseUrl ? createPostgresTaskStore(config.databaseUrl) : createMemoryTaskStore();
   const writeModelRegistry = <T>(fn: () => Promise<T>): Promise<T> =>
@@ -1293,7 +1312,7 @@ export function buildApp(
   const maxAttempts = config.maxAttempts;
   const runStore =
     runStoreKind === "postgres"
-      ? createPostgresRunStore(requireDbUrl("RUN_STORE"), { maxClaims: config.maxClaims })
+      ? createPostgresRunStore(requireDbUrl("RUN_STORE=postgres"), { maxClaims: config.maxClaims })
       : createMemoryRunStore({ maxClaims: config.maxClaims });
   const runs: RunStore = runStore.runs;
   const ledger = runStore.ledger;
@@ -1319,7 +1338,7 @@ export function buildApp(
     : createMemoryLedgerEventBus();
   const runActivity: RunActivityStore =
     runStoreKind === "postgres"
-      ? createPostgresRunActivityStore(requireDbUrl("RUN_STORE"))
+      ? createPostgresRunActivityStore(requireDbUrl("RUN_STORE=postgres"))
       : createMemoryRunActivityStore();
   const deployStore = createDeployStore({
     deployments: artifactMap<Deployment>("deployments"),
@@ -1332,13 +1351,27 @@ export function buildApp(
         ? {
             archiveBytes: createS3DurableByteStore({
               bucket: config.s3Bucket,
-              ...(config.s3Region ? { region: config.s3Region } : {}),
+              ...s3Options,
               prefix: `${config.s3Prefix ?? ""}deploy-git/`,
             }),
           }
         : {}),
     },
   });
+  const renderDeployArtifacts = createRenderDeployArtifacts({
+    baseUrl: config.apiBaseUrl ?? "",
+    signingSecret: config.signingSecret ?? "",
+    store: artifactMap<StoredRenderDeployCredential>("render_deploy_credentials"),
+    deployStore,
+  });
+  const buildRenderDeploy = (): DeployProvider => {
+    if (!pgArtifactMap) throw new Error("DEPLOY_PROVIDER=render requires DATABASE_URL for app state and credentials");
+    return createRenderDeployProvider({
+      ...config.renderDeploy,
+      store: artifactMap<StoredRenderDeploy>("render_deploy_bodies"),
+      artifacts: renderDeployArtifacts,
+    });
+  };
   const buildAwsDeploy = (): DeployProvider =>
     createAwsDeployProvider({
       ...config.awsDeploy,
@@ -1348,12 +1381,12 @@ export function buildApp(
     });
   const buildDeployProvider: Record<Config["deployProvider"], () => DeployProvider> = {
     aws: buildAwsDeploy,
+    render: buildRenderDeploy,
     docker: createDockerDeployProvider,
     fly: () => createFlyDeployProvider(config.flyDeploy),
     porter: () =>
       createPorterDeployProvider({
         ...config.porterDeploy,
-        advisoryLock,
         store: artifactMap<StoredPorterDeployBody>("porter_deploy_bodies"),
       }),
   };
@@ -1757,6 +1790,7 @@ export function buildApp(
     projects,
     environments,
     deploy: deployService,
+    renderDeployArtifacts,
     deploymentLayer,
     ...(processes ? { processes } : {}),
     monitors,
@@ -2037,6 +2071,9 @@ export function buildApp(
   const deployIdleTtlMs = deployProvider.profile.managedScaleToZero ? undefined : config.deployIdleTtlMs;
   const BLOB_TTL_MS = 6 * 60 * 60_000;
   const blobSweeper = createSweeper(() => blobTransfer.sweep(BLOB_TTL_MS), 30 * 60_000);
+  const workspaceSweeper = workspace.sweep
+    ? createSweeper(() => workspace.sweep!(), 60_000, { label: "workspace-retention", immediate: true })
+    : null;
   const BLOB_TRANSFER_EXPIRY_DAYS = 1;
   void blobTransfer
     .ensureExpiry?.(BLOB_TRANSFER_EXPIRY_DAYS)
@@ -2075,6 +2112,7 @@ export function buildApp(
       monitorRetentionSweeper.start();
       if (config.skillSyncPollMs > 0) skillSyncEngine.start(config.skillSyncPollMs);
       blobSweeper.start();
+      workspaceSweeper?.start();
       fileUploads?.start();
       idleSweeper?.start();
       keepWarmSweeper.start();
@@ -2096,6 +2134,7 @@ export function buildApp(
       keepWarmSweeper.stop();
       deepIdleSweeper?.stop();
       blobSweeper.stop();
+      workspaceSweeper?.stop();
       fileUploads?.stop();
       wakeSweep.stop();
       orphanedSignalSweeper.stop();
@@ -2199,7 +2238,7 @@ export function buildApp(
       config.snapshotStore === "s3" && config.s3Bucket
         ? createS3DurableByteStore({
             bucket: config.s3Bucket,
-            ...(config.s3Region ? { region: config.s3Region } : {}),
+            ...s3Options,
             prefix: `${config.s3Prefix ?? ""}session-shares/`,
           })
         : createLocalDurableByteStore(join(config.dataDir, "session-shares")),

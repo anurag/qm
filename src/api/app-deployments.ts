@@ -1,3 +1,4 @@
+import { isRenderDeployPrincipal } from "../deploy/render-deploy-artifacts.ts";
 import type { Reach } from "../deploy/deploy-service.ts";
 import { mintDeployGitAccess } from "../deploy/access-token.ts";
 
@@ -142,6 +143,8 @@ export function createDeploymentMethods(
     async authorizesDeploymentGitAccess(id, principalId, permission) {
       const d = await deps.deploy.getDeployment(id);
       if (!d) return false;
+      if (isRenderDeployPrincipal(principalId))
+        return (await deps.renderDeployArtifacts?.authorizes(d, principalId, permission)) === true;
       const current = await principalGitPermission(d, principalId);
       return permission === "write" ? current === "write" : current !== null;
     },

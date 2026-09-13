@@ -196,7 +196,12 @@ test("capture cannot forge platform date or cross-scope provenance markers", asy
 
 test("lossy scope names cannot share a local workspace directory", async () => {
   const ws = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "ws-scope-key-")));
-  assert.notEqual(ws.scopeDir(scopeId("channel", "a/b")), ws.scopeDir(scopeId("channel", "a?b")));
+  const first = scopeId("channel", "a/b");
+  const second = scopeId("channel", "a?b");
+  await ws.write(first, "note.txt", "first");
+  await ws.write(second, "note.txt", "second");
+  assert.equal(await ws.read(first, "note.txt"), "first");
+  assert.equal(await ws.read(second, "note.txt"), "second");
 });
 
 test("'* fact' bullets participate in capture dedupe and query(); capture never evicts old facts", async () => {

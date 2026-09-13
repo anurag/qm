@@ -307,3 +307,36 @@ test("missing multipart upload and object become terminal instead of retrying fo
   await f.service.abort(row.id);
   await assert.rejects(f.service.complete(row.id), /no longer available/);
 });
+
+test("direct uploads sign the configured S3 endpoint and keep checksum and size constraints", async (t) => {
+  t.mock.property(process, "env", {
+    ...process.env,
+    AWS_PROFILE: undefined,
+    AWS_DEFAULT_PROFILE: undefined,
+    AWS_ACCESS_KEY_ID: "test-access-key",
+    AWS_SECRET_ACCESS_KEY: "test-secret-key",
+    AWS_SESSION_TOKEN: "test-session-token",
+  });
+  const f = fixture();
+  const service = createDirectFileUploads({
+    ...f.options,
+    endpoint: "https://objects.example.com",
+    region: "auto",
+    forcePathStyle: true,
+    presign: undefined,
+  });
+  const row = await service.begin(f.input);
+  const signed = await service.sign(row.id, 1);
+  const url = new URL(signed.url);
+  assert.equal(url.origin, "https://objects.example.com");
+  assert.equal(url.pathname, `/test-bucket/files/uploads/${row.id}`);
+  assert.equal(url.searchParams.get("uploadId"), "s3-upload");
+  assert.equal(url.searchParams.get("partNumber"), "1");
+  assert.match(url.searchParams.get("X-Amz-Credential")!, /^test-access-key\/.*\/auto\/s3\/aws4_request$/);
+  assert.equal(url.searchParams.get("X-Amz-Security-Token"), "test-session-token");
+  assert.equal(url.searchParams.get("X-Amz-Expires"), "900");
+  assert.match(url.searchParams.get("X-Amz-SignedHeaders")!, /content-length/);
+  assert.match(url.searchParams.get("X-Amz-SignedHeaders")!, /x-amz-checksum-sha256/);
+  assert.equal(signed.headers["x-amz-checksum-sha256"], checksum("abc"));
+  assert.equal(signed.headers["content-length"], "3");
+});

@@ -1,6 +1,4 @@
 import { createHash } from "node:crypto";
-import { relative } from "node:path";
-import { readFile as fsReadFile } from "node:fs/promises";
 import type { WorkspaceLayer } from "../types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import { shq } from "../util/shell.ts";
@@ -30,11 +28,10 @@ export async function materializeRoLayers(
   const roEntries: Array<{ path: string; data: Uint8Array }> = [];
   for (const layer of layers) {
     if (layer.mode === "rw") continue;
-    const dir = workspace.scopeDir(layer.scopeId);
-    for (const abs of await workspace.list(layer.scopeId)) {
-      const rel = relative(dir, abs);
+    for (const rel of await workspace.list(layer.scopeId)) {
       const destRel = layer.mountPath ? `${layer.mountPath}/${rel}` : rel;
-      roEntries.push({ path: destRel, data: await fsReadFile(abs) });
+      const data = await workspace.readBytes(layer.scopeId, rel);
+      if (data !== null) roEntries.push({ path: destRel, data });
     }
   }
   if (!roEntries.length) return;

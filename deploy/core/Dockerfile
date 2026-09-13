@@ -16,6 +16,8 @@ COPY plugins/onboarding ./plugins/onboarding
 COPY plugins/chassis ./plugins/chassis
 COPY tsconfig.json ./
 
+COPY deploy/render/start.mjs ./deploy/render/start.mjs
+
 ENV NODE_ENV=production
 ENV DATA_DIR=/data
 ARG GIT_SHA=

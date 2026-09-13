@@ -56,8 +56,8 @@ jobs:
           IMAGES_REF: ${{ inputs.images_ref || github.sha }}
         run: |
           set -euo pipefail
-          out=$(jq -n '{sandboxBase: "", services: {}}')
-          for service in core web-ui admin portal auth sandbox-base; do
+          out=$(jq -n '{sandboxBase: "", renderDeployRunner: "", services: {}}')
+          for service in core web-ui admin portal auth sandbox-base render-runner; do
             repo="yc-software/qm/$service"
             token=$(curl -fsS "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" | jq -r .token)
             digest=$(curl -fsS -o /dev/null -D - -H "Authorization: Bearer $token" \
@@ -71,14 +71,16 @@ jobs:
             ref="ghcr.io/$repo@$digest"
             if [ "$service" = sandbox-base ]; then
               out=$(printf '%s' "$out" | jq --arg r "$ref" '.sandboxBase = $r')
+            elif [ "$service" = render-runner ]; then
+              out=$(printf '%s' "$out" | jq --arg r "$ref" '.renderDeployRunner = $r')
             else
               out=$(printf '%s' "$out" | jq --arg k "$service" --arg r "$ref" '.services[$k] = $r')
             fi
           done
           printf '%s\n' "$out" > cli/manifest.json
           cat cli/manifest.json
-          jq -e '[.sandboxBase] + [.services[]]
-                 | length == 6
+          jq -e '[.sandboxBase, .renderDeployRunner] + [.services[]]
+                 | length == 7
                  and all(test("^ghcr\\.io/yc-software/qm/[a-z-]+@sha256:[0-9a-f]{64}$"))
                  and all(test("@sha256:(.)\\1{63}$") | not)' cli/manifest.json > /dev/null
           printf 'manifest=%s\n' "$(jq -c . cli/manifest.json)" >> "$GITHUB_OUTPUT"
