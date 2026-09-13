@@ -109,6 +109,7 @@ bypass.listen(8080, "0.0.0.0");`,
 }
 
 async function runUntilReadyThenExit(input: { manifestPath: string; appDir: string; env: NodeJS.ProcessEnv }) {
+  const manifest = JSON.parse(await readFile(input.manifestPath, "utf8"));
   const running: Promise<number> = runRenderApp(input);
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]);
@@ -116,10 +117,15 @@ async function runUntilReadyThenExit(input: { manifestPath: string; appDir: stri
     for (;;) {
       signal.throwIfAborted();
       const response = await fetch("http://127.0.0.1:8080/__qm_ready", {
+        headers: { "x-qm-render-app-token": input.env.QM_RENDER_APP_TOKEN! },
         signal: AbortSignal.any([signal, AbortSignal.timeout(1_000)]),
       }).catch(() => null);
       await response?.body?.cancel();
-      if (response?.status === 204) return;
+      if (response?.status === 204) {
+        assert.equal(response.headers.get("cache-control"), "no-store");
+        assert.equal(response.headers.get("x-qm-render-app-ready"), manifest.readinessNonce ?? null);
+        return;
+      }
       await delay(50, undefined, { signal });
     }
   };
@@ -152,7 +158,7 @@ test(
   async (t) => {
     const f = await fixture(t);
     const v1 = f.d.versions[0]!;
-    const manifest = await f.artifacts.prepare(f.d, v1);
+    const manifest = { ...(await f.artifacts.prepare(f.d, v1)), readinessNonce: "n".repeat(43) };
     const manifestPath = join(f.root, "artifact.json");
     const appDir = join(f.root, "app");
     await writeFile(manifestPath, JSON.stringify(manifest));
@@ -300,6 +306,7 @@ test("Render runner preserves relative Git symlinks after source staging cleanup
 
 test("Render private gateway rejects peer requests and removes its credential before forwarding", async (t) => {
   let tokenHeader: unknown;
+  let ready = true;
   const application = createHttpServer((req, res) => {
     tokenHeader = req.headers["x-qm-render-app-token"];
     res.end("application");
@@ -307,6 +314,8 @@ test("Render private gateway rejects peer requests and removes its credential be
   await new Promise<void>((resolve) => application.listen(0, "127.0.0.1", resolve));
   const gateway = createRenderAppGateway({
     token: "a".repeat(43),
+    readinessNonce: "n".repeat(43),
+    isReady: () => ready,
     appPort: (application.address() as AddressInfo).port,
   });
   await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
@@ -324,5 +333,17 @@ test("Render private gateway rejects peer requests and removes its credential be
   const response = await fetch(url, { headers: { "x-qm-render-app-token": "a".repeat(43) } });
   assert.equal(await response.text(), "application");
   assert.equal(tokenHeader, undefined);
-  assert.equal((await fetch(`${url}/__qm_ready`)).status, 204);
+  for (const token of [undefined, "other-app", "a".repeat(43)]) {
+    const response = await fetch(`${url}/__qm_ready`, {
+      headers: token ? { "x-qm-render-app-token": token } : {},
+    });
+    assert.equal(response.status, 204);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.equal(response.headers.get("x-qm-render-app-ready"), token === "a".repeat(43) ? "n".repeat(43) : null);
+  }
+  ready = false;
+  const unavailable = await fetch(`${url}/__qm_ready`, { headers: { "x-qm-render-app-token": "a".repeat(43) } });
+  assert.equal(unavailable.status, 503);
+  assert.equal(unavailable.headers.get("cache-control"), "no-store");
+  assert.equal(unavailable.headers.get("x-qm-render-app-ready"), null);
 });

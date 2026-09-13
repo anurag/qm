@@ -79,6 +79,11 @@ export async function runRenderApp({
   if (typeof gatewayToken !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(gatewayToken))
     throw new Error("Render app requires a private gateway token");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  if (
+    manifest.readinessNonce !== undefined &&
+    (typeof manifest.readinessNonce !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(manifest.readinessNonce))
+  )
+    throw new Error("Invalid Render app readiness nonce");
   const entrypoint = await prepareRenderApp(manifestPath, appDir, env);
   const appEnv = { ...env, ...manifest.runtimeEnv, PORT: "8081" };
   delete appEnv.QM_RENDER_APP_TOKEN;
@@ -100,7 +105,11 @@ export async function runRenderApp({
   for (const key of Object.keys(appEnv))
     if (key.startsWith("GIT_CONFIG_") || key === "GIT_ASKPASS" || key === "SSH_ASKPASS") delete appEnv[key];
   let appReady = false;
-  const server = createRenderAppGateway({ token: gatewayToken, isReady: () => appReady });
+  const server = createRenderAppGateway({
+    token: gatewayToken,
+    readinessNonce: manifest.readinessNonce,
+    isReady: () => appReady,
+  });
   await new Promise((ready, reject) => {
     server.once("error", reject);
     server.listen(8080, "0.0.0.0", ready);
@@ -163,7 +172,7 @@ export async function runRenderApp({
   }
 }
 
-export function createRenderAppGateway({ token, appPort = 8081, isReady = () => true }) {
+export function createRenderAppGateway({ token, readinessNonce, appPort = 8081, isReady = () => true }) {
   const authorized = (req) => {
     const value = req.headers["x-qm-render-app-token"];
     return (
@@ -179,7 +188,10 @@ export function createRenderAppGateway({ token, appPort = 8081, isReady = () => 
   };
   const server = createServer((req, res) => {
     if (req.url === "/__qm_ready") {
-      res.writeHead(isReady() ? 204 : 503).end();
+      const ready = isReady();
+      const headers = { "cache-control": "no-store" };
+      if (ready && authorized(req) && readinessNonce) headers["x-qm-render-app-ready"] = readinessNonce;
+      res.writeHead(ready ? 204 : 503, headers).end();
       return;
     }
     if (!authorized(req)) {

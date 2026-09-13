@@ -29,6 +29,8 @@ function fixture(appRegion?: string) {
   let loseCreate = false;
   let loseUpdate = false;
   let activeEnv: any[] = [];
+  let manifestNonce: string | undefined;
+  let readinessNonce: string | null | undefined;
   const data = new Map<string, string>();
   let resourceSuspended = false;
   let savedRegionBeforeCreate: string | undefined;
@@ -71,7 +73,10 @@ function fixture(appRegion?: string) {
       const path = `${url.pathname}${url.search}`.replace(/^\/v1/, "");
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ method, path, body });
-      if (url.hostname === "qm-private") return response(undefined, 204);
+      if (url.hostname === "qm-private") {
+        const nonce = readinessNonce === undefined ? manifestNonce : readinessNonce;
+        return new Response(null, { status: 204, headers: nonce ? { "x-qm-render-app-ready": nonce } : {} });
+      }
       if (path === "/environments/env-test") return response({ id: "env-test", projectId: "prj-test" });
       if (path === "/projects/prj-test") return response({ owner: { id: "tea-test" } });
       if (path.startsWith("/environments?")) return response(environment ? [{ environment }] : []);
@@ -119,12 +124,17 @@ function fixture(appRegion?: string) {
         activeEnv = body;
         return response(body);
       }
-      if (path === "/services/srv-app/secret-files" && method === "PUT") return response(body);
+      if (path === "/services/srv-app/secret-files" && method === "PUT") {
+        manifestNonce = body.length ? JSON.parse(body[0].content).readinessNonce : undefined;
+        return response(body);
+      }
       if (path.startsWith("/services/srv-app/deploys?") && method === "GET")
         return response(deploys.map((deploy) => ({ deploy })));
       if (path.startsWith("/services/srv-app/deploys/"))
         return response(deploys.find((deploy) => path.endsWith(deploy.id)));
       if (path === "/services/srv-app/deploys" && method === "POST") {
+        const deploymentId = activeEnv.find((row) => row.key === "QM_DEPLOYMENT_ID").value;
+        assert.equal((await store.get(deploymentId))?.pending?.readinessNonce, manifestNonce);
         const deploy = { id: `dep-${deploys.length}`, status: outcome, commit: { id: body.commitId } };
         for (const previous of deploys)
           if (previous.status === "live" && outcome === "live") previous.status = "deactivated";
@@ -168,6 +178,12 @@ function fixture(appRegion?: string) {
     },
     get savedRegionBeforeCreate() {
       return savedRegionBeforeCreate;
+    },
+    get manifestNonce() {
+      return manifestNonce;
+    },
+    set readinessNonce(value: string | null | undefined) {
+      readinessNonce = value;
     },
     set outcome(value: string) {
       outcome = value;
@@ -267,7 +283,9 @@ test("Render app create, update, rollback, and archive retain one diskless servi
   const updated = await f.provider.apply(d, v2);
   d.appliedVersion = 2;
   assert.deepEqual(updated, endpoint);
+  const updatedNonce = f.manifestNonce;
   await f.provider.apply(d, v1);
+  assert.notEqual(f.manifestNonce, updatedNonce);
   assert.equal(f.data.get("retained"), "value");
   await f.provider.destroy(d);
   assert.equal(f.resourceSuspended, true);
@@ -338,6 +356,56 @@ test("A restarted Render provider reconciles a pending deploy against its saved 
   assert.equal((await f.store.get(f.deployment.id))!.liveVersion, 1);
   assert.equal((await f.store.get(f.deployment.id))!.pending, undefined);
   assert.equal(f.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
+});
+
+test("Render waits for the new instance nonce through old responses, lost deploy replies, and restarts", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  const endpoint = await f.provider.apply(d, v1);
+  d.status = "running";
+  d.appliedVersion = 1;
+  const firstNonce = f.manifestNonce;
+  assert.match(firstNonce!, /^[a-zA-Z0-9_-]{43}$/);
+  f.readinessNonce = firstNonce;
+  f.loseUpdate = true;
+  const v2 = { ...v1, version: 2 };
+  await assert.rejects(f.provider.apply(d, v2), /unconfirmed deployment/);
+  const pending = (await f.store.get(d.id))!;
+  assert.equal(pending.liveVersion, 1);
+  assert.notEqual(pending.pending!.readinessNonce, firstNonce);
+  assert.equal(pending.pending!.readinessNonce, f.manifestNonce);
+  assert.equal(f.resourceSuspended, false);
+  assert.deepEqual(await f.provider.resolveEndpoint!(d, v1), endpoint);
+  f.readinessNonce = null;
+  const restarted = f.restart(sha);
+  await assert.rejects(restarted.apply(d, v2), /unconfirmed deployment/);
+  assert.equal((await f.store.get(d.id))!.pending!.readinessNonce, pending.pending!.readinessNonce);
+  f.readinessNonce = undefined;
+  assert.deepEqual(await restarted.apply(d, v2), endpoint);
+  assert.equal(f.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 2);
+  assert.equal((await f.store.get(d.id))!.liveVersion, 2);
+  d.appliedVersion = 2;
+  f.readinessNonce = f.manifestNonce;
+  const previousNonce = f.manifestNonce;
+  await assert.rejects(restarted.apply(d, v2), /unconfirmed deployment/);
+  assert.notEqual((await f.store.get(d.id))!.pending!.readinessNonce, previousNonce);
+  f.readinessNonce = undefined;
+  await f.restart(sha).apply(d, v2);
+  assert.equal((await f.store.get(d.id))!.pending, undefined);
+});
+
+test("Render can reconcile a legacy pending deployment without a saved readiness nonce", async () => {
+  const f = fixture();
+  f.outcome = "build_in_progress";
+  await assert.rejects(f.provider.apply(f.deployment, f.deployment.versions[0]!), /unconfirmed deployment/);
+  const record = (await f.store.get(f.deployment.id))!;
+  delete record.pending!.readinessNonce;
+  await f.store.put(f.deployment.id, record);
+  f.finishPending();
+  f.readinessNonce = null;
+  await f.restart(sha).apply(f.deployment, f.deployment.versions[0]!);
+  assert.equal((await f.store.get(f.deployment.id))!.pending, undefined);
 });
 
 test("Render refuses changed service ownership and missing retained infrastructure", async () => {

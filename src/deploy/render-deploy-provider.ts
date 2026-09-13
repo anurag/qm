@@ -40,7 +40,13 @@ export interface StoredRenderDeploy {
   liveDeployId?: string;
   suspended: boolean;
   bootstrap?: { previousDeployIds: string[]; deployId?: string; requested?: boolean };
-  pending?: { version: number; runnerCommit: string; previousDeployIds: string[]; deployId?: string };
+  pending?: {
+    version: number;
+    runnerCommit: string;
+    readinessNonce?: string;
+    previousDeployIds: string[];
+    deployId?: string;
+  };
 }
 
 export interface RenderDeployProviderOptions {
@@ -203,7 +209,11 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         signal: AbortSignal.timeout(3_000),
       });
       await response.body?.cancel();
-      return response.status === 204;
+      return (
+        response.status === 204 &&
+        (!record.pending?.readinessNonce ||
+          response.headers.get("x-qm-render-app-ready") === record.pending.readinessNonce)
+      );
     } catch {
       return false;
     }
@@ -382,6 +392,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     await network.allowDatabaseAccess(service.id);
     const resources = await opts.resources.ensure(deployment.id);
     const artifact = await opts.artifacts.prepare(deployment, version);
+    const readinessNonce = randomBytes(32).toString("base64url");
     const envVars = Object.entries({
       PORT: "8080",
       QM_RENDER_APP_TOKEN: record.token,
@@ -390,7 +401,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     const secretFiles = [
       {
         name: "qm-render-artifact.json",
-        content: JSON.stringify({ ...artifact, runtimeEnv: { ...version.env, ...resources } }),
+        content: JSON.stringify({ ...artifact, readinessNonce, runtimeEnv: { ...version.env, ...resources } }),
       },
     ];
     await api.request("PUT", `${path(service)}/env-vars`, envVars);
@@ -401,6 +412,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       pending: {
         version: version.version,
         runnerCommit: opts.source.commit,
+        readinessNonce,
         previousDeployIds: history.map((d) => d.id),
       },
     };
