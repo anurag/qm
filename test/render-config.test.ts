@@ -57,21 +57,13 @@ test("Render sandbox settings accept supported plans and reject invalid lifetime
   assert.doesNotThrow(() => loadConfig({ SANDBOX_TIMEOUT_SEC: "86400" }));
 });
 
-test("Render deployed apps retain data and use the core environment", () => {
+test("Render deployed apps use the core environment", () => {
   const config = loadConfig({
     ...credentials,
     DEPLOY_PROVIDER: "render",
     RENDER_ENVIRONMENT_ID: "evm-production",
-    RENDER_DEPLOY_DISK_SIZE_GB: "3",
   });
   assert.equal(config.renderDeploy.environmentId, "evm-production");
-  assert.equal(config.renderDeploy.diskSizeGB, 3);
-  assert.equal(loadConfig(credentials).renderDeploy.diskSizeGB, 1);
-  for (const value of ["0", "-1", "NaN", "1.5"])
-    assert.throws(
-      () => loadConfig({ ...credentials, RENDER_DEPLOY_DISK_SIZE_GB: value }),
-      /RENDER_DEPLOY_DISK_SIZE_GB/,
-    );
   for (const environmentId of ["wrong", "env-production", "evm-", "evm-production/other"])
     assert.throws(
       () => loadConfig({ ...credentials, RENDER_ENVIRONMENT_ID: environmentId }),

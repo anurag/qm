@@ -307,6 +307,7 @@ function fmtCronRunLine(entry: CronFireLogEntry): string {
 }
 
 export interface AgentToolsOptions {
+  deployProvider?: Config["deployProvider"];
   credentialExecServices?: readonly { service: string; binary: string }[];
   commandCredentialHandles?: readonly string[];
   scratchExec?: boolean;
@@ -328,6 +329,7 @@ export type CoreToolOptions = Omit<AgentToolsOptions, "readOnly" | "surfaceTools
 
 export function coreToolOptions(config: Config): CoreToolOptions {
   return {
+    deployProvider: config.deployProvider,
     sandboxResources: config.sandboxResourcesEnabled,
     scratchExec: config.scratchExecEnabled,
     ownerAuthExec: config.sharedOwnerAuthIsolation,
@@ -1048,12 +1050,22 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       "(it keeps running after the turn ends and gets a stable link). The app must listen on " +
       "the PORT env var. By default only the owner's scope can reach it; `share` grants others " +
       "access (read = reach, write = manage). Use `name` for a friendly, stable link /d/<name>/; " +
-      "`renameFrom` to rename; `rollbackTo` to flip back to an earlier version. Egress is open, " +
-      "so bake data in or have the app fetch it. When the runtime sets $DATA_DIR, state the app " +
-      "writes there survives restarts and redeploys; keep durable state there. For a database use " +
-      "SQLite at exactly $DATA_DIR/app.db — it gets the strongest durability the runtime offers " +
-      "(continuous replication where enabled, periodic snapshots otherwise; a crash can lose the " +
-      "most recent writes). The rest of the disk is reset from source on every relaunch. By default " +
+      "`renameFrom` to rename; `rollbackTo` to select an earlier version. Egress follows the " +
+      "configured deployment policy. Put only non-secret configuration in `env`; its values are " +
+      "saved in the immutable version. " +
+      (opts?.deployProvider === "render"
+        ? "Runtime: Render. Before you build, read skills/publish/references/render.md. Published apps " +
+          "have no persistent disk. Use the runtime DATABASE_URL for the app's Postgres database and " +
+          "QM_APP_STORAGE_URL with QM_APP_STORAGE_TOKEN to request signed URLs for single files. " +
+          "Keep file metadata in Postgres and read credentials only on the server. Do not use SQLite, " +
+          "$DATA_DIR, or local files for persistent state. Serialize compatible migrations across " +
+          "old and new app versions, finish database initialization before listening on PORT, and " +
+          "drain requests on SIGTERM. "
+        : "When the runtime sets $DATA_DIR, state written there survives restarts and redeploys. " +
+          "Keep SQLite at exactly $DATA_DIR/app.db for the strongest available durability " +
+          "(continuous replication where enabled, periodic snapshots otherwise; a crash can lose " +
+          "the most recent writes). The rest of the disk is reset from source on every relaunch. ") +
+      "By default " +
       "an app sleeps when idle and cold-starts on the next visit; set `alwaysOn: true` to keep it " +
       "warm (no idle cold starts) — use it only when someone actually needs instant loads, and " +
       "`alwaysOn: false` to turn it back off.",
@@ -1069,7 +1081,9 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       ),
       renameFrom: Type.Optional(Type.String({ description: "Rename the deployment currently named this to `name`." })),
       env: Type.Optional(
-        Type.Record(Type.String(), Type.String(), { description: "Env vars baked into the immutable version." }),
+        Type.Record(Type.String(), Type.String(), {
+          description: "Non-secret configuration saved in the immutable version. Never include credentials.",
+        }),
       ),
       rollbackTo: Type.Optional(
         Type.Integer({ description: "Flip the deployment named `name` back to this version number." }),
@@ -1098,9 +1112,12 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
         const r = await tc.publish(params as PublishInput);
         const reach = describePublishAudience(r.audience);
         const alwaysOnNote = r.alwaysOn ? "\nAlways-on: the app is kept warm — no idle cold starts." : "";
-        const dataNote = r.dataDir
-          ? `\nDurable data: runtime state written under ${r.dataDir} ($DATA_DIR) survives restarts and redeploys — keep SQLite at ${r.dataDir}/app.db (it gets the strongest durability the runtime offers). If this app writes runtime state anywhere else on disk, migrate it there (data deliberately baked into the repo stays where it is).`
-          : "";
+        let dataNote = "";
+        if (r.storage)
+          dataNote =
+            "\nDurable storage: Postgres through the app's runtime DATABASE_URL; files through signed URLs from QM_APP_STORAGE_URL and QM_APP_STORAGE_TOKEN. Keep file metadata in Postgres and credentials on the server. The app has no persistent disk. Read skills/publish/references/render.md for the storage API.";
+        else if (r.dataDir)
+          dataNote = `\nDurable data: runtime state written under ${r.dataDir} ($DATA_DIR) survives restarts and redeploys — keep SQLite at ${r.dataDir}/app.db (it gets the strongest durability the runtime offers). If this app writes runtime state anywhere else on disk, migrate it there (data deliberately baked into the repo stays where it is).`;
         return recordResult(
           callId,
           {
@@ -1111,6 +1128,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
             url: r.url,
             ...(r.audience ? { audience: r.audience } : {}),
             ...(r.dataDir ? { dataDir: r.dataDir } : {}),
+            ...(r.storage ? { storage: r.storage } : {}),
           },
           text(`Published ${r.name ?? r.id} (v${r.version}) → ${r.url}\n${reach}${alwaysOnNote}${dataNote}`),
         );

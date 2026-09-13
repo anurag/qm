@@ -416,7 +416,6 @@ function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
 
 interface RenderDeployEnv {
   environmentId?: string;
-  diskSizeGB: number;
   apiKey: string;
   workspaceId: string;
   baseImage: string;
@@ -454,14 +453,10 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
     throw new Error("RENDER_DEPLOY_BRANCH must be a valid Git branch name");
   if (repo && baseImage)
     throw new Error("Set RENDER_DEPLOY_IMAGE or RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH, not both");
-  const diskSizeGB = numEnvStrict("RENDER_DEPLOY_DISK_SIZE_GB", env.RENDER_DEPLOY_DISK_SIZE_GB) ?? 1;
-  if (!Number.isSafeInteger(diskSizeGB) || diskSizeGB < 1)
-    throw new Error("RENDER_DEPLOY_DISK_SIZE_GB must be a positive integer");
   const environmentId = env.RENDER_ENVIRONMENT_ID?.trim();
   if (environmentId && !/^evm-[a-z0-9]+$/.test(environmentId))
     throw new Error("RENDER_ENVIRONMENT_ID must be an environment ID (evm-...)");
   return {
-    diskSizeGB,
     ...(environmentId ? { environmentId } : {}),
     apiKey: env.RENDER_API_KEY?.trim() || "",
     workspaceId: env.RENDER_WORKSPACE_ID?.trim() || "",

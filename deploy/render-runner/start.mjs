@@ -74,7 +74,7 @@ export async function runRenderApp({
   env = process.env,
 } = {}) {
   const entrypoint = await prepareRenderApp(manifestPath, appDir, env);
-  const appEnv = { ...env, PORT: "8080", DATA_DIR: "/data" };
+  const appEnv = { ...env, PORT: "8080" };
   for (const key of Object.keys(appEnv))
     if (key.startsWith("GIT_CONFIG_") || key === "GIT_ASKPASS" || key === "SSH_ASKPASS") delete appEnv[key];
   const child = spawn("bash", ["-c", entrypoint], {

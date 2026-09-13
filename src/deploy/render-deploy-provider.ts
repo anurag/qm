@@ -1,3 +1,4 @@
+import { Agent, fetch as undiciFetch } from "undici";
 import type { RenderDeployArtifactAccess } from "./render-deploy-artifacts.ts";
 import { LRUCache } from "lru-cache";
 import type { Deployment, DeploymentVersion } from "./deploy-store.ts";
@@ -72,7 +73,6 @@ export interface RenderDeployProviderOptions {
   source?: { repo: string; branch: string };
   region?: string;
   environmentId?: string;
-  diskSizeGB?: number;
   plan?: string;
   appPrefix?: string;
   registryCredentialId?: string;
@@ -88,7 +88,7 @@ export interface RenderDeployProviderOptions {
 }
 
 export function createRenderDeployProvider(opts: RenderDeployProviderOptions): DeployProvider {
-  const fetchImpl = opts.fetchImpl ?? fetch;
+  const fetchImpl = (opts.fetchImpl ?? undiciFetch) as typeof undiciFetch;
   const prefix = opts.appPrefix ?? "qm-app";
   const region = opts.region ?? "oregon";
   const timeoutMs = opts.deployTimeoutMs ?? 600_000;
@@ -176,8 +176,6 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       throw new Error("RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH must be set together");
     if (opts.baseImage && opts.source)
       throw new Error("Set RENDER_DEPLOY_IMAGE or RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH, not both");
-    if (!Number.isSafeInteger(opts.diskSizeGB ?? 1) || (opts.diskSizeGB ?? 1) < 1)
-      throw new Error("RENDER_DEPLOY_DISK_SIZE_GB must be a positive integer");
     if (!/^[a-z0-9][a-z0-9-]{0,19}$/.test(prefix)) {
       throw new Error("RENDER_DEPLOY_APP_PREFIX must be a lowercase DNS label with at most 20 characters");
     }
@@ -199,8 +197,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       (opts.environmentId !== undefined && service.environmentId !== opts.environmentId)
     )
       throw new Error(`Render service ${service.name} is not the expected private app service in ${region}`);
-    if (service.serviceDetails.disk?.mountPath !== "/data" || service.serviceDetails.numInstances !== 1)
-      throw new Error(`Render app ${service.id} must retain one instance and its persistent /data disk`);
+    if (service.serviceDetails.disk || service.serviceDetails.numInstances !== 1)
+      throw new Error(`Render app ${service.id} must use one instance without a persistent disk`);
     const marker = await request<{ value: string }>(
       "GET",
       `${pathOf(service)}/env-vars/${OWNER_MARKER}`,
@@ -253,7 +251,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     if (url.protocol !== "http:" || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
       throw new Error(`Render service ${service.id} returned an invalid private address`);
     }
-    return { host: url.hostname, port: APP_PORT };
+    return { host: url.hostname, port: APP_PORT, proxyHeaders: { connection: "close" } };
   }
 
   async function listDeploys(service: RenderService, deadline = Date.now() + 30_000): Promise<RenderDeploy[]> {
@@ -306,7 +304,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     const record = await opts.store.get(deployment.id);
     return (
       record !== null &&
-      (record.status === "pending" ||
+      ((record.status === "pending" && record.liveVersion === undefined) ||
         record.status === "suspending" ||
         record.status === "suspended" ||
         (record.liveVersion !== undefined && record.liveVersion !== deployment.appliedVersion))
@@ -330,8 +328,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     await save(pending);
     try {
       let service = await findService(deployment, undefined, pending.serviceId);
-      if (!service)
-        throw new Error("The retained Render app service or disk is missing; restore its data before retrying");
+      if (!service) throw new Error("The retained Render app service is missing; restore the service before retrying");
       pending = { ...pending, serviceId: service.id };
       await save(pending);
       if (service.suspended !== "suspended") await request("POST", `${pathOf(service)}/suspend`);
@@ -339,7 +336,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       while (service.suspended !== "suspended") {
         if (Date.now() >= deadline) throw new Error("Render app suspension was not confirmed before the deadline");
         service = await findService(deployment, deadline, pending.serviceId);
-        if (!service) throw new Error("The retained Render app service or disk is missing");
+        if (!service) throw new Error("The retained Render app service is missing");
         if (service.suspended !== "suspended") await sleep(Math.max(1, pollMs));
       }
       await opts.artifacts.revoke(deployment.id);
@@ -360,14 +357,20 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       if (status !== "live" && !FAILED_DEPLOYS.has(status ?? "")) return false;
       if (status === "live") {
         const endpoint = endpointOf(service!);
+        const dispatcher = new Agent({ pipelining: 0 });
         try {
-          const response = await fetchImpl(`http://${endpoint.host}:${endpoint.port}/`, {
-            redirect: "manual",
+          const requestOptions = {
+            redirect: "manual" as const,
             signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, deadline - Date.now()))),
-          });
+            dispatcher,
+          };
+          const response = await fetchImpl(`http://${endpoint.host}:${endpoint.port}/`, requestOptions);
           await response.body?.cancel();
+          if (response.status < 200 || response.status >= 500) return false;
         } catch {
           return false;
+        } finally {
+          await dispatcher.destroy();
         }
       }
       record = { ...record, status: status === "live" ? "live" : "failed", deployId: deploy.id };
@@ -440,7 +443,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
   }
 
   return {
-    profile: { managedScaleToZero: false, dataDir: "/data" },
+    profile: { managedScaleToZero: false, storage: { database: "postgres", files: "signed-urls" } },
     apply: (deployment, version) =>
       serialized(deployment, async () => {
         ensureConfigured();
@@ -457,7 +460,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         let service = await findService(deployment, undefined, previous?.serviceId);
         if (!service && previous?.serviceId)
-          throw new Error("The retained Render app service or disk is missing; restore its data before retrying");
+          throw new Error("The retained Render app service is missing; restore the service before retrying");
         if (service && previous?.serviceId && service.id !== previous.serviceId)
           throw new Error(`Render service identity changed for deployment ${deployment.id}`);
         if (
@@ -470,7 +473,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
           return endpointOf(service);
         if (service) await waitForIdle(service);
         const artifact = await opts.artifacts.prepare(deployment, version);
-        const env = { ...version.env, PORT: String(APP_PORT), DATA_DIR: "/data", [OWNER_MARKER]: deployment.id };
+        const env = { ...version.env, ...artifact.runtimeEnv, PORT: String(APP_PORT), [OWNER_MARKER]: deployment.id };
         const envVars = Object.entries(env).map(([key, value]) => ({ key, value }));
         const secretFiles = [{ name: ARTIFACT_FILE, content: JSON.stringify(artifact) }];
         const source = opts.source
@@ -495,7 +498,11 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         if (service) {
           await request("PUT", `${pathOf(service)}/env-vars`, envVars);
           await request("PUT", `${pathOf(service)}/secret-files`, secretFiles);
-          await request("PATCH", pathOf(service), { autoDeploy: "no", ...source, serviceDetails: runtime });
+          await request("PATCH", pathOf(service), {
+            autoDeploy: "no",
+            ...source,
+            serviceDetails: { ...runtime, maxShutdownDelaySeconds: 300 },
+          });
         }
         const previousDeployIds = service ? (await waitForIdle(service)).map((deploy) => deploy.id) : [];
         const liveVersion = previous?.liveVersion ?? deployment.appliedVersion;
@@ -525,7 +532,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
                 plan: opts.plan ?? "0.5c-512mb",
                 region,
                 numInstances: 1,
-                disk: { name: "data", mountPath: "/data", sizeGB: opts.diskSizeGB ?? 1 },
+                maxShutdownDelaySeconds: 300,
               },
             });
             service = created?.service ?? null;
@@ -562,7 +569,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       const inflight = inflightResolves.get(deployment.id);
       if (inflight) return inflight;
       const resolve = (async () => {
-        const service = await findService(deployment);
+        const record = await opts.store.get(deployment.id);
+        const service = await findService(deployment, undefined, record?.serviceId);
         if (!service || service.suspended === "suspended") return null;
         const deploys = await request<RenderDeployPage[]>("GET", `${pathOf(service)}/deploys?status=live&limit=1`);
         return deploys?.some(({ deploy }) => deploy.status === "live") ? endpointOf(service) : null;

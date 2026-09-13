@@ -128,7 +128,7 @@ function cloud(t: TestContext, d: Deployment) {
       if (method === "GET")
         return Response.json(
           [...state.projects.values()]
-            .filter((item) => item.name === url.searchParams.get("name"))
+            .filter((item) => !url.searchParams.has("name") || item.name === url.searchParams.get("name"))
             .map((project) => ({ project, cursor: project.id })),
         );
       assert.deepEqual(body, { name: "acme-qm", ownerId: "tea-acme", environments: [{ name: "production" }] });
@@ -175,7 +175,7 @@ function cloud(t: TestContext, d: Deployment) {
       if (method === "GET")
         return Response.json(
           [...state.services.values()]
-            .filter((item) => item.name === url.searchParams.get("name"))
+            .filter((item) => !url.searchParams.has("name") || item.name === url.searchParams.get("name"))
             .map((service) => ({ service, cursor: service.id })),
         );
       assert.equal(body.environmentId, "evm-acme");
@@ -671,7 +671,31 @@ test("Render stops services and resumes them while retaining database and disk",
   );
 });
 
-test("Render purge resumes partial deletion and retains the project for published apps", async (t) => {
+test("Render protects published apps before shutdown or purge", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const app = {
+    ...c.services.get("srv-acme-web-ui")!,
+    id: "srv-published-app",
+    name: "qm-app-a1",
+    type: "private_service",
+  };
+  c.services.set(app.id, app);
+  c.envs.set(app.id, { QM_DEPLOYMENT_ID: "00000000-0000-4000-8000-000000000001" });
+  for (const purge of [false, true]) {
+    const mark = c.calls.length;
+    await assert.rejects(async () => d.backend.down({ purge }), /Published apps still use this deployment/);
+    assert.deepEqual(writes(c.calls.slice(mark)), []);
+    assert.equal(d.saved().pendingPurge, undefined);
+  }
+  app.suspended = "suspended";
+  await assert.rejects(async () => d.backend.down({ purge: true }), /Published apps still use this deployment/);
+  await d.backend.down({});
+  assert.ok(c.database);
+});
+
+test("Render purge resumes partial deletion and retains the project", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });

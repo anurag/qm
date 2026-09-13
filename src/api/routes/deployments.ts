@@ -538,15 +538,25 @@ async function proxyReach(
     return;
   }
   const htmlNav = wantsWarmingPage(req, method);
-  const up = requestFn({ hostname: host, port, path: subPath + url.search, method, headers }, (upRes) => {
-    up.setTimeout(0);
-    markUpstreamUp(upstreamKey);
-    upRes.on("error", () => res.destroy());
-    armThrottleShield(upstreamKey, upRes.statusCode ?? 0, upRes);
-    const headers = gatewaySafeResponseHeaders(upRes.headers, opts?.sandbox ?? false);
-    res.writeHead(upRes.statusCode ?? 502, headers);
-    upRes.pipe(res);
-  });
+  const up = requestFn(
+    {
+      hostname: host,
+      port,
+      path: subPath + url.search,
+      method,
+      headers,
+      agent: reach.endpoint.proxyHeaders?.connection === "close" ? false : undefined,
+    },
+    (upRes) => {
+      up.setTimeout(0);
+      markUpstreamUp(upstreamKey);
+      upRes.on("error", () => res.destroy());
+      armThrottleShield(upstreamKey, upRes.statusCode ?? 0, upRes);
+      const headers = gatewaySafeResponseHeaders(upRes.headers, opts?.sandbox ?? false);
+      res.writeHead(upRes.statusCode ?? 502, headers);
+      upRes.pipe(res);
+    },
+  );
   const dialMs = warmingDialTimeoutMs(
     upstreamKey,
     htmlNav,
@@ -623,7 +633,14 @@ function deploymentFetchHttp1(
     const { host, port, tls, proxyHeaders } = endpoint.endpoint;
     const requestFn = tls ? httpsRequest : httpRequest;
     const request = requestFn(
-      { hostname: host, port, path, method: "GET", headers: { ...proxyHeaders, "accept-encoding": "identity" } },
+      {
+        hostname: host,
+        port,
+        path,
+        method: "GET",
+        headers: { ...proxyHeaders, "accept-encoding": "identity" },
+        agent: proxyHeaders?.connection === "close" ? false : undefined,
+      },
       async (response) => {
         clearTimeout(timeout);
         try {

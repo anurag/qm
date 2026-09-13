@@ -1047,6 +1047,29 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           );
         if (state.pendingPurge && !opts.purge) throw new CliError("Render cleanup is incomplete; run qm down --purge");
         const bound = await inventory(ctx, request, state, !!opts.purge);
+        const hosted = await list<RenderService>(
+          request,
+          `/services?${new URLSearchParams({ ownerId: state.workspaceId })}`,
+          "service",
+        );
+        const owned = new Set(Object.values(state.services).map((service) => service.id));
+        for (const service of hosted) {
+          if (
+            owned.has(service.id) ||
+            service.ownerId !== state.workspaceId ||
+            service.environmentId !== state.environmentId ||
+            service.type !== "private_service" ||
+            (!opts.purge && service.suspended === "suspended")
+          )
+            continue;
+          const env = await envVars(request, service.id);
+          if (/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(env.QM_DEPLOYMENT_ID ?? ""))
+            throw new CliError(
+              opts.purge
+                ? "Published apps still use this deployment's database and object storage. Back up app data and delete their Render services before qm down --purge"
+                : "Published apps still use this deployment. Archive or stop them before qm down",
+            );
+        }
         if (opts.purge) {
           state.pendingPurge = true;
           saveState(ctx, state);
@@ -1071,7 +1094,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           delete state.dirtyServices;
           saveState(ctx, state);
           note(
-            "QM services, Postgres, and the MinIO disk are deleted. The project and production environment are retained for published apps and future deployment",
+            "QM services, Postgres, and the MinIO disk are deleted. The project and production environment are retained for future deployment",
           );
         } else note("Postgres, persistent disks, and stored objects are retained. Storage charges continue");
       }),

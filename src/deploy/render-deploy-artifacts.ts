@@ -1,3 +1,4 @@
+import { mintRenderAppStorageToken } from "./render-app-storage.ts";
 import { randomBytes } from "node:crypto";
 import { mintDeployGitAccess } from "./access-token.ts";
 import type { Deployment, DeploymentVersion, DeployStore } from "./deploy-store.ts";
@@ -10,6 +11,7 @@ export interface RenderDeployArtifactAccess {
   token: string;
   commit: string;
   entrypoint: string;
+  runtimeEnv?: Record<string, string>;
 }
 
 export interface StoredRenderDeployCredential {
@@ -29,6 +31,7 @@ export function isRenderDeployPrincipal(principalId: string): boolean {
 export function createRenderDeployArtifacts(opts: {
   baseUrl: string;
   signingSecret: string;
+  appStorage?: boolean;
   store: DurableMap<StoredRenderDeployCredential>;
   deployStore: Pick<DeployStore, "versionOf">;
 }): RenderDeployArtifacts {
@@ -69,6 +72,20 @@ export function createRenderDeployArtifacts(opts: {
         token,
         commit: saved.commit,
         entrypoint: saved.entrypoint,
+        ...(opts.appStorage
+          ? {
+              runtimeEnv: {
+                QM_APP_STORAGE_URL: new URL(
+                  `/v1/deployments/${encodeURIComponent(deployment.id)}/storage`,
+                  base,
+                ).toString(),
+                QM_APP_STORAGE_TOKEN: await mintRenderAppStorageToken(opts.signingSecret, {
+                  deploymentId: deployment.id,
+                  principalId: credential.principalId,
+                }),
+              },
+            }
+          : {}),
       };
     },
     revoke: (id) => opts.store.delete(id),

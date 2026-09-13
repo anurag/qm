@@ -9,6 +9,7 @@ export interface S3ConnectionOptions {
   region?: string;
   endpoint?: string;
   forcePathStyle?: boolean;
+  requestChecksumCalculation?: "WHEN_REQUIRED" | "WHEN_SUPPORTED";
 }
 
 export function s3Client(options: S3ConnectionOptions = {}): S3Client {
@@ -22,6 +23,7 @@ export function s3Client(options: S3ConnectionOptions = {}): S3Client {
         }
       : {}),
     ...(options.forcePathStyle !== undefined ? { forcePathStyle: options.forcePathStyle } : {}),
+    ...(options.requestChecksumCalculation ? { requestChecksumCalculation: options.requestChecksumCalculation } : {}),
   });
 }
 

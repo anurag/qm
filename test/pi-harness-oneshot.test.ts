@@ -140,6 +140,7 @@ test("piHarnessConfigOptions maps every Config knob the harness consumes, field 
     }),
   );
   assert.deepEqual(opts, {
+    deployProvider: "docker",
     defaultModelId: "model-base",
     detectModelId: "model-detect",
     titleModelId: "model-title",

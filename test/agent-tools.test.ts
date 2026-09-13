@@ -1,7 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Check } from "typebox/value";
-import { createAgentTools, pauseStampAfterToolCall, type ToolContextRef } from "../src/harness/agent-tools.ts";
+import {
+  createAgentTools,
+  coreToolOptions,
+  pauseStampAfterToolCall,
+  type ToolContextRef,
+} from "../src/harness/agent-tools.ts";
+import { loadConfig } from "../src/config.ts";
 import { filterHistoryForAudience } from "../src/resolution/context-filter.ts";
 import { CommandDenied, NeedsApproval, type ToolContext } from "../src/tools/primitives.ts";
 import type { EntryType, SessionEntry } from "../src/types.ts";
@@ -1887,6 +1893,66 @@ test('execute scope:"owner" routes only when the owner-auth surface is enabled',
     (result as { content: Array<{ text: string }> }).content[0]?.text ?? "",
     /owner-auth box is not available/,
   );
+});
+
+test("publish describes the configured storage before the app is built", () => {
+  for (const provider of ["render", "docker", "fly", "aws", "porter"] as const) {
+    const config = { ...loadConfig({}), deployProvider: provider };
+    const publish = createAgentTools({ current: fakeToolContext() }, coreToolOptions(config)).find(
+      (tool) => tool.name === "publish",
+    )!;
+    assert.match(publish.description, /non-secret configuration/);
+    if (provider === "render") {
+      assert.match(publish.description, /Before you build, read skills\/publish\/references\/render.md/);
+      assert.match(publish.description, /runtime DATABASE_URL/);
+      assert.match(publish.description, /QM_APP_STORAGE_URL with QM_APP_STORAGE_TOKEN/);
+      assert.match(publish.description, /before listening on PORT/);
+      assert.doesNotMatch(publish.description, /SQLite at exactly \$DATA_DIR\/app.db/);
+    } else {
+      assert.match(publish.description, /SQLite at exactly \$DATA_DIR\/app.db/);
+      assert.doesNotMatch(publish.description, /QM_APP_STORAGE_TOKEN/);
+    }
+  }
+});
+
+test("publish reports runtime storage and retains DATA_DIR for other runtimes", async () => {
+  for (const storage of [undefined, { database: "postgres", files: "signed-urls" } as const]) {
+    const emitted: Emitted[] = [];
+    const publish = createAgentTools({
+      current: {
+        ...fakeToolContext(),
+        async publish() {
+          return {
+            id: "dep-1",
+            name: "site",
+            version: 1,
+            url: "/d/site/",
+            ...(storage ? { storage } : { dataDir: "/data" }),
+          };
+        },
+      },
+      scopeLabel: "personal:U1",
+      emit(entry) {
+        emitted.push(entry as Emitted);
+      },
+    }).find((tool) => tool.name === "publish");
+    const out = (await call(publish, { name: "site", entrypoint: "node server.js" })) as {
+      content: Array<{ text: string }>;
+    };
+    const message = out.content[0]!.text;
+    const recorded = emitted.find((entry) => entry.type === "tool_result")!.payload;
+    assert.deepEqual(recorded.storage, storage);
+    if (storage) {
+      assert.match(message, /Postgres through the app's runtime DATABASE_URL/);
+      assert.match(message, /files through signed URLs/);
+      assert.match(message, /no persistent disk/);
+      assert.doesNotMatch(message, /SQLite|\$DATA_DIR/);
+      assert.equal(recorded.dataDir, undefined);
+    } else {
+      assert.match(message, /SQLite at \/data\/app.db/);
+      assert.equal(recorded.dataDir, "/data");
+    }
+  }
 });
 
 test("publish reply states owner + resolved audience in human terms (ADR 0003 D7)", async () => {

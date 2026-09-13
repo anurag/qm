@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -42,7 +42,7 @@ async function fixture(t: TestContext) {
     files: [
       {
         path: "app.cjs",
-        data: 'require("node:fs").writeFileSync("result.json", JSON.stringify({ version: 1, port: process.env.PORT, secret: process.env.APP_SECRET, git: process.env.GIT_CONFIG_VALUE_0 })); process.exit(23);',
+        data: 'require("node:fs").writeFileSync("result.json", JSON.stringify({ version: 1, port: process.env.PORT, secret: process.env.APP_SECRET, git: process.env.GIT_CONFIG_VALUE_0, dataDir: process.env.DATA_DIR })); process.exit(23);',
       },
       { path: "old.txt", data: "old version" },
     ],
@@ -97,9 +97,6 @@ test("Render runner boots an immutable Git version after core and app cache dele
   const manifest = await f.artifacts.prepare(f.d, v1);
   const manifestPath = join(f.root, "artifact.json");
   const appDir = join(f.root, "app");
-  const data = join(f.root, "data");
-  await mkdir(data);
-  await writeFile(join(data, "app.db"), "durable data");
   await writeFile(manifestPath, JSON.stringify(manifest));
   await f.deployStore.addVersion(f.d.id, {
     snapshotDir: "/unused",
@@ -124,7 +121,6 @@ test("Render runner boots an immutable Git version after core and app cache dele
   await rm(join(f.root, "reader"), { recursive: true });
   assert.equal(await runRenderApp({ manifestPath, appDir, env: process.env }), 23);
   assert.equal(await readFile(join(appDir, "old.txt"), "utf8"), "old version");
-  assert.equal(await readFile(join(data, "app.db"), "utf8"), "durable data");
   const restarted = createRenderDeployArtifacts({
     baseUrl: f.base,
     signingSecret,

@@ -1,3 +1,4 @@
+import type { RenderAppStorage } from "../deploy/render-app-storage.ts";
 import type { BrokerSessionStore } from "../auth/broker-sessions.ts";
 import type { DirectFileUploads } from "../files/direct-file-upload.ts";
 import type { SandboxResources } from "../sandbox/sandbox-resources.ts";
@@ -69,6 +70,7 @@ import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces/slack-installation.ts";
 
 export interface ServerDeps {
+  renderAppStorage?: RenderAppStorage;
   production?: boolean;
   allowUnauthenticatedCore?: boolean;
   signingSecret?: string;

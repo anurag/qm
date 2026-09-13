@@ -6,6 +6,7 @@ export interface DeployProfile {
   managedScaleToZero: boolean;
   inPlaceReconcile?: boolean;
   dataDir?: string;
+  storage?: { database: "postgres"; files: "signed-urls" };
 }
 
 export interface DeployReconcileInput {

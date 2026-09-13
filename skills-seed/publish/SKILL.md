@@ -41,7 +41,7 @@ First publish, and every later update — same call, same `name`, a new immutabl
 publish({ dir: "dist", entrypoint: "node server.js", name: "status-board" })
 ```
 
-Roll back to an earlier version (an instant pointer flip):
+Roll back by deploying an earlier code version:
 
 ```
 publish({ name: "status-board", rollbackTo: 3 })
@@ -53,14 +53,25 @@ Give an auto-named deployment a friendly link:
 publish({ renameFrom: "s-1176-p-5050", name: "status-board" })
 ```
 
-`publish` returns `{ id, name, version, url, dataDir? }` — give the user the `url` (`/d/<name>/`).
+`publish` returns `{ id, name, version, url, dataDir?, storage? }`. Give the user the
+`url` (`/d/<name>/`). Put only non-secret configuration in `env`. Its values are saved
+in the immutable version. Never copy runtime credentials into publish parameters,
+source files, or browser code.
 
 ## Durable data — where app state must live
 
-The app's disk is **reset from source on every relaunch**, with one exception: when the
-runtime supports durable app data it sets `$DATA_DIR` (and the publish result reports
-`dataDir`). Everything the app writes under `$DATA_DIR` survives restarts, redeploys, and
-platform recycles.
+Choose storage before you build. The `publish` tool description identifies Render
+when it is the deployment provider.
+
+**Render:** read [references/render.md](references/render.md) before you write the
+app. Published apps have no persistent disk. Use the app's runtime `DATABASE_URL`
+for Postgres and the runtime file API for signed URLs. Keep file metadata in
+Postgres. Do not use SQLite or local files for persistent state. The publish result
+reports `storage: { database: "postgres", files: "signed-urls" }`.
+
+**Other runtimes:** when the runtime supports durable app data, it sets `$DATA_DIR`
+and the publish result reports `dataDir`. Files written under `$DATA_DIR` survive
+restarts and redeploys. The rest of the disk is reset from source on each relaunch.
 
 - **Any state the app keeps — write it under `$DATA_DIR`.** Never beside the code, never
   in `/tmp`, never in a JSON file in the app dir: all of that silently vanishes on the
@@ -69,9 +80,9 @@ platform recycles.
   strongest durability the runtime offers (continuous replication where enabled —
   ~seconds of loss window — periodic snapshots otherwise). Other files under `$DATA_DIR`
   are snapshotted periodically.
-- **Guard the no-persistence case:** if `$DATA_DIR` is unset, the runtime has no durable
-  app storage — don't build an app that quietly accumulates state on disk; say so and
-  bake data in or fetch it live instead.
+- **Guard the no-persistence case:** if the runtime provides neither the Render
+  storage contract nor `$DATA_DIR`, do not store persistent state on disk. State the
+  limitation and bake data in or fetch it live instead.
 - **Updating an existing stateful app?** If it writes _runtime_ state (a db, uploads,
   counters) anywhere else, move that state under `$DATA_DIR` as part of the update — do
   this on your own initiative; the user should never have to ask. Data deliberately baked
@@ -83,7 +94,9 @@ A published app is a new immutable version the moment the runtime accepts it —
 the same as the app _working_. So for anything browsable, sanity-check it locally before you
 publish:
 
-1. Run it locally. Start the server in the background on a port — e.g.
+1. For Render, follow the real Postgres checks in
+   [references/render.md](references/render.md). Then run the app locally. Start
+   the server in the background on a port — e.g.
    `PORT=8080 node server.js` via the `background` tool, so it keeps serving while you check.
 2. Probe it with `curl` — confirm it answers, returns the status you expect, and the main
    page/endpoint is actually there (real content, not a stack trace or a blank 500):
@@ -117,8 +130,9 @@ publish({
 
 - **Stable, friendly link.** `/d/<name>/` doesn't change when you ship a new version, and
   `renameFrom` lets you change it on request without losing history or shares.
-- **Immutable versions + rollback.** Every publish is a new immutable version; `rollbackTo`
-  is an instant pointer flip. Safe to ship often.
+- **Immutable versions + rollback.** Each source publish creates an immutable version.
+  `rollbackTo` deploys an earlier version and retains current data. It does not undo
+  database migrations.
 - **Posture-aware egress.** Deployment network access follows the operator's configured
   deployment provider and egress policy. Declare required hosts and credentials explicitly;
   never assume arbitrary outbound access.

@@ -93,12 +93,26 @@ The project, environment, and external storage remain. Keep
 `render.resources.json` available for recovery; it contains resource IDs and
 pending operations, but no credentials.
 
-Published apps use private services with a 1 GB disk at `/data` by default. Idle
-cleanup and archive suspend them and revoke source access while retaining data.
-Storage charges continue. For permanent removal, archive the app, back up its
-data, then delete its owned service in Render. The shared private network does
-not enforce QM access checks between apps: app code can reach peer service
-ports. As with Fly, app authors must be trusted to access the deployment network.
+Shutdown stops if a published app still runs in the environment. Archive or stop
+these apps first. Purge stops if any published app service remains, including a
+suspended service. Back up app data and delete these services before purge.
+
+Published apps use private services with no persistent disk. QM supplies a
+restricted `DATABASE_URL` for each app's Postgres database and runtime
+`QM_APP_STORAGE_URL` and `QM_APP_STORAGE_TOKEN` for signed file URLs. Keep file
+keys and metadata in Postgres. Do not use SQLite or local files for persistent
+state. Read runtime credentials only from the server environment; do not copy
+their values into publish parameters, source files, or browser code.
+
+Idle cleanup and archive suspend the app and revoke its source and storage
+tokens. They retain its service, database, and objects for restore. Rollback
+deploys earlier code and retains current data. Storage charges continue. Deleting
+the app service does not delete its database or objects. For permanent removal,
+archive the app, back up its data, then remove its service and retained app data.
+
+The shared private network does not enforce QM access checks between apps: app
+code can reach peer service ports. As with Fly, app authors must be trusted to
+access the deployment network.
 
 Agent sandboxes are created on demand. Core runs the existing scheduler;
 Workflows and Render Cron Jobs are not required.

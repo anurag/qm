@@ -1,6 +1,8 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
@@ -16,6 +18,7 @@ import {
 import type { Deployment, DeploymentVersion } from "../src/deploy/deploy-store.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { scopeId } from "../src/types.ts";
+import { fetch as undiciFetch, getGlobalDispatcher, MockAgent, setGlobalDispatcher } from "undici";
 
 const ID = "550e8400-e29b-41d4-a716-446655440000";
 const WORKSPACE = "tea-qm";
@@ -64,7 +67,9 @@ function fakeRender(
     existing?: boolean;
     appReachable?: boolean;
     environmentId?: string;
-    missingDisk?: boolean;
+    attachedDisk?: boolean;
+    appStatus?: number;
+    appFetch?: typeof fetch;
     marker?: string;
     type?: string;
     region?: string;
@@ -109,7 +114,7 @@ function fakeRender(
         url: "qm-app-internal:10000",
         region: opts.region ?? "oregon",
         numInstances: 1,
-        disk: opts.missingDisk ? undefined : { mountPath: "/data", sizeGB: 1 },
+        ...(opts.attachedDisk ? { disk: { mountPath: "/data", sizeGB: 1 } } : {}),
       },
     };
   }
@@ -117,8 +122,9 @@ function fakeRender(
     const url = new URL(String(input));
     if (url.hostname === "qm-app-internal") {
       assert.equal(url.port, "8080");
+      if (opts.appFetch) return opts.appFetch(input, init);
       if (opts.appReachable === false) throw new TypeError("App port is unavailable");
-      return new Response("app ready");
+      return new Response("app ready", { status: opts.appStatus ?? 200 });
     }
     assert.equal(url.origin, "https://api.render.com");
     assert.equal(new Headers(init.headers).get("authorization"), `Bearer ${TOKEN}`);
@@ -241,8 +247,9 @@ function fakeRender(
 test("Render publish creates a private image service and waits for its deploy", async () => {
   const fake = fakeRender();
   const endpoint = await fake.provider().apply(deployment, version);
-  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080 });
+  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
   assert.equal(fake.prepared[0]![1], version);
+  assert.equal(fake.provider().profile.dataDir, undefined);
   const created = fake.calls.find((call) => call.method === "POST" && call.path === "/services")!;
   assert.deepEqual(created.body, {
     type: "private_service",
@@ -254,7 +261,6 @@ test("Render publish creates a private image service and waits for its deploy", 
       { key: "APP_SECRET", value: "app-only-secret" },
       { key: "PORT", value: "8080" },
       { key: "QM_DEPLOYMENT_ID", value: ID },
-      { key: "DATA_DIR", value: "/data" },
     ],
     secretFiles: [{ name: "qm-render-artifact.json", content: JSON.stringify(fake.artifact) }],
     serviceDetails: {
@@ -262,7 +268,7 @@ test("Render publish creates a private image service and waits for its deploy", 
       plan: "0.5c-512mb",
       region: "oregon",
       numInstances: 1,
-      disk: { name: "data", mountPath: "/data", sizeGB: 1 },
+      maxShutdownDelaySeconds: 300,
     },
   });
   assert.equal(JSON.stringify(created.body).includes(TOKEN), false);
@@ -287,7 +293,7 @@ test("Render republish updates the same service before it starts a new deploy", 
   assert.equal(fake.revoked.length, 0);
 });
 
-test("Render publish builds the app runner from Git and retains the app artifact and disk", async () => {
+test("Render publish builds the app runner from Git with its app artifact", async () => {
   const fake = fakeRender({ environmentId: "evm-production" });
   await fake
     .provider({ baseImage: undefined, source: SOURCE, environmentId: "evm-production" })
@@ -305,7 +311,6 @@ test("Render publish builds the app runner from Git and retains the app artifact
       { key: "APP_SECRET", value: "app-only-secret" },
       { key: "PORT", value: "8080" },
       { key: "QM_DEPLOYMENT_ID", value: ID },
-      { key: "DATA_DIR", value: "/data" },
     ],
     secretFiles: [{ name: "qm-render-artifact.json", content: JSON.stringify(fake.artifact) }],
     serviceDetails: {
@@ -314,14 +319,14 @@ test("Render publish builds the app runner from Git and retains the app artifact
       plan: "0.5c-512mb",
       region: "oregon",
       numInstances: 1,
-      disk: { name: "data", mountPath: "/data", sizeGB: 1 },
+      maxShutdownDelaySeconds: 300,
     },
   });
   assert.equal((await fake.store.get(ID))?.status, "live");
   assert.equal((await fake.store.get(ID))?.serviceId, SERVICE);
 });
 
-test("Render switches a retained image service to a Git runner without replacing its disk", async () => {
+test("Render switches an image service to a Git runner without replacing the service", async () => {
   const fake = fakeRender({ existing: true });
   await fake.provider({ baseImage: undefined, source: SOURCE }).apply(deployment, { ...version, version: 2 });
   assert.deepEqual(fake.calls.find((call) => call.method === "PATCH")?.body, {
@@ -331,6 +336,7 @@ test("Render switches a retained image service to a Git runner without replacing
     serviceDetails: {
       runtime: "docker",
       envSpecificDetails: { dockerContext: ".", dockerfilePath: "deploy/render-runner/Dockerfile", dockerCommand: "" },
+      maxShutdownDelaySeconds: 300,
     },
   });
   assert.equal(
@@ -375,7 +381,7 @@ test("Render switches a retained Git runner to an image without replacing the se
   assert.deepEqual(fake.calls.find((call) => call.method === "PATCH")?.body, {
     autoDeploy: "no",
     image: { ownerId: WORKSPACE, imagePath: IMAGE },
-    serviceDetails: { runtime: "image" },
+    serviceDetails: { runtime: "image", maxShutdownDelaySeconds: 300 },
   });
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
   assert.equal(
@@ -422,6 +428,7 @@ for (const terminalStatus of ["live", "update_failed", "canceled"]) {
     assert.deepEqual(await provider.apply(deployment, { ...version, version: 2 }), {
       host: "qm-app-internal",
       port: 8080,
+      proxyHeaders: { connection: "close" },
     });
     assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
     assert.deepEqual((await fake.store.get(ID))?.previousDeployIds, ["dep-queued", "dep-old"]);
@@ -548,7 +555,7 @@ test("Render leaves a prior queued deploy unchanged when it exceeds the wait dea
 test("Render follows a queued deploy without triggering another deploy or accepting the old live version", async () => {
   const fake = fakeRender({ existing: true, queued: true, queuedListReads: 2 });
   const endpoint = await fake.provider().apply(deployment, version);
-  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080 });
+  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
   assert.equal(fake.calls.filter((call) => call.method === "GET" && call.path.endsWith("/deploys")).length, 5);
   assert.equal(
@@ -588,7 +595,7 @@ test("Render finds the initial deploy when service creation omits its deploy ID"
 test("Render reconciles an accepted trigger when its response is lost", async () => {
   const fake = fakeRender({ existing: true, loseTriggerResponse: true });
   const endpoint = await fake.provider().apply(deployment, version);
-  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080 });
+  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
   assert.equal((await fake.store.get(ID))?.status, "live");
 });
@@ -612,17 +619,26 @@ test("Render retains an undiscovered queued deploy across provider restarts and 
   await provider.resolveEndpoint!(running, version);
   await assert.rejects(provider.apply(running, version), /still pending/);
   assert.equal((await fake.store.get(ID))?.status, "pending");
-  assert.equal(await provider.resolveEndpoint!(running, version), null);
+  assert.deepEqual(await provider.resolveEndpoint!(running, version), {
+    host: "qm-app-internal",
+    port: 8080,
+    proxyHeaders: { connection: "close" },
+  });
   const restarted = fake.provider({ deployTimeoutMs: 5 });
   await assert.rejects(restarted.apply(running, { ...version, version: 2 }), /still pending/);
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
   assert.equal(fake.prepared.length, 1);
   fake.releaseQueued();
-  assert.deepEqual(await restarted.apply(running, version), { host: "qm-app-internal", port: 8080 });
+  assert.deepEqual(await restarted.apply(running, version), {
+    host: "qm-app-internal",
+    port: 8080,
+    proxyHeaders: { connection: "close" },
+  });
   assert.equal(await restarted.resolveEndpoint!(running, version), null);
   assert.deepEqual(await restarted.resolveEndpoint!({ ...running, appliedVersion: 1 }, version), {
     host: "qm-app-internal",
     port: 8080,
+    proxyHeaders: { connection: "close" },
   });
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
 });
@@ -643,9 +659,17 @@ for (const cancelStatus of [200, 503]) {
     await assert.rejects(fake.provider({ deployTimeoutMs: 5 }).apply(running, version), /still pending/);
     assert.equal((await fake.store.get(ID))?.status, "pending");
     const restarted = fake.provider();
-    assert.equal(await restarted.resolveEndpoint!(running, version), null);
+    assert.deepEqual(await restarted.resolveEndpoint!(running, version), {
+      host: "qm-app-internal",
+      port: 8080,
+      proxyHeaders: { connection: "close" },
+    });
     status = "live";
-    assert.deepEqual(await restarted.apply(running, version), { host: "qm-app-internal", port: 8080 });
+    assert.deepEqual(await restarted.apply(running, version), {
+      host: "qm-app-internal",
+      port: 8080,
+      proxyHeaders: { connection: "close" },
+    });
     assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
     assert.equal(await restarted.resolveEndpoint!(running, version), null);
     assert.equal(fake.revoked.length, 0);
@@ -873,11 +897,15 @@ test("Render cancels a replacement after a permanent poll error and keeps the pr
     fake.calls.some((call) => call.method === "DELETE"),
     false,
   );
-  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), { host: "qm-app-internal", port: 8080 });
+  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), {
+    host: "qm-app-internal",
+    port: 8080,
+    proxyHeaders: { connection: "close" },
+  });
   assert.deepEqual(fake.revoked, []);
 });
 
-test("Render retains a new service and its disk when polling cannot recover before the deadline", async () => {
+test("Render retains a new service when polling cannot recover before the deadline", async () => {
   const fake = fakeRender({
     async intercept(call) {
       return call.path.endsWith("/deploys/dep-first") ? new Response(null, { status: 503 }) : undefined;
@@ -930,7 +958,11 @@ test("Render failed replacement preserves the service and previous live deploy",
   const fake = fakeRender({ existing: true, deployStatus: "update_failed" });
   const provider = fake.provider();
   await assert.rejects(provider.apply(deployment, version), /update_failed/);
-  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), { host: "qm-app-internal", port: 8080 });
+  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), {
+    host: "qm-app-internal",
+    port: 8080,
+    proxyHeaders: { connection: "close" },
+  });
   assert.equal(
     fake.calls.some((call) => call.method === "DELETE"),
     false,
@@ -983,7 +1015,8 @@ test("Render coalesces endpoint refreshes and caches their result across app req
   const endpoints = await Promise.all(
     Array.from({ length: 100 }, () => provider.resolveEndpoint!(deployment, version)),
   );
-  for (const endpoint of endpoints) assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080 });
+  for (const endpoint of endpoints)
+    assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
   for (let i = 0; i < 100; i++) await provider.resolveEndpoint!(deployment, version);
   assert.equal(fake.calls.length, 3);
 });
@@ -1094,16 +1127,16 @@ test("Render waits for the app port even when the platform reports a live deploy
   assert.ok(fake.calls.every((call) => call.method !== "DELETE"));
 });
 
-test("Render restores the same disk and scopes apps to the configured environment", async () => {
+test("Render restores the same service and scopes apps to the configured environment", async () => {
   const fake = fakeRender({ environmentId: "evm-production" });
-  const provider = fake.provider({ environmentId: "evm-production", diskSizeGB: 3 });
+  const provider = fake.provider({ environmentId: "evm-production" });
   await provider.apply(deployment, version);
   const created = fake.calls.find((call) => call.method === "POST" && call.path === "/services")!.body as {
     environmentId: string;
-    serviceDetails: { disk: { sizeGB: number } };
+    serviceDetails: { disk?: unknown };
   };
   assert.equal(created.environmentId, "evm-production");
-  assert.equal(created.serviceDetails.disk.sizeGB, 3);
+  assert.equal(created.serviceDetails.disk, undefined);
   await provider.destroy(deployment);
   assert.equal((await fake.store.get(ID))?.status, "suspended");
   assert.equal(await provider.resolveEndpoint!({ ...deployment, status: "archived" }, version), null);
@@ -1115,15 +1148,15 @@ test("Render restores the same disk and scopes apps to the configured environmen
   assert.ok(fake.calls.every((call) => call.method !== "DELETE"));
 });
 
-test("Render refuses a retained app that lost its disk or moved environments", async () => {
-  const missing = fakeRender({ existing: true, missingDisk: true });
-  await assert.rejects(missing.provider().apply(deployment, version), /persistent \/data disk/);
+test("Render refuses an app with an attached disk or another environment", async () => {
+  const attached = fakeRender({ existing: true, attachedDisk: true });
+  await assert.rejects(attached.provider().apply(deployment, version), /without a persistent disk/);
   const moved = fakeRender({ existing: true, environmentId: "evm-other" });
   await assert.rejects(
     moved.provider({ environmentId: "evm-production" }).apply(deployment, version),
     /expected private app service/,
   );
-  assert.equal(missing.prepared.length + moved.prepared.length, 0);
+  assert.equal(attached.prepared.length + moved.prepared.length, 0);
 });
 
 test("Render rollback uses the selected old version on the retained service", async () => {
@@ -1189,4 +1222,245 @@ test("Render archive clears a rejected create without changing it into an uncert
   assert.ok(fake.calls.every((call) => call.method === "GET"));
   await fake.provider().apply(deployment, version);
   assert.equal((await fake.store.get(ID))?.status, "live");
+});
+
+for (const status of [200, 302, 401, 403, 404, 500, 502, 503]) {
+  test(`Render checks the app response before it confirms a deploy: HTTP ${status}`, async () => {
+    const fake = fakeRender({ appStatus: status });
+    const applied = fake.provider({ deployTimeoutMs: 5 }).apply(deployment, version);
+    if (status < 500) {
+      assert.deepEqual(await applied, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
+      assert.equal((await fake.store.get(ID))?.liveVersion, 1);
+    } else {
+      await assert.rejects(applied, /HTTP on port 8080/);
+      assert.equal((await fake.store.get(ID))?.liveVersion, undefined);
+    }
+  });
+}
+
+for (const status of ["live", "update_failed"]) {
+  test(`Render keeps app requests available while an update becomes ${status}`, { timeout: 5_000 }, async (t) => {
+    const polling = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<Response | undefined>();
+    const fake = fakeRender({
+      existing: true,
+      deployStatus: "update_in_progress",
+      async intercept(call) {
+        if (call.path.endsWith("/deploys/dep-next")) {
+          polling.resolve();
+          return release.promise;
+        }
+        return undefined;
+      },
+    });
+    const dir = mkdtempSync(join(tmpdir(), "render-deploy-availability-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const deployments = createMemoryMap<Deployment>();
+    const endpoint = { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } };
+    await deployments.put(ID, {
+      ...deployment,
+      status: "running",
+      appliedVersion: 1,
+      endpoint,
+      versions: [version],
+    });
+    await fake.store.put(ID, {
+      deploymentId: ID,
+      version: 1,
+      status: "live",
+      createdService: false,
+      previousDeployIds: [],
+      serviceId: SERVICE,
+      deployId: "dep-old",
+      liveVersion: 1,
+    });
+    const store = createDeployStore({ deployments, git: { repoRoot: join(dir, "git") } });
+    const service = createDeployService({
+      deployStore: store,
+      provider: fake.provider({ deployTimeoutMs: 3_000 }),
+      acl: createAclStore(),
+      deployDir: join(dir, "apps"),
+      auditLog: { record() {}, events: async () => [], tail: async () => [] },
+    });
+    const update = service.redeploy(ID, { entrypoint: "node updated.js", files: [] });
+    const result = update.then(
+      (value) => ({ value, error: null }),
+      (error: unknown) => ({ value: null, error }),
+    );
+    await Promise.race([
+      polling.promise,
+      result.then(({ error }) => {
+        throw error ?? new Error("Update completed before its deploy was observed");
+      }),
+    ]);
+    assert.equal((await fake.store.get(ID))?.status, "pending");
+    assert.equal((await store.get(ID))?.appliedVersion, 1);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const reached = await Promise.race([
+        Promise.all(Array.from({ length: 20 }, () => service.reachDeployment(ID, "U1"))),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("App requests waited for the pending update")), 500);
+        }),
+      ]);
+      for (const reach of reached) assert.deepEqual(reach, { status: "ok", id: ID, endpoint });
+      assert.equal((await fake.store.get(ID))?.status, "pending");
+      assert.equal(fake.prepared.length, 1);
+    } finally {
+      clearTimeout(timer);
+      release.resolve(new Response(JSON.stringify({ id: "dep-next", status })));
+    }
+    const completed = await result;
+    if (status === "live") {
+      assert.equal(completed.error, null);
+      assert.equal(completed.value?.appliedVersion, 2);
+    } else {
+      assert.match(String(completed.error), /update_failed/);
+      assert.equal((await store.get(ID))?.appliedVersion, 1);
+    }
+    assert.deepEqual(await service.reachDeployment(ID, "U1"), { status: "ok", id: ID, endpoint });
+    assert.equal((await fake.store.get(ID))?.liveVersion, status === "live" ? 2 : 1);
+    assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
+    assert.ok(fake.calls.every((call) => call.method !== "DELETE" && !call.path.endsWith("/suspend")));
+  });
+}
+
+for (const state of [
+  "first",
+  "stale",
+  "suspending",
+  "suspended",
+  "archived",
+  "missing",
+  "remote-suspended",
+  "unowned",
+] as const) {
+  test(`Render preserves the endpoint guard during a pending update: ${state}`, async () => {
+    const fake = fakeRender({
+      existing: state !== "missing",
+      suspended: state === "remote-suspended",
+      marker: state === "unowned" ? "another-deployment" : ID,
+    });
+    await fake.store.put(ID, {
+      deploymentId: ID,
+      version: 2,
+      status: state === "suspending" || state === "suspended" ? state : "pending",
+      createdService: state === "first",
+      previousDeployIds: ["dep-old"],
+      serviceId: SERVICE,
+      ...(state === "first" ? {} : { liveVersion: state === "stale" ? 0 : 1 }),
+    });
+    const running = {
+      ...deployment,
+      status: state === "archived" ? ("archived" as const) : ("running" as const),
+      appliedVersion: 1,
+    };
+    const resolved = fake.provider().resolveEndpoint!(running, version);
+    if (state === "unowned") await assert.rejects(resolved, /another deployment/);
+    else assert.equal(await resolved, null);
+    assert.ok(fake.calls.every((call) => call.method === "GET"));
+  });
+}
+
+test("Render discards a stale endpoint refresh when an update confirms another version", async () => {
+  const reading = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<Response | undefined>();
+  let held = false;
+  const fake = fakeRender({
+    existing: true,
+    async intercept(call) {
+      if (call.query.get("status") === "live" && !held) {
+        held = true;
+        reading.resolve();
+        return release.promise;
+      }
+      return undefined;
+    },
+  });
+  const running = { ...deployment, status: "running" as const, appliedVersion: 1 };
+  const provider = fake.provider();
+  const stale = provider.resolveEndpoint!(running, version);
+  await reading.promise;
+  await provider.apply(running, { ...version, version: 2 });
+  release.resolve(new Response(JSON.stringify([{ deploy: { id: "dep-old", status: "live" } }])));
+  assert.equal(await stale, null);
+  assert.deepEqual(await provider.resolveEndpoint!({ ...running, appliedVersion: 2 }, version), {
+    host: "qm-app-internal",
+    port: 8080,
+    proxyHeaders: { connection: "close" },
+  });
+});
+
+test("Render runtime storage credentials replace user values before service creation", async () => {
+  const fake = fakeRender();
+  const runtimeEnv = { QM_APP_STORAGE_URL: "https://core.example/storage", QM_APP_STORAGE_TOKEN: "scoped-token" };
+  const provider = fake.provider({
+    artifacts: {
+      async prepare() {
+        return { ...fake.artifact, runtimeEnv };
+      },
+      async revoke() {},
+    },
+  });
+  await provider.apply(deployment, {
+    ...version,
+    env: { QM_APP_STORAGE_URL: "https://untrusted.example", QM_APP_STORAGE_TOKEN: "untrusted-token" },
+  });
+  const created = fake.calls.find((call) => call.method === "POST" && call.path === "/services")!.body as {
+    envVars: Array<{ key: string; value: string }>;
+  };
+  const env = Object.fromEntries(created.envVars.map(({ key, value }) => [key, value]));
+  assert.equal(env.QM_APP_STORAGE_URL, runtimeEnv.QM_APP_STORAGE_URL);
+  assert.equal(env.QM_APP_STORAGE_TOKEN, runtimeEnv.QM_APP_STORAGE_TOKEN);
+  assert.equal(JSON.stringify(await fake.store.get(ID)).includes(runtimeEnv.QM_APP_STORAGE_TOKEN), false);
+  assert.deepEqual(provider.profile.storage, { database: "postgres", files: "signed-urls" });
+});
+
+test("Render readiness probes use a new connection after each deploy", async () => {
+  const sockets = new Set<number>();
+  const upstream = createServer((req, res) => {
+    sockets.add(req.socket.remotePort!);
+    res.end();
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const port = (upstream.address() as AddressInfo).port;
+  const fake = fakeRender({
+    appFetch: ((_input, init) =>
+      undiciFetch(`http://127.0.0.1:${port}/`, init as Parameters<typeof undiciFetch>[1])) as typeof fetch,
+  });
+  const provider = fake.provider();
+  try {
+    for (const number of [1, 2, 3]) {
+      await provider.apply(deployment, { ...version, version: number });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    assert.equal(sockets.size, 3);
+  } finally {
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test("Render default HTTP client uses the installed Undici dispatcher", async (t) => {
+  t.mock.method(globalThis, "fetch", () => {
+    throw new Error("The native fetch must not run");
+  });
+  const previous = getGlobalDispatcher();
+  const dispatcher = new MockAgent();
+  dispatcher.disableNetConnect();
+  dispatcher
+    .get("https://api.render.com")
+    .intercept({
+      method: "GET",
+      path: `/v1/services?name=qm-app-${ID}&ownerId=${WORKSPACE}&limit=100`,
+    })
+    .reply(200, []);
+  setGlobalDispatcher(dispatcher);
+  try {
+    const fake = fakeRender();
+    assert.equal(await fake.provider({ fetchImpl: undefined }).resolveEndpoint!(deployment, version), null);
+    dispatcher.assertNoPendingInterceptors();
+  } finally {
+    setGlobalDispatcher(previous);
+    await dispatcher.close();
+  }
 });

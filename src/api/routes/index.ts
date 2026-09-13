@@ -1,3 +1,4 @@
+import { renderAppStorageRoutes } from "./render-app-storage.ts";
 import { sendJson } from "../http.ts";
 import { type ApiCtx, type BaseCtx, type Route } from "./route.ts";
 import { connectorRawRoutes, connectorRoutes } from "./connectors.ts";
@@ -52,6 +53,7 @@ export const rawRoutes: ReadonlyArray<Route<BaseCtx>> = [
 ];
 
 export const apiRoutes: ReadonlyArray<Route<ApiCtx>> = [
+  ...renderAppStorageRoutes,
   ...searchRoutes,
   ...deploymentLayerRoutes,
   ...turnRoutes,

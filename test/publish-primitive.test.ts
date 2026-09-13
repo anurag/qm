@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createToolContext } from "../src/tools/primitives.ts";
 import { createDeployStore, type DeployStore, type Deployment } from "../src/deploy/deploy-store.ts";
 import { createDeployService, type DeployService, type DeployOrUpdateInput } from "../src/deploy/deploy-service.ts";
+import type { DeployProfile } from "../src/deploy/deploy-provider.ts";
 import { createAclStore, type AclStore } from "../src/acl/acl-store.ts";
 import { createMemoryConfigStore } from "../src/resolution/config-store.ts";
 import type { ToolLedger } from "../src/runs/tool-ledger.ts";
@@ -13,14 +14,14 @@ import { CapabilityUnsupportedError } from "../src/sandbox/sandbox.ts";
 import type { AgentComputerExportEntry, Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
 import { scopeId } from "../src/types.ts";
 
-function svc() {
+function svc(profile: DeployProfile = { managedScaleToZero: false }) {
   const deployStore: DeployStore = createDeployStore();
   const acl: AclStore = createAclStore();
   let starts = 0;
   const deploy: DeployService = createDeployService({
     deployStore,
     provider: {
-      profile: { managedScaleToZero: false },
+      profile,
       apply: async () => {
         starts++;
         return { host: "127.0.0.1", port: 20000 };
@@ -237,20 +238,50 @@ test("publish: a different scope claiming a taken name is rejected", async () =>
   await assert.rejects(() => other.publish({ entrypoint: "x", name: "taken" }), /name taken/);
 });
 
-test("publish: renameFrom moves the link but keeps the id (and shares ride the id)", async () => {
-  const s = svc();
+test("publish rename keeps the running version, source, shares, and storage without a sandbox", async () => {
+  const s = svc({ managedScaleToZero: false, dataDir: "/data" });
   const created = await ctx(s.deploy, { files: appFile() }).publish({
     entrypoint: "x",
     name: "old-name",
     share: [{ scope: scopeId("personal", "U2"), permission: "read" }],
   });
-  const renamed = await ctx(s.deploy).publish({ renameFrom: "old-name", name: "new-name" });
+  const before = (await s.deployStore.get(created.id))!;
+  const source = await s.deployStore.filesOf(created.id, before.currentVersion);
+  const renamed = await ctx(s.deploy, {
+    provision: async () => {
+      throw new Error("rename must not start a sandbox");
+    },
+  }).publish({ renameFrom: "old-name", name: "new-name" });
 
   assert.equal(renamed.id, created.id);
   assert.equal(renamed.url, "/d/new-name/");
+  assert.equal(renamed.version, created.version);
+  assert.equal(renamed.dataDir, "/data");
+  assert.equal(s.starts, 1);
   assert.equal(await s.deployStore.getByName("old-name"), null);
-  assert.equal((await s.deployStore.getByName("new-name"))!.id, created.id);
+  const after = (await s.deployStore.getByName("new-name"))!;
+  assert.equal(after.id, created.id);
+  assert.deepEqual(after.versions, before.versions);
+  assert.deepEqual(await s.deployStore.filesOf(created.id, after.currentVersion), source);
   assert.equal((await s.acl.grantsFor(scopeId("personal", "U1"), `deployment:${created.id}`)).length, 1);
+});
+
+test("publish rename with a directory deploys the supplied source with the existing entrypoint", async () => {
+  const s = svc();
+  const created = await ctx(s.deploy, { files: appFile() }).publish({
+    entrypoint: "node server.js",
+    name: "old-name",
+  });
+  const renamed = await ctx(s.deploy, { files: appFile("dist/server.js", "updated") }).publish({
+    renameFrom: "old-name",
+    name: "new-name",
+    dir: "dist",
+  });
+  assert.equal(renamed.id, created.id);
+  assert.equal(renamed.version, 2);
+  assert.equal(s.starts, 2);
+  assert.equal((await s.deployStore.versionOf(created.id, 2))!.entrypoint, "node server.js");
+  assert.deepEqual(await s.deployStore.filesOf(created.id, 2), [{ path: "server.js", data: Buffer.from("updated") }]);
 });
 
 test("publish rejects an entrypoint deploy when no files were collected", async () => {
@@ -427,8 +458,9 @@ test("publish rejects parent traversal before listing outside the workspace", as
   assert.equal((await s.deployStore.list()).length, 0);
 });
 
-test("publish: rollbackTo flips the named deployment's pointer", async () => {
-  const s = svc();
+test("publish rollback returns the selected version and storage without a sandbox", async () => {
+  const storage = { database: "postgres", files: "signed-urls" } as const;
+  const s = svc({ managedScaleToZero: false, storage });
   await ctx(s.deploy, { files: [{ path: "a/s.js", data: bytes("v1") }] }).publish({
     dir: "a",
     entrypoint: "x",
@@ -441,8 +473,15 @@ test("publish: rollbackTo flips the named deployment's pointer", async () => {
   });
   assert.equal((await s.deployStore.getByName("roll"))!.currentVersion, 2);
 
-  await ctx(s.deploy).publish({ name: "roll", rollbackTo: 1 });
+  const rolled = await ctx(s.deploy, {
+    provision: async () => {
+      throw new Error("rollback must not start a sandbox");
+    },
+  }).publish({ name: "roll", rollbackTo: 1 });
   assert.equal((await s.deployStore.getByName("roll"))!.currentVersion, 1);
+  assert.equal(rolled.version, 1);
+  assert.deepEqual(rolled.storage, storage);
+  assert.equal(s.starts, 3);
 });
 
 test("publish is ledgered (G6): a crash-replay returns the cached result, not a second deploy", async () => {

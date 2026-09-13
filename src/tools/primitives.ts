@@ -110,6 +110,7 @@ interface PublishResult {
   url: string;
   audience?: PublishAudienceDescriptor;
   dataDir?: string;
+  storage?: { database: "postgres"; files: "signed-urls" };
   alwaysOn?: boolean;
 }
 
@@ -968,9 +969,8 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       if (effectiveEntrypoint && input.dir && hasParentPathSegment(input.dir)) {
         throw new Error("publish directory must stay inside the workspace — no .. path segments");
       }
-      const handle = await deps.provision();
       const files: DeployFile[] = effectiveEntrypoint
-        ? filesUnder(await collectTree(deps.sandbox, handle, input.dir), input.dir)
+        ? filesUnder(await collectTree(deps.sandbox, await deps.provision(), input.dir), input.dir)
         : [];
       if (effectiveEntrypoint && files.length === 0) {
         throw new Error(`publish: no files found under ${input.dir ?? "."} - nothing to deploy`);
@@ -1014,7 +1014,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           ownerScopeId: owner,
           createdBy: deps.createdBy,
           createdInScope,
-          files,
+          ...(effectiveEntrypoint ? { files } : {}),
           ...(input.entrypoint ? { entrypoint: input.entrypoint } : {}),
           ...(input.name !== undefined ? { name: input.name } : {}),
           ...(input.renameFrom !== undefined ? { renameFrom: input.renameFrom } : {}),
@@ -1045,7 +1045,9 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
             : base;
         const urlBase = deps.publicWebUrl?.replace(/\/$/, "") ?? "";
         const url = publicUrlOf(d.endpoint) ?? `${urlBase}/d/${ref}/`;
-        const dataDir = effectiveEntrypoint ? deps.deploy.providerProfile?.dataDir : undefined;
+        const profile = deploymentEntrypoint(d) ? deps.deploy.providerProfile : undefined;
+        const dataDir = profile?.dataDir;
+        const storage = profile?.storage;
         return {
           id: d.id,
           ...(d.name ? { name: d.name } : {}),
@@ -1053,6 +1055,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
           url,
           audience,
           ...(dataDir ? { dataDir } : {}),
+          ...(storage ? { storage } : {}),
           ...(d.alwaysOn ? { alwaysOn: true } : {}),
         };
       });

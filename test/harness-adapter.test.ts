@@ -1,10 +1,30 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createMockHarness } from "../src/harness/mock-harness.ts";
-import { createOpenCodeHarness } from "../src/harness/opencode-harness.ts";
-import { createCodexHarness } from "../src/harness/codex-harness.ts";
-import { createClaudeHarness } from "../src/harness/claude-harness.ts";
-import { createPiHarness } from "../src/harness/pi-harness.ts";
+import { createOpenCodeHarness, openCodeHarnessConfigOptions } from "../src/harness/opencode-harness.ts";
+import { createCodexHarness, codexHarnessConfigOptions } from "../src/harness/codex-harness.ts";
+import { createClaudeHarness, claudeHarnessConfigOptions } from "../src/harness/claude-harness.ts";
+import { createPiHarness, piHarnessConfigOptions } from "../src/harness/pi-harness.ts";
+import { loadConfig } from "../src/config.ts";
+import { bridgedTools, harnessToolOptions } from "../src/harness/harness-shared.ts";
+
+test("each harness carries the deployment provider to its publish tool", () => {
+  const config = { ...loadConfig({}), deployProvider: "render" as const };
+  for (const optionsOf of [
+    openCodeHarnessConfigOptions,
+    codexHarnessConfigOptions,
+    claudeHarnessConfigOptions,
+    piHarnessConfigOptions,
+  ]) {
+    const options = optionsOf(config);
+    assert.equal(options.deployProvider, "render");
+    const publish = bridgedTools({ current: null }, harnessToolOptions(options)).find(
+      (tool) => tool.name === "publish",
+    )!;
+    assert.match(publish.description, /runtime DATABASE_URL/);
+    assert.doesNotMatch(publish.description, /SQLite at exactly \$DATA_DIR\/app.db/);
+  }
+});
 
 test("harness adapters declare their native control and tool transports", async (t) => {
   const mock = createMockHarness();

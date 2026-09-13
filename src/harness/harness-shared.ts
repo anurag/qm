@@ -14,6 +14,7 @@ import { tapeCheckpointPayload, tapeEntryMirrorRecord } from "../sessions/sessio
 import { swallow } from "../util/errors.ts";
 
 export interface HarnessToolPlumbing {
+  deployProvider?: AgentToolsOptions["deployProvider"];
   scratchExec?: boolean;
   ownerAuthExec?: boolean;
   reachExec?: boolean;
@@ -86,6 +87,7 @@ export function harnessToolContext(turn: HarnessTurnInput): ToolContextRef {
 
 export function harnessToolOptions(opts: HarnessToolPlumbing, turn?: HarnessTurnInput): AgentToolsOptions {
   return {
+    deployProvider: opts.deployProvider,
     scratchExec: opts.scratchExec,
     ownerAuthExec: opts.ownerAuthExec,
     reachExec: opts.reachExec,

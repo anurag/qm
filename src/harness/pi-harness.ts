@@ -106,6 +106,7 @@ import {
 } from "./goal.ts";
 
 export interface PiHarnessOptions {
+  deployProvider?: Config["deployProvider"];
   modelId?: string | ((scope?: ScopeId) => string | undefined);
   defaultModelId?: string;
   resolveBaseModelId?: () => string | undefined;
@@ -1543,6 +1544,7 @@ export function createPiHarness(opts?: PiHarnessOptions): Harness {
         modelRuntime,
         resourceLoader,
         customTools: createAgentTools(ref, {
+          deployProvider: opts?.deployProvider,
           scratchExec,
           ownerAuthExec,
           reachExec,

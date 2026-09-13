@@ -1,5 +1,7 @@
 import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/render-deploy-provider.ts";
 import { createRenderDeployArtifacts, type StoredRenderDeployCredential } from "./deploy/render-deploy-artifacts.ts";
+import { createRenderAppDatabase, type StoredRenderAppDatabase } from "./deploy/render-app-database.ts";
+import { createRenderAppStorage, type RenderAppStorage } from "./deploy/render-app-storage.ts";
 import { createRuntimeService } from "./harness/runtime-control.ts";
 import { createPostgresBrokerSessions, type BrokerSessionStore } from "./auth/broker-sessions.ts";
 import { createDirectFileUploads, type DirectFileUploads } from "./files/direct-file-upload.ts";
@@ -400,6 +402,7 @@ export function stopWithBackstop(
 }
 
 export interface BuiltApp {
+  renderAppStorage?: RenderAppStorage;
   app: App;
   screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
@@ -1363,9 +1366,32 @@ export function buildApp(
     signingSecret: config.signingSecret ?? "",
     store: artifactMap<StoredRenderDeployCredential>("render_deploy_credentials"),
     deployStore,
+    appStorage: config.deployProvider === "render",
   });
+  const renderAppDatabase =
+    config.deployProvider === "render"
+      ? createRenderAppDatabase({
+          adminUrl: requireDbUrl("DEPLOY_PROVIDER=render"),
+          store: artifactMap<StoredRenderAppDatabase>("render_app_databases"),
+          keyMaterial: config.connectorSecretKey ?? "",
+        })
+      : undefined;
+  const renderAppStorage =
+    config.deployProvider === "render" && config.s3Bucket
+      ? createRenderAppStorage({
+          bucket: config.s3Bucket,
+          ...s3Options,
+          prefix: config.s3Prefix ?? "",
+          signingSecret: config.signingSecret ?? "",
+          deployStore,
+          authorizes: renderDeployArtifacts.authorizes,
+        })
+      : undefined;
   const buildRenderDeploy = (): DeployProvider => {
     if (!pgArtifactMap) throw new Error("DEPLOY_PROVIDER=render requires DATABASE_URL for app state and credentials");
+    if (!renderAppStorage) throw new Error("DEPLOY_PROVIDER=render requires S3_BUCKET for app files");
+    if (!config.signingSecret || !config.apiBaseUrl)
+      throw new Error("DEPLOY_PROVIDER=render requires CORE_SIGNING_SECRET and PUBLIC_API_URL");
     return createRenderDeployProvider({
       ...config.renderDeploy,
       store: artifactMap<StoredRenderDeploy>("render_deploy_bodies"),
@@ -1449,6 +1475,7 @@ export function buildApp(
           deploymentEnv: async (deployment: Deployment): Promise<Record<string, string>> => {
             const env: Record<string, string> = {
               VIEWER_IDENTITY_KEY: viewerIdentityKey(deployGitSecret, deployment.id),
+              ...(renderAppDatabase ? await renderAppDatabase.ensure(deployment.id) : {}),
             };
             const orgScope = scopeId("org", config.orgId);
             const credentials = await deploymentCredentialSlugs(
@@ -2155,6 +2182,7 @@ export function buildApp(
 
   return {
     app,
+    ...(renderAppStorage ? { renderAppStorage } : {}),
     ...(screenSecurity ? { screenSecurity } : {}),
     deploymentLayer,
     deploymentLayerStore,
@@ -2257,6 +2285,7 @@ export function serverDeps(
   const carriedModelAuth = harnessCarriedModelAuth(config);
   return {
     production: config.production,
+    ...(built.renderAppStorage ? { renderAppStorage: built.renderAppStorage } : {}),
     allowUnauthenticatedCore: config.allowUnauthenticatedCore,
     ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),

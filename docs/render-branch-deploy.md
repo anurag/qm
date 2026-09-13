@@ -108,6 +108,13 @@ It writes the assigned URLs into `qm.config.jsonc` and stores resource IDs in
 `render.resources.json`. Keep this file: later commands use it to update the same
 resources. Do not run two CLI operations concurrently in this deployment directory.
 
+Published apps use private Render services with no persistent disk. QM creates
+an app database on the managed Postgres instance and supplies a restricted
+`DATABASE_URL`. It also supplies app-scoped file access to bundled MinIO, or the
+configured external object store. No extra database or S3 credentials are needed
+from the operator. The agent's publish tool and Render publishing reference
+describe the runtime variables, migration rules, and shutdown requirements.
+
 `check --live` creates a bounded one-off job to check the live core session and
 database path, in addition to the health and signed configuration checks. Open the
 private, single-use link from `admin-login` within five minutes. Then submit a task
@@ -129,11 +136,13 @@ npm exec qm -- down
 ```
 
 `down` retains the database and MinIO data, and storage charges continue. Use
-`down --purge` only to delete the hosted stack and its stored data. Runtime apps and
-sandboxes have their own lifecycle and must be removed through QM. The project and
-environment remain after purge.
+`down --purge` only to delete the hosted stack and its stored data. Stop or archive
+published apps before `down`. Before purge, back up their data, archive them in
+QM, and delete their owned Render services. The CLI checks for retained app
+services before it stops or deletes shared infrastructure. Sandboxes have their
+own lifecycle. The project and environment remain after purge.
 
-The first live deployment is still unverified. App authors must be trusted to
+Full sandbox acceptance is still pending. App authors must be trusted to
 access peer services on the shared Render private network; the current provider
 does not isolate app authors from each other.
 
