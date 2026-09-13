@@ -4,6 +4,10 @@ import { enabledSandboxBackends, loadConfig } from "../src/config.ts";
 import { validateCoreSecretEnv } from "../src/deployment/secret-schema.ts";
 
 const credentials = { RENDER_API_KEY: "rnd-test", RENDER_WORKSPACE_ID: "tea-test" };
+const database = {
+  RENDER_POSTGRES_ID: "dpg-acme-a",
+  RENDER_APP_DATABASE_ENDPOINT: "postgresql://dpg-acme-a.oregon-postgres.render.com:5432/?sslmode=verify-full",
+};
 
 test("Render sandbox configuration uses the SDK defaults", () => {
   const config = loadConfig({ ...credentials, SANDBOX_BACKEND: "render" });
@@ -24,6 +28,57 @@ test("Render provider selection requires a workspace and one API key", () => {
     assert.throws(() => loadConfig({ ...selection, RENDER_API_KEY: "rnd-test" }), /RENDER_WORKSPACE_ID/);
   }
   assert.deepEqual(validateCoreSecretEnv({ SANDBOX_BACKEND: "render", DEPLOY_PROVIDER: "render" }), ["RENDER_API_KEY"]);
+});
+
+test("Render app deployment requires a project without requiring one for sandboxes", () => {
+  for (const projectId of [undefined, "", " "])
+    assert.throws(
+      () => loadConfig({ ...credentials, DEPLOY_PROVIDER: "render", RENDER_PROJECT_ID: projectId }),
+      /DEPLOY_PROVIDER=render requires RENDER_PROJECT_ID/,
+    );
+  for (const projectId of ["wrong", "prj-", "evm-production", "prj-acme/other"])
+    assert.throws(
+      () => loadConfig({ ...credentials, DEPLOY_PROVIDER: "render", RENDER_PROJECT_ID: projectId }),
+      /RENDER_PROJECT_ID must be a project ID \(prj-\.\.\.\)/,
+    );
+  assert.equal(loadConfig({ ...credentials, SANDBOX_BACKEND: "render" }).renderDeploy.projectId, "");
+});
+
+test("Render app deployment requires a database ID and a verified external endpoint", () => {
+  const selection = { ...credentials, DEPLOY_PROVIDER: "render", RENDER_PROJECT_ID: "prj-acme" };
+  for (const postgresId of [undefined, "", " "])
+    assert.throws(
+      () => loadConfig({ ...selection, RENDER_POSTGRES_ID: postgresId }),
+      /DEPLOY_PROVIDER=render requires RENDER_POSTGRES_ID/,
+    );
+  for (const postgresId of ["wrong", "dpg-", "prj-acme", "dpg-acme-a/other"])
+    assert.throws(
+      () => loadConfig({ ...selection, RENDER_POSTGRES_ID: postgresId }),
+      /RENDER_POSTGRES_ID must be a PostgreSQL ID/,
+    );
+  for (const endpoint of [undefined, "", " "])
+    assert.throws(
+      () => loadConfig({ ...selection, ...database, RENDER_APP_DATABASE_ENDPOINT: endpoint }),
+      /DEPLOY_PROVIDER=render requires RENDER_APP_DATABASE_ENDPOINT/,
+    );
+  for (const endpoint of [
+    "postgresql://admin:secret@db.example.com/?sslmode=verify-full",
+    "postgresql://db.example.com/core?sslmode=verify-full",
+    "postgresql://db.example.com/?sslmode=require",
+    "postgresql://db.example.com/?sslmode=disable",
+    "postgresql://db.example.com/",
+    "postgresql://db.example.com/?sslmode=verify-full&sslmode=disable",
+    "postgresql://db.example.com/?sslmode=verify-full&user=admin",
+  ])
+    assert.throws(
+      () => loadConfig({ ...selection, ...database, RENDER_APP_DATABASE_ENDPOINT: endpoint }),
+      /RENDER_APP_DATABASE_ENDPOINT/,
+    );
+  const config = loadConfig({ ...selection, ...database });
+  assert.equal(config.renderDeploy.postgresId, database.RENDER_POSTGRES_ID);
+  assert.equal(config.renderDeploy.appDatabaseEndpoint, database.RENDER_APP_DATABASE_ENDPOINT);
+  assert.equal(loadConfig({ ...credentials, SANDBOX_BACKEND: "render" }).renderDeploy.postgresId, "");
+  assert.equal(loadConfig({ ...credentials, SANDBOX_BACKEND: "render" }).renderDeploy.appDatabaseEndpoint, "");
 });
 
 test("Render sandbox requires both account fields before automatic registration", () => {
@@ -57,12 +112,15 @@ test("Render sandbox settings accept supported plans and reject invalid lifetime
   assert.doesNotThrow(() => loadConfig({ SANDBOX_TIMEOUT_SEC: "86400" }));
 });
 
-test("Render deployed apps use the core environment", () => {
+test("Render deployed apps use the configured project", () => {
   const config = loadConfig({
     ...credentials,
+    ...database,
     DEPLOY_PROVIDER: "render",
+    RENDER_PROJECT_ID: " prj-acme ",
     RENDER_ENVIRONMENT_ID: "evm-production",
   });
+  assert.equal(config.renderDeploy.projectId, "prj-acme");
   assert.equal(config.renderDeploy.environmentId, "evm-production");
   for (const environmentId of ["wrong", "env-production", "evm-", "evm-production/other"])
     assert.throws(
@@ -74,7 +132,9 @@ test("Render deployed apps use the core environment", () => {
 test("Render app runners accept Git builds without a published image", () => {
   const config = loadConfig({
     ...credentials,
+    ...database,
     DEPLOY_PROVIDER: "render",
+    RENDER_PROJECT_ID: "prj-acme",
     RENDER_DEPLOY_REPO: " https://github.com/example/qm.git/ ",
     RENDER_DEPLOY_BRANCH: " feature/render ",
     RENDER_DEPLOY_IMAGE: " ",

@@ -112,8 +112,27 @@ Published apps use private Render services with no persistent disk. QM creates
 an app database on the managed Postgres instance and supplies a restricted
 `DATABASE_URL`. It also supplies app-scoped file access to bundled MinIO, or the
 configured external object store. No extra database or S3 credentials are needed
-from the operator. The agent's publish tool and Render publishing reference
+from the operator. Core provisions databases through the internal Postgres URL.
+App connections use the external Postgres endpoint with TLS certificate and
+hostname checks. QM adds the reported app-service outbound IP ranges to the database
+access list and retains existing entries; it does not add a public catch-all
+rule. The agent's publish tool and Render publishing reference
 describe the runtime variables, migration rules, and shutdown requirements.
+
+The CLI supplies the project ID to core as `RENDER_PROJECT_ID`. Core creates an
+isolated environment for each app owner scope in that project. Private apps for
+one owner share that environment with a trusted gateway that runs stock Caddy.
+Core, Postgres, and MinIO stay in `production`. App traffic passes through QM's
+access checks and the owner's gateway. Anyone with write access to an app can
+run code on its owner's private network and reach that owner's other apps.
+Treat all app editors in an owner scope as trusted with every app in that scope.
+Read-only shares still use core access checks. Ownership transfers retain the
+previous owner's write grant.
+
+Each active owner adds one public gateway web service and one environment. The
+gateway has no disk. Route changes redeploy it and can interrupt active streams
+for that owner. The core stores owner resource references in Postgres;
+`render.resources.json` records only the shared stack.
 
 `check --live` creates a bounded one-off job to check the live core session and
 database path, in addition to the health and signed configuration checks. Open the
@@ -142,9 +161,10 @@ QM, and delete their owned Render services. The CLI checks for retained app
 services before it stops or deletes shared infrastructure. Sandboxes have their
 own lifecycle. The project and environment remain after purge.
 
-Full sandbox acceptance is still pending. App authors must be trusted to
-access peer services on the shared Render private network; the current provider
-does not isolate app authors from each other.
+When the last active app in an owner scope is suspended, core suspends its
+gateway and retains the isolated environment. These runtime resources remain
+outside CLI teardown. The shutdown guard checks app services in every environment
+in the project. Archive and idle cleanup retain each app's database and objects.
 
 ## Use released images instead
 

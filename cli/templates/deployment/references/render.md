@@ -27,7 +27,7 @@ update a project named `<appPrefix>-qm`, with `orgId` as the default prefix. Its
 
 - Public core with one instance and no persistent disk.
 - Private web UI and public portal with the sign-in broker.
-- Render Postgres with external access disabled.
+- Render Postgres with external access initially disabled.
 - MinIO from a digest-pinned image based on [Render's template](https://render.com/templates/minio), with a 10 GB disk by default.
 - Separate services for plugins with published images.
 
@@ -44,6 +44,33 @@ layer after core is healthy. Run `qm slack render` when the URLs change.
 This target uses assigned `onrender.com` URLs; custom domains need a separate migration.
 Slack runs in core and admin in web UI. Removing `slack` clears its core
 environment credentials; disconnect a stored installation in Admin separately.
+
+The CLI sets core's `RENDER_PROJECT_ID` to the shared project and
+`RENDER_ENVIRONMENT_ID` to `production`. App deployment requires the project ID;
+Render Sandboxes alone do not. Core creates an isolated environment in that
+project for each app owner scope. It contains that owner's private apps and a
+trusted gateway that runs stock Caddy. Core, Postgres, and MinIO stay in the
+shared environment. The app private network cannot reach the shared stack or
+another owner's environment.
+
+The CLI supplies `RENDER_POSTGRES_ID` and a credential-free external
+`RENDER_APP_DATABASE_ENDPOINT` with `sslmode=verify-full`. Core provisions app
+databases through its internal administrator connection. Apps use restricted
+logins over the public endpoint with TLS certificate and hostname checks.
+QM adds the reported app-service outbound IP ranges to the database access list under
+a shared lock and retains existing entries. It does not add a public catch-all
+rule. Keep database credentials on the server and do not disable TLS checks.
+
+Core applies QM access checks before it sends authenticated requests over HTTPS
+to the owner's gateway. The gateway routes them to private apps and does not run
+app code. Anyone with write access to an app can run code on its owner's private
+network and reach that owner's other apps. Treat all app editors in an owner
+scope as trusted with every app in that scope. Read-only shares still use core
+access checks. Ownership transfers retain the previous owner's write grant.
+
+Each active owner adds one public gateway web service and one environment. The
+gateway has no disk. Route changes redeploy it and can interrupt active streams
+for that owner.
 
 ## Storage
 
@@ -91,10 +118,12 @@ stored reply and title, and archives its test session. Model and job usage apply
 `qm down --purge` deletes hosted QM services, Postgres, and bundled MinIO data.
 The project, environment, and external storage remain. Keep
 `render.resources.json` available for recovery; it contains resource IDs and
-pending operations, but no credentials.
+pending operations for the shared stack, but no credentials. Core stores runtime
+app, owner gateway, and owner environment state in Postgres. CLI teardown does
+not remove these resources.
 
-Shutdown stops if a published app still runs in the environment. Archive or stop
-these apps first. Purge stops if any published app service remains, including a
+Shutdown stops if a published app still runs in any environment in the project.
+Archive or stop these apps first. Purge stops if any published app service remains, including a
 suspended service. Back up app data and delete these services before purge.
 
 Published apps use private services with no persistent disk. QM supplies a
@@ -110,9 +139,8 @@ deploys earlier code and retains current data. Storage charges continue. Deletin
 the app service does not delete its database or objects. For permanent removal,
 archive the app, back up its data, then remove its service and retained app data.
 
-The shared private network does not enforce QM access checks between apps: app
-code can reach peer service ports. As with Fly, app authors must be trusted to
-access the deployment network.
+Suspending the last active app in an owner scope also suspends its gateway and
+retains the environment. Restore resumes the required resources.
 
 Agent sandboxes are created on demand. Core runs the existing scheduler;
 Workflows and Render Cron Jobs are not required.

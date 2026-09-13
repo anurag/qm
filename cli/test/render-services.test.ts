@@ -29,7 +29,10 @@ const connections = {
   databaseUrl: "postgres://qm:password@postgres/qm",
   coreUrl: "http://core-assigned:8080",
   webUiUrl: "http://web-ui:8080",
+  projectId: "prj-acme",
   environmentId: "evm-production",
+  postgresId: "dpg-acme",
+  appDatabaseEndpoint: "postgresql://pg.oregon-postgres.render.com:5432/?sslmode=verify-full",
 };
 
 test("Render Git source accepts GitHub repositories and branch names without credentials", () => {
@@ -136,6 +139,9 @@ test("Render core receives scoped storage credentials and assigned URLs", (t) =>
   assert.equal(core.S3_BUCKET, "qm-storage");
   assert.equal(core.S3_FORCE_PATH_STYLE, "true");
   assert.equal(core.RENDER_QM_MINIO, "true");
+  assert.equal(core.RENDER_PROJECT_ID, connections.projectId);
+  assert.equal(core.RENDER_POSTGRES_ID, connections.postgresId);
+  assert.equal(core.RENDER_APP_DATABASE_ENDPOINT, connections.appDatabaseEndpoint);
   assert.equal(core.RENDER_ENVIRONMENT_ID, connections.environmentId);
   assert.equal(core.PUBLIC_API_URL, config.apiUrl);
   assert.equal(core.PUBLIC_WEB_URL, config.publicUrl);
@@ -146,7 +152,11 @@ test("Render core receives scoped storage credentials and assigned URLs", (t) =>
     assert.equal(env.CORE_API_URL, connections.coreUrl);
     assert.equal(env.MINIO_ROOT_USER, undefined);
     assert.equal(env.MINIO_ROOT_PASSWORD, undefined);
-    if (service !== "core") assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
+    if (service !== "core") {
+      assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
+      assert.equal(env.RENDER_POSTGRES_ID, undefined);
+      assert.equal(env.RENDER_APP_DATABASE_ENDPOINT, undefined);
+    }
   }
   const portal = renderServiceEnv(config, "portal", values, connections);
   assert.equal(portal.OIDC_ISSUER, `${config.publicUrl}/idp`);

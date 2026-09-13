@@ -161,7 +161,11 @@ function cloud(t: TestContext, d: Deployment) {
       return Response.json(state.database);
     }
     if (path === "/postgres/dpg-acme/connection-info")
-      return Response.json({ internalConnectionString: "postgresql://qm:private-password@pg/qm" });
+      return Response.json({
+        internalConnectionString: "postgresql://qm:private-password@pg/qm",
+        externalConnectionString:
+          "postgresql://qm:private-password@pg.oregon-postgres.render.com:5432/qm?sslmode=require&application_name=qm#discard",
+      });
     if (path === "/postgres/dpg-acme") {
       if (!state.database) return missing();
       if (method === "DELETE") {
@@ -315,6 +319,12 @@ test("Render creates one project and wires MinIO credentials, URLs, Postgres, an
   assert.notEqual(minio.MINIO_ROOT_PASSWORD, core.AWS_SECRET_ACCESS_KEY);
   assert.equal(core.AWS_ACCESS_KEY_ID, "qm-storage");
   assert.equal(core.AWS_ENDPOINT_URL_S3, "https://acme-minio-assigned.onrender.com");
+  assert.equal(core.RENDER_PROJECT_ID, "prj-acme");
+  assert.equal(core.RENDER_POSTGRES_ID, "dpg-acme");
+  assert.equal(
+    core.RENDER_APP_DATABASE_ENDPOINT,
+    "postgresql://pg.oregon-postgres.render.com:5432/?sslmode=verify-full",
+  );
   assert.equal(core.RENDER_ENVIRONMENT_ID, "evm-acme");
   assert.equal(core.DATABASE_URL, "postgresql://qm:private-password@pg/qm");
   assert.equal(core.PUBLIC_API_URL, "https://acme-core-assigned.onrender.com");
@@ -671,7 +681,53 @@ test("Render stops services and resumes them while retaining database and disk",
   );
 });
 
-test("Render protects published apps before shutdown or purge", async (t) => {
+for (const [name, externalConnectionString] of [
+  ["missing", undefined],
+  ["malformed", "private-password"],
+  ["wrong protocol", "https://qm:private-password@pg.oregon-postgres.render.com/qm"],
+] as const)
+  test(`Render rejects ${name} external database connection details before service creation`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    c.intercept = (call) =>
+      call.path === "/postgres/dpg-acme/connection-info"
+        ? Response.json({
+            internalConnectionString: "postgresql://qm:private-password@pg/qm",
+            externalConnectionString,
+          })
+        : undefined;
+    await assert.rejects(d.backend.up({ dryRun: false }), (error: Error) => {
+      assert.match(error.message, /no valid external Postgres connection string/);
+      assert.doesNotMatch(error.message, /private-password/);
+      return true;
+    });
+    assert.equal(c.services.size, 0);
+    assert.equal(
+      writes(c.calls).some((call) => call.path === "/postgres/dpg-acme" && call.method === "PATCH"),
+      false,
+    );
+  });
+
+test("Render shutdown ignores app services outside the saved project", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const app = {
+    ...c.services.get("srv-acme-web-ui")!,
+    id: "srv-other-project-app",
+    name: "qm-app-other",
+    type: "private_service",
+    environmentId: "evm-other-project",
+  };
+  c.services.set(app.id, app);
+  c.envs.set(app.id, { QM_DEPLOYMENT_ID: "00000000-0000-4000-8000-000000000002" });
+  const mark = c.calls.length;
+  await d.backend.down({});
+  assert.equal(app.suspended, "not_suspended");
+  assert.ok(c.calls.slice(mark).every((call) => !call.path.startsWith(`/services/${app.id}`)));
+});
+
+test("Render protects published apps in owner environments before shutdown or purge", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
@@ -679,15 +735,20 @@ test("Render protects published apps before shutdown or purge", async (t) => {
     ...c.services.get("srv-acme-web-ui")!,
     id: "srv-published-app",
     name: "qm-app-a1",
+    environmentId: "evm-owner",
     type: "private_service",
   };
+  c.projects.get("prj-acme")!.environmentIds.push("evm-owner");
   c.services.set(app.id, app);
   c.envs.set(app.id, { QM_DEPLOYMENT_ID: "00000000-0000-4000-8000-000000000001" });
-  for (const purge of [false, true]) {
-    const mark = c.calls.length;
-    await assert.rejects(async () => d.backend.down({ purge }), /Published apps still use this deployment/);
-    assert.deepEqual(writes(c.calls.slice(mark)), []);
-    assert.equal(d.saved().pendingPurge, undefined);
+  for (const environmentId of ["evm-acme", "evm-owner"]) {
+    app.environmentId = environmentId;
+    for (const purge of [false, true]) {
+      const mark = c.calls.length;
+      await assert.rejects(async () => d.backend.down({ purge }), /Published apps still use this deployment/);
+      assert.deepEqual(writes(c.calls.slice(mark)), []);
+      assert.equal(d.saved().pendingPurge, undefined);
+    }
   }
   app.suspended = "suspended";
   await assert.rejects(async () => d.backend.down({ purge: true }), /Published apps still use this deployment/);

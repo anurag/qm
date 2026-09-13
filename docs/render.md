@@ -129,6 +129,10 @@ Core selects `SANDBOX_BACKEND=render`, `DEPLOY_PROVIDER=render`,
 `WORKSPACE_STORE=s3`, `SNAPSHOT_STORE=s3`, and `TRANSFER_STORE=s3`. Postgres stores
 sessions, runs, file metadata, and provider references. Object storage holds
 workspace files, portable sandbox backups, file artifacts, and Git archives.
+The CLI sets `RENDER_PROJECT_ID` to the shared project and
+`RENDER_ENVIRONMENT_ID` to the shared `production` environment. Core requires a
+`prj-...` project ID for Render app deployment. Render Sandboxes alone do not
+require this setting.
 Core has no persistent disk; files at `/data` are temporary. Keep one core
 instance until concurrent recovery has been tested. Existing local data needs a
 separate backup and migration; QM does not copy it or detach disks automatically.
@@ -138,36 +142,68 @@ operator secrets. `qm down` retains Postgres and MinIO data, so storage charges
 continue. `qm down --purge` deletes the hosted QM services, Postgres, and bundled MinIO
 data. It retains the project and environment. External object storage is outside
 this lifecycle. Keep `render.resources.json` with the deployment configuration;
-it records resource IDs and pending operations, but no credentials. Do not use
-one deployment directory for concurrent CLI operations.
+it records shared stack resource IDs and pending operations, but no credentials.
+It does not track runtime apps, owner gateways, or owner environments. These
+resources have a separate lifecycle in core. Do not use one deployment directory
+for concurrent CLI operations.
 
-Shutdown stops if a published app still runs in the environment. Archive or stop
-these apps first. Purge stops if any published app service remains, including a
-suspended service. Back up app data and delete these services before purge.
+Shutdown stops if a published app still runs in any environment in the project.
+Archive or stop these apps first. Purge stops if any published app service
+remains, including a suspended service. Back up app data and delete these
+services before purge.
 
-Published apps use private Render services in the same environment. QM proxies
-public requests through its existing access controls. The shared private network
-does not enforce those controls between apps: app code can connect directly to
-peer service ports. This matches the current Fly limitation; use this target
-where app authors are trusted to access the deployment network.
+## Published apps
+
+Core creates a separate Render environment for each app owner scope in the
+configured project. Each owner environment has network isolation enabled and
+contains that owner's private app services plus a trusted gateway. Core,
+Postgres, and MinIO remain in the shared `production` environment. App services
+cannot use the Render private network to reach the shared stack or another
+owner's environment.
+
+The gateway runs the stock Caddy image with a configuration that core controls.
+Core applies the existing QM access checks, then sends authenticated requests
+over HTTPS to the owner's gateway. The gateway routes them to that owner's
+private apps. It does not run app code. Anyone with write access to an app can
+run code on its owner's private network and reach that owner's other apps.
+Treat all app editors in an owner scope as trusted with every app in that scope.
+Read-only shares still use core access checks. Ownership transfers retain the
+previous owner's write grant. Isolation between app editors would require a
+separate environment for each app, which this provider does not create.
+
+Each active owner adds one public gateway web service and one environment, in
+addition to the private app services. The gateway has no persistent disk. Core
+stores its configuration and resource references in Postgres. Route changes
+redeploy the gateway and can interrupt active streams for that owner.
 
 App services have no persistent disk. Render keeps the current instance available
 while its replacement starts. QM continues to route requests to the live service
 during the update. Render keeps the current instance when a build or startup
-fails before the replacement becomes ready. The
-runner forwards shutdown signals; Render allows up to 300 seconds for shutdown.
-App code must drain requests on SIGTERM and keep database changes compatible with
-both versions. Private services use TCP health checks, so the app must finish
-initialization before it listens on `PORT`. A process that accepts TCP connections
-but returns HTTP errors can still pass Render's readiness check; QM's HTTP check
-cannot undo that traffic switch.
+fails before the replacement becomes ready. The runner forwards shutdown signals;
+Render allows up to 300 seconds for shutdown. App code must drain requests on
+SIGTERM and keep database changes compatible with both versions. Private services
+use TCP health checks, so the app must finish initialization before it listens on
+`PORT`. A process that accepts TCP connections but returns HTTP errors can still
+pass Render's readiness check; QM's HTTP check cannot undo that traffic switch.
 
 QM creates one logical Postgres database and a restricted login for each app on
-the managed Postgres instance. It supplies `DATABASE_URL` at runtime. App roles
-can create tables in their own database; they cannot read or change QM's data or
-connect to another app database. Credentials are encrypted in QM's durable store.
-The managed Postgres login must have `CREATEDB` and `CREATEROLE`. App pools should
-use at most five connections because apps share the instance's connection limit.
+the managed Postgres instance. Core uses the internal administrator connection
+to provision databases. The CLI supplies `RENDER_POSTGRES_ID` and a credential-free
+external `RENDER_APP_DATABASE_ENDPOINT` with `sslmode=verify-full`. App connections
+use this public endpoint because environment isolation blocks the private path.
+QM adds the reported app-service outbound IP ranges to the database access list under
+a shared lock and retains existing entries. It does not add a public catch-all
+rule. The CLI creates Postgres with external access disabled; core adds app access
+when it provisions app services. Render can share outbound ranges across
+services, so these rules do not identify an individual app. Each app must also
+authenticate with its restricted database login.
+
+QM supplies each app's `DATABASE_URL` at runtime with its restricted login and
+TLS certificate and hostname checks enabled. App roles can create tables in
+their own database; they cannot read or change QM's data or connect to another
+app database. Credentials are encrypted in QM's durable store. The managed
+Postgres login must have `CREATEDB` and `CREATEROLE`. App pools should use at most
+five connections because apps share the instance's connection limit.
 
 Files use the configured S3-compatible store. QM supplies `QM_APP_STORAGE_URL`
 and `QM_APP_STORAGE_TOKEN` at runtime. The app server requests a short-lived URL
@@ -177,9 +213,11 @@ uploads, or other durable state on the app filesystem. App storage credentials
 are not part of the immutable source version or publish result.
 
 Idle cleanup and archive suspend the app and revoke its source and storage
-tokens. They retain its service, database, and objects for restore. Rollback
-changes code and retains the data. Storage charges continue. To remove an app
-permanently, archive it, back up its data, then remove its owned resources.
+tokens. They retain its service, database, and objects for restore. Suspending
+the last active app in an owner scope also suspends its gateway and retains the
+environment. Restore resumes the required resources. Rollback changes code and
+retains data. Storage charges continue. To remove an app permanently, archive
+it, back up its data, then remove its owned resources.
 
 Apps fetch their selected Git commit through the existing core Git endpoint on
 each startup. Their credentials permit reads of one app and are stored durably

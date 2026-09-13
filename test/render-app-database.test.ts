@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { test, type TestContext } from "node:test";
 import pg from "pg";
-import { createRenderAppDatabase, type StoredRenderAppDatabase } from "../src/deploy/render-app-database.ts";
+import {
+  createRenderAppDatabase,
+  parseRenderAppDatabaseEndpoint,
+  type StoredRenderAppDatabase,
+} from "../src/deploy/render-app-database.ts";
 import { createMemoryMap, createPostgresMapFactory, type DurableMap } from "../src/persistence/durable-map.ts";
 
 const TEST_URL = process.env.RENDER_APP_DATABASE_TEST_URL;
@@ -58,8 +62,8 @@ async function fixture(t: TestContext) {
   });
   await query(adminUrl.toString(), "CREATE TABLE core_secrets (id integer PRIMARY KEY, value text)");
   await query(adminUrl.toString(), "INSERT INTO core_secrets VALUES (1, 'private')");
-  const create = (backing: DurableMap<StoredRenderAppDatabase> = store) =>
-    createRenderAppDatabase({ adminUrl: adminUrl.toString(), store: backing, keyMaterial });
+  const create = (backing: DurableMap<StoredRenderAppDatabase> = store, appEndpoint?: string) =>
+    createRenderAppDatabase({ adminUrl: adminUrl.toString(), store: backing, keyMaterial, appEndpoint });
   return { root, store, maps, create, adminUrl: adminUrl.toString(), adminRole, coreDatabase };
 }
 
@@ -87,6 +91,62 @@ test("Render app database rejects unsafe URLs and invalid deployment IDs", async
       }),
     /encryption key/,
   );
+});
+
+test("Render app database endpoints require verified TLS without credentials or a database", () => {
+  for (const appEndpoint of [
+    "invalid",
+    "https://db.example.com/?sslmode=verify-full",
+    "postgresql://admin@db.example.com/?sslmode=verify-full",
+    "postgresql://:secret@db.example.com/?sslmode=verify-full",
+    "postgresql://db.example.com/core?sslmode=verify-full",
+    "postgresql://db.example.com/?sslmode=verify-full#fragment",
+    "postgresql://db.example.com/?sslmode=require",
+    "postgresql://db.example.com/?sslmode=disable",
+    "postgresql://db.example.com/",
+    "postgresql://db.example.com/?sslmode=verify-full&sslmode=verify-full",
+    "postgresql://db.example.com/?sslmode=verify-full&password=secret",
+  ])
+    assert.throws(
+      () =>
+        createRenderAppDatabase({
+          adminUrl: "postgresql://admin:secret@internal/core",
+          appEndpoint,
+          store: createMemoryMap(),
+          keyMaterial,
+        }),
+      /RENDER_APP_DATABASE_ENDPOINT/,
+    );
+  const endpoint = "postgresql://dpg-test-a.oregon-postgres.render.com:5432/?sslmode=verify-full";
+  assert.equal(parseRenderAppDatabaseEndpoint(endpoint).toString(), endpoint);
+});
+
+test("Render app database returns scoped external credentials and verifies them internally", { skip }, async (t) => {
+  const f = await fixture(t);
+  const id = randomUUID();
+  const endpoint = "postgresql://dpg-test-a.oregon-postgres.render.com:5432/?sslmode=verify-full";
+  const result = await f.create(f.store, endpoint).ensure(id);
+  const external = new URL(result.DATABASE_URL!);
+  const record = (await f.store.get(id))!;
+  assert.equal(external.hostname, "dpg-test-a.oregon-postgres.render.com");
+  assert.equal(external.port, "5432");
+  assert.equal(external.search, "?sslmode=verify-full");
+  assert.equal(external.username, record.loginRole);
+  assert.equal(external.pathname, `/${record.database}`);
+  assert.notEqual(external.password, new URL(f.adminUrl).password);
+  assert.ok(external.password.length >= 32);
+  assert.equal(result.DATABASE_URL!.includes(f.adminRole), false);
+  assert.equal(result.DATABASE_URL!.includes(new URL(f.adminUrl).password), false);
+  assert.equal(result.DATABASE_URL!.includes(f.coreDatabase), false);
+  assert.equal((await f.create(f.store, endpoint).ensure(id)).DATABASE_URL, result.DATABASE_URL);
+  const internal = new URL(f.adminUrl);
+  internal.username = external.username;
+  internal.password = external.password;
+  internal.pathname = external.pathname;
+  assert.deepEqual((await query(internal.toString(), "SELECT current_user AS role")).rows, [
+    { role: record.loginRole },
+  ]);
+  assert.equal(JSON.stringify(record).includes(external.password), false);
 });
 
 test("Render app databases preserve data and isolate app accounts from core data and peers", { skip }, async (t) => {

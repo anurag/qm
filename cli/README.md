@@ -173,5 +173,31 @@ storage field keep external mode.
 
 Core has one instance without a persistent disk. Postgres and object storage
 hold durable state. MinIO has its own persistent disk. The core creates Render
-Sandboxes when an agent needs one. Read the generated Render deployment reference
-for storage details, lifecycle commands, and image release requirements.
+Sandboxes when an agent needs one. The CLI supplies `RENDER_PROJECT_ID` to core.
+Published apps for each owner scope use a separate isolated environment in that
+project, with private app services and a trusted gateway that runs stock Caddy.
+Core applies QM access checks before it routes requests through that gateway.
+Anyone with write access to an app can run code on its owner's private network
+and reach that owner's other apps. Treat all app editors in an owner scope as
+trusted with every app in that scope. Read-only shares still use core access
+checks. Ownership transfers retain the previous owner's write grant.
+
+Published app services have no persistent disk. QM creates a restricted Postgres
+database for each app and supplies file access through the configured object
+store. Core provisions databases through the internal connection. Apps use the
+public database endpoint with TLS certificate and hostname checks. QM adds the
+reported app-service outbound IP ranges to the database access list and retains existing
+entries; it does not add a public catch-all rule. The CLI supplies the database
+resource ID and credential-free app endpoint to core.
+
+Each active owner adds one public gateway web service and one environment. The
+gateway has no disk; route changes redeploy it and can interrupt active streams.
+Core stores runtime app and gateway state in Postgres. These resources are not
+listed in `render.resources.json` or removed by CLI teardown. Suspending the
+last active app also suspends its gateway and retains the environment. Read the
+generated Render deployment reference for storage details, lifecycle commands,
+and image release requirements.
+
+`qm down` stops if a published app still runs in any project environment. Archive
+or stop apps first. `qm down --purge` stops if any app service remains, including
+a suspended service. Back up app data and remove these services before purge.

@@ -1,4 +1,5 @@
-import type { PgPool } from "./pg-pool.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { PgPool, PoolClient } from "./pg-pool.ts";
 import { createKeyedQueue, sleep } from "../util/async.ts";
 
 export interface AdvisoryLock {
@@ -41,57 +42,96 @@ export function createMemoryAdvisoryLock(): AdvisoryLock {
   };
 }
 
+interface LockSession {
+  client: PoolClient;
+  borrowers: number;
+  reserved: Set<string>;
+  failed: boolean;
+}
+
+interface LockScope {
+  session: LockSession;
+  key: string;
+  parent?: LockScope;
+  active: boolean;
+}
+
 export function createPostgresAdvisoryLock(
   pg: PgPool,
   opts: { timeoutMs?: number; pollMs?: number } = {},
 ): AdvisoryLock {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_ADVISORY_LOCK_TIMEOUT_MS;
   const pollMs = opts.pollMs ?? DEFAULT_ADVISORY_LOCK_POLL_MS;
-
-  return {
-    async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-      const deadline = Date.now() + timeoutMs;
-      const pool = await pg.sessionPool();
+  const scopes = new AsyncLocalStorage<LockScope>();
+  const release = (session: LockSession) => {
+    if (--session.borrowers === 0) session.client.release(session.failed);
+  };
+  const query = async (session: LockSession, sql: string, key: string) => {
+    try {
+      return await session.client.query<{ locked: boolean }>(sql, [key]);
+    } catch (error) {
+      session.failed = true;
+      throw error;
+    }
+  };
+  const run = async <T>(key: string, fn: () => Promise<T>, wait: boolean): Promise<T | null> => {
+    const inherited = scopes.getStore();
+    const parent = inherited?.active ? inherited : undefined;
+    for (let ancestor = parent; ancestor; ancestor = ancestor.parent) {
+      if (ancestor.active && ancestor.key === key) {
+        if (!wait) return null;
+        throw new Error(`advisory lock is already held by this callback for ${key}`);
+      }
+    }
+    const borrowed = parent?.session;
+    if (borrowed?.failed) throw new Error("advisory lock session failed");
+    if (borrowed) borrowed.borrowers++;
+    const deadline = Date.now() + timeoutMs;
+    try {
       for (;;) {
-        const client = await pool.connect();
+        const session = borrowed ?? {
+          client: await (await pg.sessionPool()).connect(),
+          borrowers: 1,
+          reserved: new Set<string>(),
+          failed: false,
+        };
         try {
-          const res = await client.query<{ locked: boolean }>(
-            "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
-            [key],
-          );
-          const held = res.rows[0]?.locked === true;
-          if (held) {
+          if (session.failed) throw new Error("advisory lock session failed");
+          if (!session.reserved.has(key)) {
+            session.reserved.add(key);
             try {
-              return await fn();
+              const result = await query(
+                session,
+                "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+                key,
+              );
+              if (result.rows[0]?.locked === true) {
+                const scope: LockScope = { session, key, parent, active: true };
+                try {
+                  if (session.failed) throw new Error("advisory lock session failed");
+                  return await scopes.run(scope, fn);
+                } finally {
+                  scope.active = false;
+                  await query(session, "SELECT pg_advisory_unlock(hashtextextended($1, 0))", key);
+                }
+              }
             } finally {
-              await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
+              session.reserved.delete(key);
             }
           }
         } finally {
-          client.release();
+          if (!borrowed) release(session);
         }
+        if (!wait) return null;
         if (Date.now() >= deadline) throw new Error(`timeout acquiring advisory lock for ${key}`);
         await sleep(pollMs);
       }
-    },
-
-    async tryWithLock<T>(key: string, fn: () => Promise<T>): Promise<T | null> {
-      const pool = await pg.sessionPool();
-      const client = await pool.connect();
-      try {
-        const res = await client.query<{ locked: boolean }>(
-          "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
-          [key],
-        );
-        if (res.rows[0]?.locked !== true) return null;
-        try {
-          return await fn();
-        } finally {
-          await client.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
-        }
-      } finally {
-        client.release();
-      }
-    },
+    } finally {
+      if (borrowed) release(borrowed);
+    }
+  };
+  return {
+    withLock: <T>(key: string, fn: () => Promise<T>) => run(key, fn, true) as Promise<T>,
+    tryWithLock: <T>(key: string, fn: () => Promise<T>) => run(key, fn, false),
   };
 }

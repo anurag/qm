@@ -764,35 +764,39 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     },
 
     async transferDeploymentOwner(idOrName, toScope, actor) {
-      const d = (await deps.deployStore.get(idOrName)) ?? (await deps.deployStore.getByName(idOrName));
-      if (!d) throw new Error(`no such app: ${idOrName}`);
-      if (!(await managesHome(d, actor.callerId, actor.actingScopeId))) {
-        throw new Error(`only the owner can transfer "${d.name ?? d.id}"`);
-      }
-      if (d.ownerScopeId === toScope) return d;
-      const ref = deploymentRef(d.id);
-      const fromScope = d.ownerScopeId;
-      const prior = await grantsOn(d);
-      const newOwnerId = parseScopeId(toScope).kind === "personal" ? parseScopeId(toScope).ref! : actor.callerId;
-      const oldOwnerId = parseScopeId(fromScope).kind === "personal" ? parseScopeId(fromScope).ref! : actor.callerId;
-      for (const g of prior) {
-        if (g.granteeScopeId === toScope) continue;
-        await deps.acl.grant({ ...g, ownerScopeId: toScope, grantedBy: newOwnerId }, d.createdBy);
-      }
-      await deps.acl.grant(
-        { ownerScopeId: toScope, ref, granteeScopeId: fromScope, permission: "write", grantedBy: newOwnerId },
-        d.createdBy,
-      );
-      await deps.deployStore.setOwnerScope(d.id, toScope);
-      for (const g of prior) await deps.acl.revoke(fromScope, ref, g.granteeScopeId, oldOwnerId, d.createdBy);
-      deps.auditLog.record({
-        at: Date.now(),
-        principalId: actor.callerId,
-        action: "deploy_transfer",
-        resource: ref,
-        scopeLabel: toScope,
+      const found = (await deps.deployStore.get(idOrName)) ?? (await deps.deployStore.getByName(idOrName));
+      if (!found) throw new Error(`no such app: ${idOrName}`);
+      return withDeployLock(found.id, async () => {
+        const d = (await deps.deployStore.get(found.id))!;
+        if (!(await managesHome(d, actor.callerId, actor.actingScopeId))) {
+          throw new Error(`only the owner can transfer "${d.name ?? d.id}"`);
+        }
+        if (d.ownerScopeId === toScope) return d;
+        await deps.provider.transferOwnership?.(d, toScope);
+        const ref = deploymentRef(d.id);
+        const fromScope = d.ownerScopeId;
+        const prior = await grantsOn(d);
+        const newOwnerId = parseScopeId(toScope).kind === "personal" ? parseScopeId(toScope).ref! : actor.callerId;
+        const oldOwnerId = parseScopeId(fromScope).kind === "personal" ? parseScopeId(fromScope).ref! : actor.callerId;
+        for (const g of prior) {
+          if (g.granteeScopeId === toScope) continue;
+          await deps.acl.grant({ ...g, ownerScopeId: toScope, grantedBy: newOwnerId }, d.createdBy);
+        }
+        await deps.acl.grant(
+          { ownerScopeId: toScope, ref, granteeScopeId: fromScope, permission: "write", grantedBy: newOwnerId },
+          d.createdBy,
+        );
+        await deps.deployStore.setOwnerScope(d.id, toScope);
+        for (const g of prior) await deps.acl.revoke(fromScope, ref, g.granteeScopeId, oldOwnerId, d.createdBy);
+        deps.auditLog.record({
+          at: Date.now(),
+          principalId: actor.callerId,
+          action: "deploy_transfer",
+          resource: ref,
+          scopeLabel: toScope,
+        });
+        return (await deps.deployStore.get(d.id))!;
       });
-      return (await deps.deployStore.get(d.id))!;
     },
   };
 }

@@ -7,7 +7,7 @@ import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
 import { configurePgPooling, createPgPool } from "../src/persistence/pg-pool.ts";
-import { createPostgresAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { createMemoryAdvisoryLock, createPostgresAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -19,6 +19,9 @@ import type { Deployment, DeploymentVersion } from "../src/deploy/deploy-store.t
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { scopeId } from "../src/types.ts";
 import { fetch as undiciFetch, getGlobalDispatcher, MockAgent, setGlobalDispatcher } from "undici";
+import { createFakeRenderGateways } from "./support/fake-render-gateways.ts";
+import { createRenderDeployGateways, type StoredRenderGateway } from "../src/deploy/render-deploy-gateways.ts";
+import { RENDER_GATEWAY_APP_HEADER, RENDER_GATEWAY_AUTH_HEADER } from "../src/deploy/render-caddy.ts";
 
 const ID = "550e8400-e29b-41d4-a716-446655440000";
 const WORKSPACE = "tea-qm";
@@ -87,7 +90,42 @@ function fakeRender(
 ) {
   const calls: Call[] = [];
   const store = createMemoryMap<StoredRenderDeploy>();
+  const gatewayStore = createMemoryMap<StoredRenderGateway>();
+  const network = {
+    calls: [] as Call[],
+    ips: ["203.0.113.1"],
+    projectId: "prj-qm",
+    before: undefined as ((call: Call) => Promise<Response | undefined>) | undefined,
+    database: {
+      id: "dpg-qm-a",
+      owner: { id: WORKSPACE },
+      region: "oregon",
+      environmentId: "evm-production",
+      ipAllowList: [{ cidrBlock: "203.0.113.1/32", description: "Retained egress" }],
+    },
+  };
+  const gateway = createFakeRenderGateways({
+    workspaceId: WORKSPACE,
+    projectId: "prj-qm",
+    moveResource(id, environmentId) {
+      assert.equal(id, SERVICE);
+      if (service) service.environmentId = environmentId;
+    },
+  });
   let service: Service | null = opts.existing ? newService() : null;
+  const ready = opts.existing
+    ? createRenderDeployGateways({
+        request: gateway.request,
+        fetchImpl: gateway.fetchImpl,
+        workspaceId: WORKSPACE,
+        projectId: "prj-qm",
+        prefix: "qm-app",
+        region: "oregon",
+        store: gatewayStore,
+        timeoutMs: 100,
+        pollMs: 1,
+      }).upsert(deployment.ownerScopeId, ID, { host: "qm-app-internal", port: 8080 })
+    : Promise.resolve();
   let marker = opts.marker ?? ID;
   const artifact = {
     url: "https://core.example/v1/render/deploy-artifacts/a",
@@ -107,7 +145,7 @@ function fakeRender(
       id: SERVICE,
       name: `qm-app-${ID}`,
       ownerId: WORKSPACE,
-      ...(opts.environmentId ? { environmentId: opts.environmentId } : {}),
+      environmentId: opts.environmentId ?? "env-gw-1",
       type: opts.type ?? "private_service",
       suspended: opts.suspended ? "suspended" : "not_suspended",
       serviceDetails: {
@@ -120,18 +158,36 @@ function fakeRender(
   }
   const fetchImpl = (async (input: string | URL, init: RequestInit = {}) => {
     const url = new URL(String(input));
-    if (url.hostname === "qm-app-internal") {
-      assert.equal(url.port, "8080");
-      if (opts.appFetch) return opts.appFetch(input, init);
-      if (opts.appReachable === false) throw new TypeError("App port is unavailable");
-      return new Response("app ready", { status: opts.appStatus ?? 200 });
+    await ready;
+    if (url.hostname.endsWith(".onrender.com")) {
+      if (new Headers(init.headers).has(RENDER_GATEWAY_APP_HEADER)) {
+        if (opts.appFetch) return opts.appFetch(input, init);
+        if (opts.appReachable === false) throw new TypeError("App port is unavailable");
+        if (opts.appStatus !== undefined) return new Response("app ready", { status: opts.appStatus });
+      }
+      return gateway.fetchImpl(input, init);
     }
+    assert.notEqual(url.hostname, "qm-app-internal", "core must not connect to isolated private app ports");
     assert.equal(url.origin, "https://api.render.com");
     assert.equal(new Headers(init.headers).get("authorization"), `Bearer ${TOKEN}`);
     assert.equal(init.redirect, "error");
     const method = init.method ?? "GET";
     const path = url.pathname.replace(/^\/v1/, "");
     const body: unknown = init.body ? JSON.parse(String(init.body)) : undefined;
+    if (path.startsWith("/postgres/") || path.endsWith("/outbound-ips") || path === "/environments/evm-production") {
+      const call = { method, path, query: url.searchParams, body };
+      network.calls.push(call);
+      const intercepted = await network.before?.(call);
+      if (intercepted) return intercepted;
+      if (path === "/environments/evm-production")
+        return Response.json({ id: "evm-production", projectId: network.projectId });
+      if (path.endsWith("/outbound-ips")) return Response.json({ ips: network.ips, type: "shared" });
+      if (method === "PATCH")
+        network.database.ipAllowList = (body as { ipAllowList: typeof network.database.ipAllowList }).ipAllowList;
+      return Response.json(network.database);
+    }
+    const gatewayResponse = gateway.intercept(method, `${path}${url.search}`, body);
+    if (gatewayResponse) return gatewayResponse;
     const call = { method, path, query: url.searchParams, body };
     calls.push(call);
     const intercepted = await opts.intercept?.(call);
@@ -140,8 +196,9 @@ function fakeRender(
     if (path === "/services" && method === "GET") return json(service ? [{ service, cursor: "end" }] : []);
     if (path === "/services" && method === "POST") {
       service = newService();
-      const created = body as { name: string; envVars: Array<{ key: string; value: string }> };
+      const created = body as { name: string; environmentId: string; envVars: Array<{ key: string; value: string }> };
       service.name = created.name;
+      service.environmentId = created.environmentId;
       marker = created.envVars.find((entry) => entry.key === "QM_DEPLOYMENT_ID")!.value;
       pendingDeployId = "dep-first";
       if (opts.loseCreateResponse) throw new TypeError("create response was lost");
@@ -211,12 +268,15 @@ function fakeRender(
     }
     throw new Error(`Unexpected ${method} ${path}`);
   }) as typeof fetch;
-  const provider = (extra: Partial<RenderDeployProviderOptions> = {}) =>
-    createRenderDeployProvider({
+  const provider = (extra: Partial<RenderDeployProviderOptions> = {}) => {
+    const result = createRenderDeployProvider({
       apiKey: TOKEN,
       workspaceId: WORKSPACE,
+      projectId: "prj-qm",
+      postgresId: "dpg-qm-a",
       baseImage: IMAGE,
       store,
+      gatewayStore,
       fetchImpl,
       pollIntervalMs: 1,
       deployTimeoutMs: 50,
@@ -231,6 +291,30 @@ function fakeRender(
       },
       ...extra,
     });
+    return {
+      ...result,
+      apply: async (...args: Parameters<typeof result.apply>) => {
+        await ready;
+        return result.apply(...args);
+      },
+      destroy: async (...args: Parameters<typeof result.destroy>) => {
+        await ready;
+        return result.destroy(...args);
+      },
+      resolveEndpoint: async (...args: Parameters<NonNullable<typeof result.resolveEndpoint>>) => {
+        await ready;
+        return result.resolveEndpoint!(...args);
+      },
+      logs: async (...args: Parameters<NonNullable<typeof result.logs>>) => {
+        await ready;
+        return result.logs!(...args);
+      },
+      transferOwnership: async (...args: Parameters<NonNullable<typeof result.transferOwnership>>) => {
+        await ready;
+        return result.transferOwnership!(...args);
+      },
+    };
+  };
   return {
     provider,
     calls,
@@ -238,6 +322,22 @@ function fakeRender(
     revoked,
     artifact,
     store,
+    gateway,
+    gatewayStore,
+    network,
+    appService: () => service!,
+    ready,
+    endpoint: () => {
+      const gatewayService = [...gateway.services.values()][0]!;
+      const config = JSON.parse(gateway.configs.get(gatewayService.id)!);
+      const token = (Object.values(config.apps.http.servers.gateway.routes[1].match[0].not[0].vars)[0] as string[])[0]!;
+      return {
+        host: new URL(gatewayService.serviceDetails.url).hostname,
+        port: 443,
+        tls: true,
+        proxyHeaders: { connection: "close", [RENDER_GATEWAY_AUTH_HEADER]: token, [RENDER_GATEWAY_APP_HEADER]: ID },
+      };
+    },
     releaseQueued: () => {
       queuedListReads = 0;
     },
@@ -247,12 +347,13 @@ function fakeRender(
 test("Render publish creates a private image service and waits for its deploy", async () => {
   const fake = fakeRender();
   const endpoint = await fake.provider().apply(deployment, version);
-  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
+  assert.deepEqual(endpoint, fake.endpoint());
   assert.equal(fake.prepared[0]![1], version);
   assert.equal(fake.provider().profile.dataDir, undefined);
   const created = fake.calls.find((call) => call.method === "POST" && call.path === "/services")!;
   assert.deepEqual(created.body, {
     type: "private_service",
+    environmentId: "env-gw-1",
     name: `qm-app-${ID}`,
     ownerId: WORKSPACE,
     autoDeploy: "no",
@@ -294,16 +395,14 @@ test("Render republish updates the same service before it starts a new deploy", 
 });
 
 test("Render publish builds the app runner from Git with its app artifact", async () => {
-  const fake = fakeRender({ environmentId: "evm-production" });
-  await fake
-    .provider({ baseImage: undefined, source: SOURCE, environmentId: "evm-production" })
-    .apply(deployment, version);
+  const fake = fakeRender({ environmentId: "env-gw-1" });
+  await fake.provider({ baseImage: undefined, source: SOURCE, environmentId: "env-gw-1" }).apply(deployment, version);
   const created = fake.calls.find((call) => call.method === "POST" && call.path === "/services")!;
   assert.deepEqual(created.body, {
     type: "private_service",
     name: `qm-app-${ID}`,
     ownerId: WORKSPACE,
-    environmentId: "evm-production",
+    environmentId: "env-gw-1",
     autoDeploy: "no",
     ...SOURCE,
     rootDir: "",
@@ -425,11 +524,7 @@ for (const terminalStatus of ["live", "update_failed", "canceled"]) {
         },
       },
     });
-    assert.deepEqual(await provider.apply(deployment, { ...version, version: 2 }), {
-      host: "qm-app-internal",
-      port: 8080,
-      proxyHeaders: { connection: "close" },
-    });
+    assert.deepEqual(await provider.apply(deployment, { ...version, version: 2 }), fake.endpoint());
     assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
     assert.deepEqual((await fake.store.get(ID))?.previousDeployIds, ["dep-queued", "dep-old"]);
     assert.equal((await fake.store.get(ID))?.liveVersion, 2);
@@ -555,7 +650,7 @@ test("Render leaves a prior queued deploy unchanged when it exceeds the wait dea
 test("Render follows a queued deploy without triggering another deploy or accepting the old live version", async () => {
   const fake = fakeRender({ existing: true, queued: true, queuedListReads: 2 });
   const endpoint = await fake.provider().apply(deployment, version);
-  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
+  assert.deepEqual(endpoint, fake.endpoint());
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
   assert.equal(fake.calls.filter((call) => call.method === "GET" && call.path.endsWith("/deploys")).length, 5);
   assert.equal(
@@ -595,7 +690,7 @@ test("Render finds the initial deploy when service creation omits its deploy ID"
 test("Render reconciles an accepted trigger when its response is lost", async () => {
   const fake = fakeRender({ existing: true, loseTriggerResponse: true });
   const endpoint = await fake.provider().apply(deployment, version);
-  assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
+  assert.deepEqual(endpoint, fake.endpoint());
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
   assert.equal((await fake.store.get(ID))?.status, "live");
 });
@@ -619,27 +714,15 @@ test("Render retains an undiscovered queued deploy across provider restarts and 
   await provider.resolveEndpoint!(running, version);
   await assert.rejects(provider.apply(running, version), /still pending/);
   assert.equal((await fake.store.get(ID))?.status, "pending");
-  assert.deepEqual(await provider.resolveEndpoint!(running, version), {
-    host: "qm-app-internal",
-    port: 8080,
-    proxyHeaders: { connection: "close" },
-  });
+  assert.deepEqual(await provider.resolveEndpoint!(running, version), fake.endpoint());
   const restarted = fake.provider({ deployTimeoutMs: 5 });
   await assert.rejects(restarted.apply(running, { ...version, version: 2 }), /still pending/);
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
   assert.equal(fake.prepared.length, 1);
   fake.releaseQueued();
-  assert.deepEqual(await restarted.apply(running, version), {
-    host: "qm-app-internal",
-    port: 8080,
-    proxyHeaders: { connection: "close" },
-  });
+  assert.deepEqual(await restarted.apply(running, version), fake.endpoint());
   assert.equal(await restarted.resolveEndpoint!(running, version), null);
-  assert.deepEqual(await restarted.resolveEndpoint!({ ...running, appliedVersion: 1 }, version), {
-    host: "qm-app-internal",
-    port: 8080,
-    proxyHeaders: { connection: "close" },
-  });
+  assert.deepEqual(await restarted.resolveEndpoint!({ ...running, appliedVersion: 1 }, version), fake.endpoint());
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
 });
 
@@ -659,17 +742,9 @@ for (const cancelStatus of [200, 503]) {
     await assert.rejects(fake.provider({ deployTimeoutMs: 5 }).apply(running, version), /still pending/);
     assert.equal((await fake.store.get(ID))?.status, "pending");
     const restarted = fake.provider();
-    assert.deepEqual(await restarted.resolveEndpoint!(running, version), {
-      host: "qm-app-internal",
-      port: 8080,
-      proxyHeaders: { connection: "close" },
-    });
+    assert.deepEqual(await restarted.resolveEndpoint!(running, version), fake.endpoint());
     status = "live";
-    assert.deepEqual(await restarted.apply(running, version), {
-      host: "qm-app-internal",
-      port: 8080,
-      proxyHeaders: { connection: "close" },
-    });
+    assert.deepEqual(await restarted.apply(running, version), fake.endpoint());
     assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
     assert.equal(await restarted.resolveEndpoint!(running, version), null);
     assert.equal(fake.revoked.length, 0);
@@ -712,6 +787,8 @@ test("Render resumes cleanup after a crash saved the first deploy failure", asyn
   const fake = fakeRender({ existing: true, deployStatus: "update_failed" });
   await fake.store.put(ID, {
     deploymentId: ID,
+    ownerScopeId: deployment.ownerScopeId,
+    environmentId: "env-gw-1",
     version: 1,
     status: "failed",
     createdService: true,
@@ -735,6 +812,8 @@ test("Render retains cleanup ownership when suspension of a failed first service
   const fake = fakeRender(options);
   await fake.store.put(ID, {
     deploymentId: ID,
+    ownerScopeId: deployment.ownerScopeId,
+    environmentId: "env-gw-1",
     version: 1,
     status: "failed",
     createdService: true,
@@ -759,6 +838,8 @@ test("Render finishes cleanup of a rejected create that stopped before artifact 
   const fake = fakeRender();
   await fake.store.put(ID, {
     deploymentId: ID,
+    ownerScopeId: deployment.ownerScopeId,
+    environmentId: "env-gw-1",
     version: 1,
     status: "failed",
     createdService: true,
@@ -774,6 +855,8 @@ test("Render requires operator recovery when a saved request has no observable r
   const fake = fakeRender();
   await fake.store.put(ID, {
     deploymentId: ID,
+    ownerScopeId: deployment.ownerScopeId,
+    environmentId: "env-gw-1",
     version: 1,
     status: "pending",
     createdService: true,
@@ -795,6 +878,8 @@ test("Render can clear an ambiguous deploy by suspending its known service", asy
   const fake = fakeRender({ existing: true });
   await fake.store.put(ID, {
     deploymentId: ID,
+    ownerScopeId: deployment.ownerScopeId,
+    environmentId: "env-gw-1",
     version: 1,
     status: "pending",
     createdService: false,
@@ -897,11 +982,7 @@ test("Render cancels a replacement after a permanent poll error and keeps the pr
     fake.calls.some((call) => call.method === "DELETE"),
     false,
   );
-  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), {
-    host: "qm-app-internal",
-    port: 8080,
-    proxyHeaders: { connection: "close" },
-  });
+  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), fake.endpoint());
   assert.deepEqual(fake.revoked, []);
 });
 
@@ -958,11 +1039,7 @@ test("Render failed replacement preserves the service and previous live deploy",
   const fake = fakeRender({ existing: true, deployStatus: "update_failed" });
   const provider = fake.provider();
   await assert.rejects(provider.apply(deployment, version), /update_failed/);
-  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), {
-    host: "qm-app-internal",
-    port: 8080,
-    proxyHeaders: { connection: "close" },
-  });
+  assert.deepEqual(await provider.resolveEndpoint!(deployment, version), fake.endpoint());
   assert.equal(
     fake.calls.some((call) => call.method === "DELETE"),
     false,
@@ -1015,8 +1092,7 @@ test("Render coalesces endpoint refreshes and caches their result across app req
   const endpoints = await Promise.all(
     Array.from({ length: 100 }, () => provider.resolveEndpoint!(deployment, version)),
   );
-  for (const endpoint of endpoints)
-    assert.deepEqual(endpoint, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
+  for (const endpoint of endpoints) assert.deepEqual(endpoint, fake.endpoint());
   for (let i = 0; i < 100; i++) await provider.resolveEndpoint!(deployment, version);
   assert.equal(fake.calls.length, 3);
 });
@@ -1116,7 +1192,7 @@ test("Render serializes app mutations under the shared deployment lock", async (
   await provider.destroy(deployment);
   assert.deepEqual(
     locks,
-    Array.from({ length: 3 }, () => `render-deploy:${ID}`),
+    Array.from({ length: 3 }, () => `render-deploy-owner:${deployment.ownerScopeId}`),
   );
   assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
 });
@@ -1128,14 +1204,14 @@ test("Render waits for the app port even when the platform reports a live deploy
 });
 
 test("Render restores the same service and scopes apps to the configured environment", async () => {
-  const fake = fakeRender({ environmentId: "evm-production" });
-  const provider = fake.provider({ environmentId: "evm-production" });
+  const fake = fakeRender({ environmentId: "env-gw-1" });
+  const provider = fake.provider({ environmentId: "env-gw-1" });
   await provider.apply(deployment, version);
   const created = fake.calls.find((call) => call.method === "POST" && call.path === "/services")!.body as {
     environmentId: string;
     serviceDetails: { disk?: unknown };
   };
-  assert.equal(created.environmentId, "evm-production");
+  assert.equal(created.environmentId, "env-gw-1");
   assert.equal(created.serviceDetails.disk, undefined);
   await provider.destroy(deployment);
   assert.equal((await fake.store.get(ID))?.status, "suspended");
@@ -1153,7 +1229,7 @@ test("Render refuses an app with an attached disk or another environment", async
   await assert.rejects(attached.provider().apply(deployment, version), /without a persistent disk/);
   const moved = fakeRender({ existing: true, environmentId: "evm-other" });
   await assert.rejects(
-    moved.provider({ environmentId: "evm-production" }).apply(deployment, version),
+    moved.provider({ environmentId: "env-gw-1" }).apply(deployment, version),
     /expected private app service/,
   );
   assert.equal(attached.prepared.length + moved.prepared.length, 0);
@@ -1183,11 +1259,13 @@ test(
       rmSync(dir, { recursive: true, force: true });
     });
     const fake = fakeRender();
+    fake.network.ips = ["203.0.113.2"];
     const store = createDeployStore({ git: { repoRoot: join(dir, "git") } });
+    const lock = createPostgresAdvisoryLock(pg);
     const service = createDeployService({
       deployStore: store,
-      provider: fake.provider(),
-      advisoryLock: createPostgresAdvisoryLock(pg),
+      provider: fake.provider({ advisoryLock: lock }),
+      advisoryLock: lock,
       acl: createAclStore(),
       deployDir: join(dir, "apps"),
       auditLog: { record() {}, events: async () => [], tail: async () => [] },
@@ -1201,8 +1279,20 @@ test(
     await service.redeploy(d.id, { entrypoint: "node app.js", files: [] });
     await service.archiveDeployment(d.id);
     await service.restoreDeployment(d.id, "U1");
+    const previousEndpoint = (await store.get(d.id))!.endpoint!;
+    const nextOwner = scopeId("personal", "U2");
+    await service.transferDeploymentOwner(d.id, nextOwner, {
+      callerId: "U1",
+      actingScopeId: scopeId("personal", "U1"),
+    });
+    const reached = await service.reachDeployment(d.id, "U2");
+    assert.equal(reached.status, "ok");
+    if (reached.status !== "ok") throw new Error("The new owner cannot reach the transferred app");
+    assert.notEqual(reached.endpoint.host, previousEndpoint.host);
+    assert.equal((await store.get(d.id))!.ownerScopeId, nextOwner);
     assert.equal((await store.get(d.id))!.status, "running");
     assert.equal((await pg.sessionPool()).options.max, 1);
+    assert.equal(fake.network.calls.filter((call) => call.method === "PATCH").length, 1);
     assert.ok(fake.calls.every((call) => call.method !== "DELETE"));
   },
 );
@@ -1211,6 +1301,8 @@ test("Render archive clears a rejected create without changing it into an uncert
   const fake = fakeRender();
   await fake.store.put(ID, {
     deploymentId: ID,
+    ownerScopeId: deployment.ownerScopeId,
+    environmentId: "env-gw-1",
     version: 1,
     status: "failed",
     createdService: true,
@@ -1229,7 +1321,7 @@ for (const status of [200, 302, 401, 403, 404, 500, 502, 503]) {
     const fake = fakeRender({ appStatus: status });
     const applied = fake.provider({ deployTimeoutMs: 5 }).apply(deployment, version);
     if (status < 500) {
-      assert.deepEqual(await applied, { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } });
+      assert.deepEqual(await applied, fake.endpoint());
       assert.equal((await fake.store.get(ID))?.liveVersion, 1);
     } else {
       await assert.rejects(applied, /HTTP on port 8080/);
@@ -1256,7 +1348,8 @@ for (const status of ["live", "update_failed"]) {
     const dir = mkdtempSync(join(tmpdir(), "render-deploy-availability-"));
     t.after(() => rmSync(dir, { recursive: true, force: true }));
     const deployments = createMemoryMap<Deployment>();
-    const endpoint = { host: "qm-app-internal", port: 8080, proxyHeaders: { connection: "close" } };
+    await fake.ready;
+    const endpoint = fake.endpoint();
     await deployments.put(ID, {
       ...deployment,
       status: "running",
@@ -1266,6 +1359,8 @@ for (const status of ["live", "update_failed"]) {
     });
     await fake.store.put(ID, {
       deploymentId: ID,
+      ownerScopeId: deployment.ownerScopeId,
+      environmentId: "env-gw-1",
       version: 1,
       status: "live",
       createdService: false,
@@ -1343,6 +1438,8 @@ for (const state of [
     });
     await fake.store.put(ID, {
       deploymentId: ID,
+      ownerScopeId: deployment.ownerScopeId,
+      environmentId: "env-gw-1",
       version: 2,
       status: state === "suspending" || state === "suspended" ? state : "pending",
       createdService: state === "first",
@@ -1384,11 +1481,7 @@ test("Render discards a stale endpoint refresh when an update confirms another v
   await provider.apply(running, { ...version, version: 2 });
   release.resolve(new Response(JSON.stringify([{ deploy: { id: "dep-old", status: "live" } }])));
   assert.equal(await stale, null);
-  assert.deepEqual(await provider.resolveEndpoint!({ ...running, appliedVersion: 2 }, version), {
-    host: "qm-app-internal",
-    port: 8080,
-    proxyHeaders: { connection: "close" },
-  });
+  assert.deepEqual(await provider.resolveEndpoint!({ ...running, appliedVersion: 2 }, version), fake.endpoint());
 });
 
 test("Render runtime storage credentials replace user values before service creation", async () => {
@@ -1463,4 +1556,221 @@ test("Render default HTTP client uses the installed Undici dispatcher", async (t
     setGlobalDispatcher(previous);
     await dispatcher.close();
   }
+});
+test("Render transfers an app while suspended and resumes it behind its new owner's gateway", async () => {
+  const fake = fakeRender();
+  const provider = fake.provider();
+  const before = await provider.apply(deployment, version);
+  const original = await fake.gatewayStore.get(deployment.ownerScopeId);
+  const nextOwner = scopeId("personal", "U2");
+  await provider.transferOwnership(deployment, nextOwner);
+  const record = (await fake.store.get(ID))!;
+  assert.equal(record.ownerScopeId, nextOwner);
+  assert.equal(record.status, "suspended");
+  assert.equal(fake.appService().suspended, "suspended");
+  assert.equal(fake.appService().environmentId, record.environmentId);
+  assert.notEqual(record.environmentId, original!.environmentId);
+  assert.deepEqual((await fake.gatewayStore.get(deployment.ownerScopeId))!.routes, {});
+  assert.equal(fake.gateway.services.get(original!.gatewayServiceId!)!.suspended, "suspended");
+  assert.deepEqual(fake.revoked, [ID]);
+  await assert.rejects(provider.resolveEndpoint(deployment, version), /ownership transfer/);
+  const moved = { ...deployment, ownerScopeId: nextOwner };
+  const after = await provider.apply(moved, version);
+  assert.notEqual(after.host, before.host);
+  assert.notEqual(after.proxyHeaders![RENDER_GATEWAY_AUTH_HEADER], before.proxyHeaders![RENDER_GATEWAY_AUTH_HEADER]);
+  assert.equal(after.proxyHeaders![RENDER_GATEWAY_APP_HEADER], ID);
+  assert.equal(fake.appService().id, SERVICE);
+  assert.equal(fake.appService().serviceDetails.disk, undefined);
+  assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
+});
+
+for (const lostResponse of [false, true]) {
+  test(`Render recovers an ownership move with ${lostResponse ? "a lost response" : "a failed request"}`, async () => {
+    const fake = fakeRender();
+    const provider = fake.provider();
+    await provider.apply(deployment, version);
+    const target = scopeId("personal", "U2");
+    const moving = (call: { method: string; path: string }) =>
+      call.method === "POST" && call.path.endsWith("/resources");
+    if (lostResponse)
+      fake.gateway.controls.after = (call, response) => {
+        if (moving(call)) throw new TypeError("move response was lost");
+        return response;
+      };
+    else fake.gateway.controls.before = (call) => (moving(call) ? new Response(null, { status: 503 }) : undefined);
+    if (lostResponse) await provider.transferOwnership(deployment, target);
+    else {
+      await assert.rejects(provider.transferOwnership(deployment, target), /HTTP 503/);
+      const pending = (await fake.store.get(ID))!;
+      assert.equal(pending.transfer!.ownerScopeId, target);
+      assert.equal(fake.appService().suspended, "suspended");
+      assert.deepEqual((await fake.gatewayStore.get(deployment.ownerScopeId))!.routes, {});
+      await assert.rejects(provider.resolveEndpoint(deployment, version), /ownership transfer/);
+      fake.gateway.controls.before = undefined;
+      await fake.provider().transferOwnership(deployment, target);
+    }
+    const finished = (await fake.store.get(ID))!;
+    assert.equal(finished.ownerScopeId, target);
+    assert.equal(finished.transfer, undefined);
+    assert.equal(fake.appService().environmentId, finished.environmentId);
+    assert.equal(fake.appService().suspended, "suspended");
+    assert.equal(fake.calls.filter((call) => call.method === "POST" && call.path.endsWith("/suspend")).length, 1);
+  });
+}
+
+test("Render permits only reported app egress ranges and preserves existing database rules", async () => {
+  const fake = fakeRender();
+  fake.network.ips = ["74.220.48.0/24", "74.220.56.0/24", "203.0.113.9", "2001:db8::1", "2001:0db8:0:0::1"];
+  const existing = structuredClone(fake.network.database.ipAllowList);
+  fake.network.before = async (call) => {
+    if (call.method === "PATCH") {
+      assert.equal((await fake.store.get(ID))?.serviceId, SERVICE);
+      assert.equal((await fake.store.get(ID))?.status, "pending");
+      assert.equal(fake.gateway.services.size, 0);
+    }
+    return undefined;
+  };
+  await fake.provider().apply(deployment, version);
+  assert.deepEqual(fake.network.database.ipAllowList, [
+    ...existing,
+    ...["74.220.48.0/24", "74.220.56.0/24", "203.0.113.9/32", "2001:db8::1/128"].map((cidrBlock) => ({
+      cidrBlock,
+      description: "QM Render app outbound IP range",
+    })),
+  ]);
+  await fake.provider().apply(deployment, { ...version, version: 2 });
+  assert.equal(fake.network.calls.filter((call) => call.method === "PATCH").length, 1);
+});
+
+test("Render recognizes database rules after the API normalizes their network addresses", async () => {
+  const fake = fakeRender();
+  fake.network.ips = ["74.220.48.12/24", "2001:0db8:0:0::1/64"];
+  fake.network.database.ipAllowList = [
+    { cidrBlock: "74.220.48.0/24", description: "Shared egress" },
+    { cidrBlock: "2001:db8::/64", description: "IPv6 egress" },
+  ];
+  await fake.provider().apply(deployment, version);
+  assert.ok(fake.network.calls.every((call) => call.method === "GET"));
+});
+
+for (const ips of [
+  [],
+  ["0.0.0.0/0"],
+  ["::/0"],
+  ["1.2.3.4/33"],
+  ["2001:db8::1/129"],
+  ["1.2.3.4/24/32"],
+  ["bad"],
+  ["fe80::1%eth0"],
+]) {
+  test(`Render rejects invalid or unrestricted database egress: ${JSON.stringify(ips)}`, async () => {
+    const fake = fakeRender();
+    fake.network.ips = ips;
+    await assert.rejects(fake.provider().apply(deployment, version), /outbound IP/);
+    assert.ok(fake.network.calls.every((call) => call.method === "GET"));
+    assert.equal((await fake.store.get(ID))?.serviceId, SERVICE);
+  });
+}
+
+for (const mismatch of ["id", "owner", "region", "environment", "project"] as const) {
+  test(`Render refuses database network changes for an unexpected ${mismatch}`, async () => {
+    const fake = fakeRender();
+    fake.network.ips = ["203.0.113.2"];
+    if (mismatch === "id") fake.network.database.id = "dpg-other-a";
+    if (mismatch === "owner") fake.network.database.owner.id = "tea-other";
+    if (mismatch === "region") fake.network.database.region = "frankfurt";
+    if (mismatch === "environment") fake.network.database.environmentId = "";
+    if (mismatch === "project") fake.network.projectId = "prj-other";
+    await assert.rejects(fake.provider().apply(deployment, version), /database (does not match|belongs to another)/);
+    assert.ok(fake.network.calls.every((call) => call.method === "GET"));
+  });
+}
+
+for (const failure of ["rejected", "lost response", "not applied"] as const) {
+  test(`Render retains a created app after its database rule update is ${failure}`, async () => {
+    const fake = fakeRender();
+    fake.network.ips = ["203.0.113.2"];
+    fake.network.before = async (call) => {
+      if (call.method !== "PATCH") return undefined;
+      if (failure === "rejected") return Response.json({}, { status: 403 });
+      if (failure === "not applied") return Response.json(fake.network.database);
+      fake.network.database.ipAllowList = (
+        call.body as { ipAllowList: typeof fake.network.database.ipAllowList }
+      ).ipAllowList;
+      throw new TypeError("Database update response was lost");
+    };
+    await assert.rejects(fake.provider().apply(deployment, version), /still pending/);
+    assert.equal((await fake.store.get(ID))?.serviceId, SERVICE);
+    assert.equal((await fake.store.get(ID))?.status, "pending");
+    assert.deepEqual(fake.revoked, []);
+    assert.ok(fake.calls.every((call) => !/\/(cancel|suspend)$/.test(call.path) && call.method !== "DELETE"));
+    fake.network.before = undefined;
+    await fake.provider().apply(deployment, version);
+    assert.equal((await fake.store.get(ID))?.status, "live");
+    assert.equal(fake.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 1);
+    assert.equal(
+      fake.network.calls.filter((call) => call.method === "PATCH").length,
+      failure === "lost response" ? 1 : 2,
+    );
+  });
+}
+
+test("Render authorizes changed outbound ranges before resuming a transferred app", async () => {
+  const fake = fakeRender();
+  const provider = fake.provider();
+  await provider.apply(deployment, version);
+  const nextOwner = scopeId("personal", "U2");
+  await provider.transferOwnership(deployment, nextOwner);
+  fake.network.ips = ["203.0.113.2"];
+  fake.network.before = async (call) => {
+    if (call.method === "PATCH") {
+      assert.equal(fake.appService().suspended, "suspended");
+      assert.equal((await fake.store.get(ID))?.ownerScopeId, nextOwner);
+      assert.ok(fake.calls.every((call) => !call.path.endsWith("/resume")));
+    }
+    return undefined;
+  };
+  await provider.apply({ ...deployment, ownerScopeId: nextOwner }, version);
+  assert.equal(fake.network.database.ipAllowList.at(-1)?.cidrBlock, "203.0.113.2/32");
+});
+
+test("Render serializes database rule updates for different app owners", async () => {
+  const first = fakeRender();
+  const second = fakeRender();
+  second.network.database = first.network.database;
+  first.network.ips = ["203.0.113.2"];
+  second.network.ips = ["203.0.113.3"];
+  const ready = Promise.withResolvers<void>();
+  let reading = 0;
+  for (const fake of [first, second]) {
+    let held = false;
+    fake.network.before = async (call) => {
+      if (call.method === "GET" && call.path.startsWith("/postgres/") && !held) {
+        held = true;
+        if (++reading === 2) ready.resolve();
+        await ready.promise;
+      }
+      return undefined;
+    };
+  }
+  const advisoryLock = createMemoryAdvisoryLock();
+  await Promise.all([
+    first.provider({ advisoryLock }).apply(deployment, version),
+    second.provider({ advisoryLock }).apply({ ...deployment, ownerScopeId: scopeId("personal", "U2") }, version),
+  ]);
+  assert.deepEqual(
+    new Set(first.network.database.ipAllowList.map((rule) => rule.cidrBlock)),
+    new Set(["203.0.113.1/32", "203.0.113.2/32", "203.0.113.3/32"]),
+  );
+});
+
+test("Render does not discard database rules when the allowlist is full", async () => {
+  const fake = fakeRender();
+  fake.network.database.ipAllowList = Array.from({ length: 600 }, (_, i) => ({
+    cidrBlock: `10.0.${Math.floor(i / 256)}.${i % 256}/32`,
+    description: `Retained rule ${i}`,
+  }));
+  await assert.rejects(fake.provider().apply(deployment, version), /allowlist is full/);
+  assert.ok(fake.network.calls.every((call) => call.method === "GET"));
+  assert.equal(fake.network.database.ipAllowList.length, 600);
 });

@@ -178,3 +178,246 @@ test("pg sandbox activation fences publication from a separate compatible reader
     await pgB.close();
   }
 });
+
+function sessionFixture(beforeQuery?: (sql: string, key: string) => Promise<void>) {
+  const clients: { released: boolean; discarded: boolean; held: Set<string> }[] = [];
+  const owners = new Map<string, object>();
+  const pg = {
+    sessionPool: async () => ({
+      connect: async () => {
+        const state = { released: false, discarded: false, held: new Set<string>() };
+        clients.push(state);
+        return {
+          async query(sql: string, [key]: [string]) {
+            assert.equal(state.released, false, "A released session must not receive queries");
+            await beforeQuery?.(sql, key);
+            if (sql.includes("pg_try_advisory_lock")) {
+              const locked = !owners.has(key) || owners.get(key) === state;
+              if (locked) {
+                owners.set(key, state);
+                state.held.add(key);
+              }
+              return { rows: [{ locked }] };
+            }
+            assert.equal(owners.get(key), state);
+            owners.delete(key);
+            state.held.delete(key);
+            return { rows: [{ unlocked: true }] };
+          },
+          release(discarded: boolean) {
+            assert.equal(state.released, false, "Each session must be released once");
+            state.released = true;
+            state.discarded = discarded;
+            if (!discarded) assert.equal(state.held.size, 0, "A healthy released session must hold no locks");
+            for (const key of state.held) owners.delete(key);
+            state.held.clear();
+          },
+        };
+      },
+    }),
+  } as unknown as import("../src/persistence/pg-pool.ts").PgPool;
+  const lock = createPostgresAdvisoryLock(pg, { pollMs: 1, timeoutMs: 1_000 });
+  return { lock, clients, owners };
+}
+
+test("pg mutex: nested calls reject active ancestor keys and serialize sibling keys on one session", async () => {
+  const { lock, clients, owners } = sessionFixture();
+  let active = 0;
+  let maximum = 0;
+  await lock.withLock("outer", async () => {
+    assert.equal(await lock.tryWithLock!("outer", async () => "must not run"), null);
+    await assert.rejects(
+      lock.withLock("outer", async () => "must not run"),
+      /already held by this callback/,
+    );
+    await Promise.all(
+      Array.from({ length: 4 }, () =>
+        lock.withLock("inner", async () => {
+          active++;
+          maximum = Math.max(maximum, active);
+          assert.equal(await lock.tryWithLock!("inner", async () => "must not run"), null);
+          assert.equal(owners.has("outer"), true);
+          await sleep(5);
+          active--;
+        }),
+      ),
+    );
+  });
+  assert.equal(maximum, 1);
+  assert.equal(clients.length, 1);
+  assert.equal(clients[0]!.released, true);
+  assert.equal(clients[0]!.discarded, false);
+});
+
+test("pg mutex: a detached call after its callback ends opens a new session", async () => {
+  const { lock, clients } = sessionFixture();
+  const start = Promise.withResolvers<void>();
+  let detached!: Promise<string | null>;
+  await lock.withLock("outer", async () => {
+    detached = (async () => {
+      await start.promise;
+      return lock.tryWithLock!("outer", async () => "detached");
+    })();
+  });
+  assert.equal(clients[0]!.released, true);
+  start.resolve();
+  assert.equal(await detached, "detached");
+  assert.equal(clients.length, 2);
+  assert.ok(clients.every((client) => client.released && !client.discarded));
+});
+
+test("pg mutex: a nested call retains its session while its acquire query is pending after the parent ends", async () => {
+  const entered = Promise.withResolvers<void>();
+  const continueQuery = Promise.withResolvers<void>();
+  const { lock, clients, owners } = sessionFixture(async (sql, key) => {
+    if (key === "inner" && sql.includes("pg_try_advisory_lock")) {
+      entered.resolve();
+      await continueQuery.promise;
+    }
+  });
+  let detached!: Promise<string>;
+  await lock.withLock("outer", async () => {
+    detached = lock.withLock("inner", async () => {
+      assert.equal(clients[0]!.released, false);
+      assert.equal(owners.has("outer"), false);
+      return "retained";
+    });
+    await entered.promise;
+  });
+  assert.equal(clients[0]!.released, false);
+  continueQuery.resolve();
+  assert.equal(await detached, "retained");
+  assert.equal(clients.length, 1);
+  assert.equal(clients[0]!.released, true);
+});
+
+test("pg mutex: active detached children keep the lease but inactive sibling scopes cannot reuse it", async () => {
+  const { lock, clients } = sessionFixture();
+  const childEntered = Promise.withResolvers<void>();
+  const finishChild = Promise.withResolvers<void>();
+  const startSibling = Promise.withResolvers<void>();
+  let child!: Promise<void>;
+  let sibling!: Promise<void>;
+  await lock.withLock("outer", async () => {
+    child = lock.withLock("child", async () => {
+      childEntered.resolve();
+      await finishChild.promise;
+    });
+    sibling = (async () => {
+      await startSibling.promise;
+      await lock.withLock("sibling", async () => undefined);
+    })();
+    await childEntered.promise;
+  });
+  assert.equal(clients[0]!.released, false);
+  startSibling.resolve();
+  await sibling;
+  assert.equal(clients.length, 2);
+  assert.equal(clients[0]!.released, false);
+  assert.equal(clients[1]!.released, true);
+  finishChild.resolve();
+  await child;
+  assert.equal(clients[0]!.released, true);
+});
+
+test("pg mutex: failed acquire and unlock queries discard the session after all borrowers exit", async () => {
+  for (const failedStatement of ["pg_try_advisory_lock", "pg_advisory_unlock"]) {
+    const { lock, clients, owners } = sessionFixture(async (sql, key) => {
+      if (key === "inner" && sql.includes(failedStatement)) throw new Error("query failed");
+    });
+    await lock.withLock("outer", async () => {
+      await assert.rejects(
+        lock.withLock("inner", async () => undefined),
+        /query failed/,
+      );
+      assert.equal(owners.has("outer"), true);
+      assert.equal(clients[0]!.released, false);
+      await assert.rejects(
+        lock.withLock("another", async () => undefined),
+        /session failed/,
+      );
+    });
+    assert.equal(clients.length, 1);
+    assert.equal(clients[0]!.released, true);
+    assert.equal(clients[0]!.discarded, true);
+    assert.equal(owners.size, 0);
+  }
+});
+
+test(
+  "pg mutex: nested distinct keys and concurrent publishes use a session pool with one connection",
+  { skip, timeout: 10_000 },
+  async () => {
+    const { Pool } = await import("pg");
+    const pool = new Pool({ connectionString: URL!, max: 1, connectionTimeoutMillis: 1_000 });
+    const observer = new Pool({ connectionString: URL!, max: 1, connectionTimeoutMillis: 1_000 });
+    const pg = { sessionPool: async () => pool } as unknown as import("../src/persistence/pg-pool.ts").PgPool;
+    const lock = createPostgresAdvisoryLock(pg, { pollMs: 5, timeoutMs: 1_000 });
+    const prefix = `nested-${Date.now()}-${Math.random()}`;
+    let active = 0;
+    let maximum = 0;
+    try {
+      await Promise.all(
+        Array.from({ length: 8 }, (_, index) =>
+          lock.withLock(`${prefix}:app:${index}`, async () => {
+            await lock.withLock(`${prefix}:owner`, async () => {
+              active++;
+              maximum = Math.max(maximum, active);
+              assert.equal(await lock.tryWithLock!(`${prefix}:app:${index}`, async () => "must not run"), null);
+              await assert.rejects(
+                lock.withLock(`${prefix}:failure`, async () => {
+                  throw new Error("callback failed");
+                }),
+                /callback failed/,
+              );
+              const held = await observer.query<{ locked: boolean }>(
+                "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
+                [`${prefix}:app:${index}`],
+              );
+              assert.equal(held.rows[0]!.locked, false, "The outer lock remains held after the inner callback throws");
+              await sleep(5);
+              active--;
+            });
+          }),
+        ),
+      );
+      assert.equal(maximum, 1);
+      await lock.withLock(`${prefix}:siblings`, async () => {
+        await Promise.all(
+          Array.from({ length: 4 }, () =>
+            lock.withLock(`${prefix}:shared`, async () => {
+              active++;
+              maximum = Math.max(maximum, active);
+              await sleep(5);
+              active--;
+            }),
+          ),
+        );
+      });
+      assert.equal(maximum, 1, "Nested sibling callbacks do not overlap on a shared PostgreSQL session");
+      const bothEntered = Promise.withResolvers<void>();
+      await lock.withLock(`${prefix}:parallel`, async () => {
+        await Promise.all(
+          ["first", "second"].map((key) =>
+            lock.withLock(`${prefix}:${key}`, async () => {
+              active++;
+              maximum = Math.max(maximum, active);
+              if (active === 2) bothEntered.resolve();
+              await bothEntered.promise;
+              active--;
+            }),
+          ),
+        );
+      });
+      assert.equal(maximum, 2, "Nested distinct keys can run at the same time on one session");
+      assert.equal(pool.totalCount, 1);
+      const remaining = await pool.query<{ count: string }>(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+      );
+      assert.equal(remaining.rows[0]!.count, "0");
+    } finally {
+      await pool.end();
+      await observer.end();
+    }
+  },
+);

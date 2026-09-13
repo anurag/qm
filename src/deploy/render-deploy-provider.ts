@@ -1,4 +1,5 @@
 import { Agent, fetch as undiciFetch } from "undici";
+import { BlockList, isIP } from "node:net";
 import type { RenderDeployArtifactAccess } from "./render-deploy-artifacts.ts";
 import { LRUCache } from "lru-cache";
 import type { Deployment, DeploymentVersion } from "./deploy-store.ts";
@@ -7,6 +8,8 @@ import { createKeyedQueue, sleep } from "../util/async.ts";
 import { swallow } from "../util/errors.ts";
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
+import { createRenderDeployGateways, type StoredRenderGateway } from "./render-deploy-gateways.ts";
+import type { ScopeId } from "../types.ts";
 
 const API_URL = "https://api.render.com/v1";
 const APP_PORT = 8080;
@@ -57,6 +60,9 @@ interface RenderDeployPage {
 
 export interface StoredRenderDeploy {
   deploymentId: string;
+  ownerScopeId: ScopeId;
+  environmentId: string;
+  transfer?: { ownerScopeId: ScopeId; environmentId: string };
   version: number;
   status: "pending" | "live" | "failed" | "suspending" | "suspended";
   createdService: boolean;
@@ -69,6 +75,8 @@ export interface StoredRenderDeploy {
 export interface RenderDeployProviderOptions {
   apiKey: string;
   workspaceId: string;
+  projectId: string;
+  postgresId: string;
   baseImage?: string;
   source?: { repo: string; branch: string };
   region?: string;
@@ -77,6 +85,7 @@ export interface RenderDeployProviderOptions {
   appPrefix?: string;
   registryCredentialId?: string;
   store: DurableMap<StoredRenderDeploy>;
+  gatewayStore: DurableMap<StoredRenderGateway>;
   artifacts: {
     prepare(deployment: Deployment, version: DeploymentVersion): Promise<RenderDeployArtifactAccess>;
     revoke(deploymentId: string): Promise<void>;
@@ -97,21 +106,36 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
   const inflightResolves = new Map<string, Promise<DeployEndpoint | null>>();
   const queue = createKeyedQueue<string>();
   const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const gateways = createRenderDeployGateways({
+    request,
+    workspaceId: opts.workspaceId,
+    projectId: opts.projectId,
+    region,
+    prefix,
+    store: opts.gatewayStore,
+    timeoutMs,
+    pollMs,
+    fetchImpl: fetchImpl as typeof fetch,
+  });
   const invalidate = (id: string): void => {
     resolveCache.delete(id);
     inflightResolves.delete(id);
   };
-  const serialized = <T>(deployment: Deployment, fn: () => Promise<T>): Promise<T> =>
-    queue(deployment.id, () =>
-      advisoryLock.withLock(`render-deploy:${deployment.id}`, async () => {
+  const withOwners = <T>(owners: string[], fn: () => Promise<T>): Promise<T> => {
+    const [owner, ...rest] = [...new Set(owners)].sort();
+    return owner === undefined
+      ? fn()
+      : queue(owner, () => advisoryLock.withLock(`render-deploy-owner:${owner}`, () => withOwners(rest, fn)));
+  };
+  const serialized = <T>(deployment: Deployment, fn: () => Promise<T>, toScope?: ScopeId): Promise<T> =>
+    withOwners([deployment.ownerScopeId, ...(toScope ? [toScope] : [])], async () => {
+      invalidate(deployment.id);
+      try {
+        return await fn();
+      } finally {
         invalidate(deployment.id);
-        try {
-          return await fn();
-        } finally {
-          invalidate(deployment.id);
-        }
-      }),
-    );
+      }
+    });
 
   async function request<T>(
     method: string,
@@ -168,6 +192,9 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
   function ensureConfigured(): void {
     if (!opts.apiKey) throw new Error("RENDER_API_KEY is required for DEPLOY_PROVIDER=render");
     if (!opts.workspaceId) throw new Error("RENDER_WORKSPACE_ID is required for DEPLOY_PROVIDER=render");
+    if (!/^prj-[a-z0-9]+$/.test(opts.projectId)) throw new Error("RENDER_PROJECT_ID must be a project ID (prj-...)");
+    if (!/^dpg-[a-z0-9]+(?:-a)?$/.test(opts.postgresId))
+      throw new Error("RENDER_POSTGRES_ID must be a PostgreSQL ID (dpg-...)");
     if (!opts.baseImage && !opts.source)
       throw new Error(
         "RENDER_DEPLOY_IMAGE or RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH are required for DEPLOY_PROVIDER=render",
@@ -189,12 +216,19 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     deployment: Deployment,
     deadline?: number,
   ): Promise<RenderService> {
+    const record = await opts.store.get(deployment.id);
+    if (record && record.ownerScopeId !== deployment.ownerScopeId)
+      throw new Error(`Render app ${deployment.id} belongs to another ownership scope`);
+    if (record?.transfer) throw new Error(`Render app ${deployment.id} has an incomplete ownership transfer`);
+    const environmentId =
+      record?.environmentId ?? (await opts.gatewayStore.get(deployment.ownerScopeId))?.environmentId;
     if (
       service.name !== nameOf(deployment) ||
       service.ownerId !== opts.workspaceId ||
       service.type !== "private_service" ||
       service.serviceDetails.region !== region ||
-      (opts.environmentId !== undefined && service.environmentId !== opts.environmentId)
+      !environmentId ||
+      service.environmentId !== environmentId
     )
       throw new Error(`Render service ${service.name} is not the expected private app service in ${region}`);
     if (service.serviceDetails.disk || service.serviceDetails.numInstances !== 1)
@@ -302,6 +336,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
 
   async function unconfirmed(deployment: Deployment): Promise<boolean> {
     const record = await opts.store.get(deployment.id);
+    if (record?.transfer || (record && record.ownerScopeId !== deployment.ownerScopeId))
+      throw new Error(`Render app ${deployment.id} has an incomplete ownership transfer`);
     return (
       record !== null &&
       ((record.status === "pending" && record.liveVersion === undefined) ||
@@ -340,10 +376,84 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         if (service.suspended !== "suspended") await sleep(Math.max(1, pollMs));
       }
       await opts.artifacts.revoke(deployment.id);
+      await gateways.remove(deployment.ownerScopeId, deployment.id);
       await save({ ...pending, status: "suspended", createdService: false });
     } catch (error) {
       throw pendingError(pending, error);
     }
+  }
+
+  async function allowDatabaseAccess(service: RenderService): Promise<void> {
+    const range = (value: string, allowAll = false) => {
+      if (typeof value !== "string") throw new Error("Render returned an invalid outbound IP range");
+      const [address, mask, ...extra] = value.split("/");
+      const version = isIP(address!);
+      const maxPrefix = version === 4 ? 32 : 128;
+      const prefix = mask === undefined ? maxPrefix : Number(mask);
+      if (
+        !version ||
+        address!.includes("%") ||
+        extra.length ||
+        (mask !== undefined && !/^\d+$/.test(mask)) ||
+        !Number.isInteger(prefix) ||
+        prefix < (allowAll ? 0 : 1) ||
+        prefix > maxPrefix
+      )
+        throw new Error("Render returned an invalid outbound IP range");
+      const family = version === 4 ? ("ipv4" as const) : ("ipv6" as const);
+      const block = new BlockList();
+      block.addSubnet(address!, prefix, family);
+      return { cidrBlock: `${address}/${prefix}`, address: address!, prefix, family, block };
+    };
+    const same = (a: ReturnType<typeof range>, b: ReturnType<typeof range>) =>
+      a.prefix === b.prefix && a.family === b.family && a.block.check(b.address, b.family);
+    const outbound = await request<{ ips: string[] }>("GET", `${pathOf(service)}/outbound-ips`);
+    if (!Array.isArray(outbound?.ips) || !outbound.ips.length)
+      throw new Error("Render app outbound IP ranges are unavailable");
+    const reported = outbound.ips.map((ip) => range(ip));
+    const required = reported.filter((value, index) => !reported.slice(0, index).some((prior) => same(value, prior)));
+    const path = `/postgres/${encodeURIComponent(opts.postgresId)}`;
+    const read = async () => {
+      const database = await request<{
+        id: string;
+        owner: { id: string };
+        region: string;
+        environmentId?: string;
+        ipAllowList: Array<{ cidrBlock: string; description: string }>;
+      }>("GET", path);
+      if (
+        database?.id !== opts.postgresId ||
+        database.owner?.id !== opts.workspaceId ||
+        database.region !== region ||
+        !database.environmentId ||
+        !Array.isArray(database.ipAllowList)
+      )
+        throw new Error("Render app database does not match the configured workspace and region");
+      const environment = await request<{ id: string; projectId: string }>(
+        "GET",
+        `/environments/${encodeURIComponent(database.environmentId)}`,
+      );
+      if (environment?.id !== database.environmentId || environment.projectId !== opts.projectId)
+        throw new Error("Render app database belongs to another project");
+      return database.ipAllowList;
+    };
+    const missing = (rules: Array<{ cidrBlock: string }>) => {
+      const existing = rules.map((rule) => range(rule.cidrBlock, true));
+      return required.filter((wanted) => !existing.some((current) => same(wanted, current)));
+    };
+    if (!missing(await read()).length) return;
+    await advisoryLock.withLock(`render-app-database-network:${opts.postgresId}`, async () => {
+      const current = await read();
+      const additions = missing(current);
+      if (!additions.length) return;
+      const ipAllowList = [
+        ...current,
+        ...additions.map(({ cidrBlock }) => ({ cidrBlock, description: "QM Render app outbound IP range" })),
+      ];
+      if (ipAllowList.length > 600) throw new Error("Render app database IP allowlist is full");
+      await request("PATCH", path, { ipAllowList });
+      if (missing(await read()).length) throw new Error("Render app database network access is not confirmed");
+    });
   }
 
   async function waitLive(deployment: Deployment, initial: StoredRenderDeploy): Promise<RenderService> {
@@ -351,20 +461,22 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     let record = initial;
     let service: RenderService | null = null;
     let status: string | undefined;
+    let databaseReady = false;
     const previous = new Set(record.previousDeployIds);
     const finish = async (deploy: RenderDeploy): Promise<boolean> => {
       status = deploy.status;
       if (status !== "live" && !FAILED_DEPLOYS.has(status ?? "")) return false;
       if (status === "live") {
-        const endpoint = endpointOf(service!);
+        const endpoint = await gateways.upsert(deployment.ownerScopeId, deployment.id, endpointOf(service!));
         const dispatcher = new Agent({ pipelining: 0 });
         try {
           const requestOptions = {
+            headers: endpoint.proxyHeaders,
             redirect: "manual" as const,
             signal: AbortSignal.timeout(Math.max(1, Math.min(2_000, deadline - Date.now()))),
             dispatcher,
           };
-          const response = await fetchImpl(`http://${endpoint.host}:${endpoint.port}/`, requestOptions);
+          const response = await fetchImpl(`https://${endpoint.host}:${endpoint.port}/`, requestOptions);
           await response.body?.cancel();
           if (response.status < 200 || response.status >= 500) return false;
         } catch {
@@ -390,6 +502,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
               throw new Error(`Render service identity changed for deployment ${deployment.id}`);
             record = { ...record, serviceId: service.id };
             await save(record);
+            await allowDatabaseAccess(service);
+            databaseReady = true;
           }
         }
         if (service && !record.deployId) {
@@ -420,6 +534,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
           : `Render deploy ${record.deployId ?? "queued"} did not become live within ${Math.round(timeoutMs / 1000)}s`,
       );
     } catch (error) {
+      if (service && !databaseReady) throw pendingError(record, error);
       if (record.status === "pending" && service && record.deployId) {
         const deployPath = `${pathOf(service)}/deploys/${encodeURIComponent(record.deployId)}`;
         const canceled = await request<RenderDeploy>("POST", `${deployPath}/cancel`).catch((cancelError) => {
@@ -447,6 +562,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     apply: (deployment, version) =>
       serialized(deployment, async () => {
         ensureConfigured();
+        const { environmentId } = await gateways.ensure(deployment.ownerScopeId);
         let previous = await opts.store.get(deployment.id);
         if (previous) previous = await recoverRejectedCreate(deployment, previous);
         if ((previous?.status === "failed" && previous.createdService) || previous?.status === "suspending") {
@@ -455,7 +571,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         if (previous?.status === "pending") {
           const recovered = await waitLive(deployment, previous);
-          if (previous.version === version.version) return endpointOf(recovered);
+          if (previous.version === version.version)
+            return gateways.upsert(deployment.ownerScopeId, deployment.id, endpointOf(recovered));
           previous = await opts.store.get(deployment.id);
         }
         let service = await findService(deployment, undefined, previous?.serviceId);
@@ -470,8 +587,9 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
           previous.version === version.version &&
           deployment.appliedVersion !== previous.version
         )
-          return endpointOf(service);
+          return gateways.upsert(deployment.ownerScopeId, deployment.id, endpointOf(service));
         if (service) await waitForIdle(service);
+        if (service) await allowDatabaseAccess(service);
         const artifact = await opts.artifacts.prepare(deployment, version);
         const env = { ...version.env, ...artifact.runtimeEnv, PORT: String(APP_PORT), [OWNER_MARKER]: deployment.id };
         const envVars = Object.entries(env).map(([key, value]) => ({ key, value }));
@@ -508,6 +626,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         const liveVersion = previous?.liveVersion ?? deployment.appliedVersion;
         let record: StoredRenderDeploy = {
           deploymentId: deployment.id,
+          ownerScopeId: deployment.ownerScopeId,
+          environmentId,
           version: version.version,
           status: "pending",
           createdService: !service,
@@ -522,7 +642,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
               type: "private_service",
               name: nameOf(deployment),
               ownerId: opts.workspaceId,
-              ...(opts.environmentId ? { environmentId: opts.environmentId } : {}),
+              environmentId,
               autoDeploy: "no",
               ...source,
               envVars,
@@ -559,7 +679,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
           }
           swallow("render-deploy: reconcile uncertain request", error);
         }
-        return endpointOf(await waitLive(deployment, record));
+        return gateways.upsert(deployment.ownerScopeId, deployment.id, endpointOf(await waitLive(deployment, record)));
       }),
     async resolveEndpoint(deployment) {
       ensureConfigured();
@@ -573,7 +693,9 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         const service = await findService(deployment, undefined, record?.serviceId);
         if (!service || service.suspended === "suspended") return null;
         const deploys = await request<RenderDeployPage[]>("GET", `${pathOf(service)}/deploys?status=live&limit=1`);
-        return deploys?.some(({ deploy }) => deploy.status === "live") ? endpointOf(service) : null;
+        return deploys?.some(({ deploy }) => deploy.status === "live")
+          ? gateways.endpoint(deployment.ownerScopeId, deployment.id)
+          : null;
       })()
         .then(async (endpoint) => {
           if (await unconfirmed(deployment)) return null;
@@ -619,6 +741,65 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       }
       return messages.reverse().join("\n");
     },
+    transferOwnership: (deployment, toScope) =>
+      serialized(
+        deployment,
+        async () => {
+          ensureConfigured();
+          let record = await opts.store.get(deployment.id);
+          if (!record) return;
+          if (record.ownerScopeId === toScope && record.status === "suspended" && !record.transfer) return;
+          if (record.transfer && record.transfer.ownerScopeId !== toScope)
+            throw new Error(`Render app ${deployment.id} has an incomplete ownership transfer`);
+          const target = await gateways.ensure(toScope);
+          if (!record.transfer) {
+            if (record.status === "pending") await waitLive(deployment, record);
+            record = (await opts.store.get(deployment.id))!;
+            await suspendService(deployment, record);
+            record = {
+              ...(await opts.store.get(deployment.id))!,
+              transfer: { ownerScopeId: toScope, environmentId: target.environmentId },
+            };
+            await save(record);
+          }
+          const servicePath = `/services/${encodeURIComponent(record.serviceId!)}`;
+          let service = await request<RenderService>("GET", servicePath);
+          if (
+            !service ||
+            service.id !== record.serviceId ||
+            service.name !== nameOf(deployment) ||
+            service.ownerId !== opts.workspaceId ||
+            service.type !== "private_service" ||
+            service.suspended !== "suspended" ||
+            service.serviceDetails.region !== region ||
+            !service.environmentId ||
+            ![record.environmentId, target.environmentId].includes(service.environmentId)
+          )
+            throw new Error(`Render app ${deployment.id} is not the expected suspended service`);
+          const marker = await request<{ value: string }>("GET", `${servicePath}/env-vars/${OWNER_MARKER}`);
+          if (marker?.value !== deployment.id)
+            throw new Error(`Render service ${service.name} belongs to another deployment`);
+          if (service.environmentId !== target.environmentId) {
+            try {
+              await request("POST", `/environments/${target.environmentId}/resources`, { resourceIds: [service.id] });
+            } catch (error) {
+              service = await request<RenderService>("GET", servicePath);
+              if (service?.environmentId !== target.environmentId) throw error;
+            }
+          }
+          service = await request<RenderService>("GET", servicePath);
+          if (service?.environmentId !== target.environmentId || service.suspended !== "suspended")
+            throw new Error(`Render app ${deployment.id} ownership transfer is not confirmed`);
+          await save({
+            ...record,
+            ownerScopeId: toScope,
+            environmentId: target.environmentId,
+            transfer: undefined,
+            status: "suspended",
+          });
+        },
+        toScope,
+      ),
     destroy: (deployment) =>
       serialized(deployment, async () => {
         ensureConfigured();
@@ -632,6 +813,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         if (service) {
           await suspendService(deployment, {
             deploymentId: deployment.id,
+            ownerScopeId: deployment.ownerScopeId,
+            environmentId: service.environmentId!,
             version: deployment.currentVersion,
             status: "suspending",
             createdService: false,
@@ -640,6 +823,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
           });
         } else {
           await opts.artifacts.revoke(deployment.id);
+          await gateways.remove(deployment.ownerScopeId, deployment.id);
         }
       }),
   };

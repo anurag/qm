@@ -1,4 +1,5 @@
 import type { Deployment, DeployEndpoint, DeploymentVersion } from "./deploy-store.ts";
+import type { ScopeId } from "../types.ts";
 
 export type { DeployEndpoint };
 
@@ -21,6 +22,7 @@ export interface DeployProvider {
   apply(d: Deployment, version: DeploymentVersion): Promise<DeployEndpoint>;
   reconcile?(d: Deployment, version: DeploymentVersion, input: DeployReconcileInput): Promise<DeployEndpoint>;
   destroy(d: Deployment): Promise<void>;
+  transferOwnership?(d: Deployment, toScope: ScopeId): Promise<void>;
   resolveEndpoint?(d: Deployment, version: DeploymentVersion): Promise<DeployEndpoint | null>;
   /** Recent output from the running app (entrypoint stdout+stderr), newest last. */
   logs?(d: Deployment, opts: { tailLines: number }): Promise<string | null>;

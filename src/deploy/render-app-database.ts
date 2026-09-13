@@ -34,8 +34,30 @@ function provisioningFailure(error: unknown): Error {
   return new Error(`Render app database provisioning failed${/^[A-Z0-9]{5}$/.test(code) ? ` (${code})` : ""}`);
 }
 
+export function parseRenderAppDatabaseEndpoint(value: string): URL {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value);
+  } catch {
+    throw new Error("RENDER_APP_DATABASE_ENDPOINT must be a valid PostgreSQL endpoint");
+  }
+  if (
+    !["postgres:", "postgresql:"].includes(endpoint.protocol) ||
+    !endpoint.hostname ||
+    endpoint.username ||
+    endpoint.password ||
+    (endpoint.pathname && endpoint.pathname !== "/") ||
+    endpoint.hash ||
+    endpoint.searchParams.size !== 1 ||
+    endpoint.searchParams.get("sslmode") !== "verify-full"
+  )
+    throw new Error("RENDER_APP_DATABASE_ENDPOINT must omit credentials and a database and use sslmode=verify-full");
+  return endpoint;
+}
+
 export function createRenderAppDatabase(opts: {
   adminUrl: string;
+  appEndpoint?: string;
   store: DurableMap<StoredRenderAppDatabase>;
   keyMaterial: string | Buffer;
 }): { ensure(deploymentId: string): Promise<Record<string, string>> } {
@@ -55,13 +77,14 @@ export function createRenderAppDatabase(opts: {
     [...adminUrl.searchParams.keys()].some((name) => name !== "sslmode")
   )
     throw new Error("Render app databases require a PostgreSQL admin URL for the core database");
+  const appEndpoint = opts.appEndpoint ? parseRenderAppDatabaseEndpoint(opts.appEndpoint) : adminUrl;
   if (!opts.keyMaterial.length) throw new Error("Render app databases require an encryption key");
   const key = deriveConnectorKey(opts.keyMaterial, "render-app-database");
   const identifier = pg.escapeIdentifier;
   const literal = pg.escapeLiteral;
   const marker = (record: StoredRenderAppDatabase) => `qm:render-app:${record.deploymentId}:${record.ownershipToken}`;
-  const connectionUrl = (database: string, login?: { role: string; password: string }): string => {
-    const url = new URL(adminUrl);
+  const connectionUrl = (endpoint: URL, database: string, login?: { role: string; password: string }): string => {
+    const url = new URL(endpoint);
     url.pathname = `/${database}`;
     if (login) {
       url.username = login.role;
@@ -204,7 +227,7 @@ export function createRenderAppDatabase(opts: {
           await client.query(`ALTER DATABASE ${identifier(record.database)} ALLOW_CONNECTIONS true`);
         });
         const appAdmin = new pg.Client({
-          connectionString: connectionUrl(record.database),
+          connectionString: connectionUrl(adminUrl, record.database),
           connectionTimeoutMillis: 10_000,
         });
         appAdmin.on("error", () => {});
@@ -219,8 +242,11 @@ export function createRenderAppDatabase(opts: {
           await appAdmin.end();
         }
         await client.query(`ALTER ROLE ${identifier(record.loginRole)} LOGIN`);
-        const DATABASE_URL = connectionUrl(record.database, { role: record.loginRole, password });
-        const app = new pg.Client({ connectionString: DATABASE_URL, connectionTimeoutMillis: 10_000 });
+        const login = { role: record.loginRole, password };
+        const app = new pg.Client({
+          connectionString: connectionUrl(adminUrl, record.database, login),
+          connectionTimeoutMillis: 10_000,
+        });
         app.on("error", () => {});
         try {
           await app.connect();
@@ -229,7 +255,7 @@ export function createRenderAppDatabase(opts: {
           await app.end();
         }
         if (!record.ready) await opts.store.put(deploymentId, { ...record, ready: true });
-        return { DATABASE_URL };
+        return { DATABASE_URL: connectionUrl(appEndpoint, record.database, login) };
       } catch (error) {
         throw provisioningFailure(error);
       } finally {

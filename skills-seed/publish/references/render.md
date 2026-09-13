@@ -15,6 +15,14 @@ versions during a deployment. For Node.js `pg`, set `max: 5` on the pool. Do not
 Postgres with SQLite or files when the connection is unavailable. Fail startup
 with a clear error that does not include the connection string.
 
+The runtime database URL uses the public Render Postgres endpoint with
+`sslmode=verify-full`. Keep its TLS certificate and hostname checks enabled.
+Do not replace its host with a private Render hostname or disable certificate
+checks. QM provisions the app's database access and service outbound IP rules.
+The private app network is isolated from QM's shared services and other owners.
+Apps with the same owner share a private network, including code that an app
+editor can publish.
+
 Old and new app versions can run at the same time during a deployment. Use a
 migration library that serializes migrations, or hold a Postgres advisory lock on
 one connection while the migration runs. Release the lock on that connection.

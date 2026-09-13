@@ -2,6 +2,7 @@ import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/re
 import { createRenderDeployArtifacts, type StoredRenderDeployCredential } from "./deploy/render-deploy-artifacts.ts";
 import { createRenderAppDatabase, type StoredRenderAppDatabase } from "./deploy/render-app-database.ts";
 import { createRenderAppStorage, type RenderAppStorage } from "./deploy/render-app-storage.ts";
+import type { StoredRenderGateway } from "./deploy/render-deploy-gateways.ts";
 import { createRuntimeService } from "./harness/runtime-control.ts";
 import { createPostgresBrokerSessions, type BrokerSessionStore } from "./auth/broker-sessions.ts";
 import { createDirectFileUploads, type DirectFileUploads } from "./files/direct-file-upload.ts";
@@ -1372,6 +1373,7 @@ export function buildApp(
     config.deployProvider === "render"
       ? createRenderAppDatabase({
           adminUrl: requireDbUrl("DEPLOY_PROVIDER=render"),
+          appEndpoint: config.renderDeploy.appDatabaseEndpoint,
           store: artifactMap<StoredRenderAppDatabase>("render_app_databases"),
           keyMaterial: config.connectorSecretKey ?? "",
         })
@@ -1395,7 +1397,9 @@ export function buildApp(
     return createRenderDeployProvider({
       ...config.renderDeploy,
       store: artifactMap<StoredRenderDeploy>("render_deploy_bodies"),
+      gatewayStore: artifactMap<StoredRenderGateway>("render_deploy_gateways"),
       artifacts: renderDeployArtifacts,
+      advisoryLock,
     });
   };
   const buildAwsDeploy = (): DeployProvider =>

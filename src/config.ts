@@ -1,4 +1,5 @@
 import { existsSync, readdirSync } from "node:fs";
+import { parseRenderAppDatabaseEndpoint } from "./deploy/render-app-database.ts";
 import {
   parseProviderBaseUrl,
   providerBaseUrlsFromEnv,
@@ -415,6 +416,9 @@ function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
 }
 
 interface RenderDeployEnv {
+  projectId: string;
+  postgresId: string;
+  appDatabaseEndpoint: string;
   environmentId?: string;
   apiKey: string;
   workspaceId: string;
@@ -453,10 +457,27 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
     throw new Error("RENDER_DEPLOY_BRANCH must be a valid Git branch name");
   if (repo && baseImage)
     throw new Error("Set RENDER_DEPLOY_IMAGE or RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH, not both");
+  const projectId = env.RENDER_PROJECT_ID?.trim() || "";
+  if (env.DEPLOY_PROVIDER === "render" && !projectId)
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_PROJECT_ID");
+  if (projectId && !/^prj-[a-z0-9]+$/.test(projectId))
+    throw new Error("RENDER_PROJECT_ID must be a project ID (prj-...)");
+  const postgresId = env.RENDER_POSTGRES_ID?.trim() || "";
+  if (env.DEPLOY_PROVIDER === "render" && !postgresId)
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_POSTGRES_ID");
+  if (postgresId && !/^dpg-[a-z0-9]+(?:-a)?$/.test(postgresId))
+    throw new Error("RENDER_POSTGRES_ID must be a PostgreSQL ID (dpg-...)");
+  const appDatabaseEndpoint = env.RENDER_APP_DATABASE_ENDPOINT?.trim() || "";
+  if (env.DEPLOY_PROVIDER === "render" && !appDatabaseEndpoint)
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_APP_DATABASE_ENDPOINT");
+  if (appDatabaseEndpoint) parseRenderAppDatabaseEndpoint(appDatabaseEndpoint);
   const environmentId = env.RENDER_ENVIRONMENT_ID?.trim();
   if (environmentId && !/^evm-[a-z0-9]+$/.test(environmentId))
     throw new Error("RENDER_ENVIRONMENT_ID must be an environment ID (evm-...)");
   return {
+    projectId,
+    postgresId,
+    appDatabaseEndpoint,
     ...(environmentId ? { environmentId } : {}),
     apiKey: env.RENDER_API_KEY?.trim() || "",
     workspaceId: env.RENDER_WORKSPACE_ID?.trim() || "",

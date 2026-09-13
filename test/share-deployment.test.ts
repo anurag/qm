@@ -23,10 +23,11 @@ import type { CapabilityClaims } from "../src/auth/capability-token.ts";
 import type { RecipientResolution } from "../src/directory/directory-store.ts";
 import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
 import { scopeId } from "../src/types.ts";
+import type { DeployProvider } from "../src/deploy/deploy-provider.ts";
 
 type Dir = { resolve: (orgId: string, q: string) => Promise<RecipientResolution> };
 
-function makeDeploy(): { deploy: DeployService; acl: AclStore } {
+function makeDeploy(transferOwnership?: DeployProvider["transferOwnership"]): { deploy: DeployService; acl: AclStore } {
   const acl: AclStore = createAclStore();
   const deploy = createDeployService({
     deployStore: createDeployStore(),
@@ -34,6 +35,7 @@ function makeDeploy(): { deploy: DeployService; acl: AclStore } {
       profile: { managedScaleToZero: false },
       apply: async () => ({ host: "127.0.0.1", port: 20200 }),
       destroy: async () => {},
+      transferOwnership,
     },
     auditLog: { record() {}, events: async () => [], tail: async () => [] },
     acl,
@@ -476,4 +478,59 @@ test("transferDeploymentOwner to the current home is a no-op", async () => {
   const after = (await deploy.listDeployments()).find((x) => x.id === d.id)!;
   assert.equal(after.ownerScopeId, scopeId("personal", "U1"));
   assert.equal((await acl.list()).length, 0, "no self-grant sprayed by a no-op transfer");
+});
+
+test("ownership transfer completes provider isolation before changing permissions", async () => {
+  let failed = true;
+  const seen: string[] = [];
+  const { deploy, acl } = makeDeploy(async (app, target) => {
+    assert.equal((await deploy.getDeployment(app.id))?.ownerScopeId, scopeId("personal", "U1"));
+    seen.push(target);
+    if (failed) throw new Error("environment move not confirmed");
+  });
+  const app = await deploy.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "x",
+    files: [],
+  });
+  await deploy.shareDeployment(app.id, scopeId("personal", "U3"), "read", { createdBy: "U1" });
+  const grants = await acl.list();
+  await assert.rejects(
+    deploy.transferDeploymentOwner(app.id, scopeId("personal", "U2"), { callerId: "U1" }),
+    /move not confirmed/,
+  );
+  assert.equal((await deploy.getDeployment(app.id))?.ownerScopeId, scopeId("personal", "U1"));
+  assert.deepEqual(await acl.list(), grants);
+  failed = false;
+  await deploy.transferDeploymentOwner(app.id, scopeId("personal", "U2"), { callerId: "U1" });
+  assert.equal((await deploy.getDeployment(app.id))?.ownerScopeId, scopeId("personal", "U2"));
+  assert.deepEqual(seen, ["personal:U2", "personal:U2"]);
+});
+
+test("concurrent ownership transfers recheck the owner after taking the deployment lock", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let calls = 0;
+  const { deploy } = makeDeploy(async () => {
+    calls++;
+    entered.resolve();
+    await release.promise;
+  });
+  const app = await deploy.deploy({
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    entrypoint: "x",
+    files: [],
+  });
+  const first = deploy.transferDeploymentOwner(app.id, scopeId("personal", "U2"), { callerId: "U1" });
+  await entered.promise;
+  const second = assert.rejects(
+    deploy.transferDeploymentOwner(app.id, scopeId("personal", "U3"), { callerId: "U1" }),
+    /only the owner/,
+  );
+  release.resolve();
+  await Promise.all([first, second]);
+  assert.equal(calls, 1);
+  assert.equal((await deploy.getDeployment(app.id))?.ownerScopeId, scopeId("personal", "U2"));
 });

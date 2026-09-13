@@ -51,7 +51,15 @@ export function renderServiceEnv(
   config: QmConfig,
   service: string,
   values: ReadonlyMap<string, string>,
-  connections: { databaseUrl: string; coreUrl: string; webUiUrl?: string; environmentId?: string },
+  connections: {
+    databaseUrl: string;
+    coreUrl: string;
+    webUiUrl?: string;
+    projectId?: string;
+    environmentId?: string;
+    postgresId?: string;
+    appDatabaseEndpoint?: string;
+  },
   plugin?: ResolvedPlugin,
 ): Record<string, string> {
   const render = config.render;
@@ -111,6 +119,9 @@ export function renderServiceEnv(
       DEPLOY_PROVIDER: "render",
       RENDER_WORKSPACE_ID: render.workspaceId,
       RENDER_REGION: render.region,
+      ...(connections.projectId ? { RENDER_PROJECT_ID: connections.projectId } : {}),
+      ...(connections.postgresId ? { RENDER_POSTGRES_ID: connections.postgresId } : {}),
+      ...(connections.appDatabaseEndpoint ? { RENDER_APP_DATABASE_ENDPOINT: connections.appDatabaseEndpoint } : {}),
       ...(connections.environmentId ? { RENDER_ENVIRONMENT_ID: connections.environmentId } : {}),
       ...(render.source && !config.env.core?.RENDER_DEPLOY_IMAGE
         ? {

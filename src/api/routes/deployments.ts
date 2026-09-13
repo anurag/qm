@@ -148,6 +148,8 @@ const GATEWAY_AUTH_HEADERS = [
   "x-as-principal",
   "x-admin-actor",
   "x-agent-capability",
+  "x-qm-gateway-token",
+  "x-qm-app-id",
   PORTAL_IDENTITY_HEADER,
 ];
 
@@ -1238,7 +1240,7 @@ async function createDeployment(ctx: ApiCtx): Promise<void> {
   const principalId = ctx.capability?.actorId ?? ctx.actor?.p;
   if (principalId && body.createdBy !== principalId) return sendJson(res, 403, { error: "forbidden" });
   try {
-    return sendJson(res, 200, { deployment: await app.deploy(body) });
+    return sendJson(res, 200, { deployment: deploymentView(await app.deploy(body)) });
   } catch (e) {
     return sendJson(res, 400, { error: "deploy_failed", message: errMessage(e) });
   }
@@ -1372,7 +1374,9 @@ async function redeployDeployment(ctx: ApiCtx): Promise<void> {
     return sendJson(res, 400, { error: "bad_request", message: "entrypoint (string) and files (array) required" });
   }
   try {
-    return sendJson(res, 200, { deployment: await app.redeploy(id, { entrypoint: b.entrypoint, files: b.files }) });
+    return sendJson(res, 200, {
+      deployment: deploymentView(await app.redeploy(id, { entrypoint: b.entrypoint, files: b.files })),
+    });
   } catch (e) {
     return sendJson(res, 400, { error: "deploy_failed", message: errMessage(e) });
   }
@@ -1426,7 +1430,7 @@ export async function renameDeployment(ctx: ApiCtx): Promise<void> {
   if (typeof b.name !== "string")
     return sendJson(res, 400, { error: "bad_request", message: "name (string) required" });
   try {
-    return sendJson(res, 200, { deployment: await app.renameDeployment(id, b.name) });
+    return sendJson(res, 200, { deployment: deploymentView(await app.renameDeployment(id, b.name)) });
   } catch (e) {
     return sendJson(res, 400, { error: "rename_failed", message: errMessage(e) });
   }
@@ -1442,7 +1446,7 @@ export async function setDeploymentDisplayName(ctx: ApiCtx): Promise<void> {
   if (typeof b.displayName !== "string")
     return sendJson(res, 400, { error: "bad_request", message: "displayName (string) required" });
   try {
-    return sendJson(res, 200, { deployment: await app.setDeploymentDisplayName(id, b.displayName) });
+    return sendJson(res, 200, { deployment: deploymentView(await app.setDeploymentDisplayName(id, b.displayName)) });
   } catch (e) {
     return sendJson(res, 400, { error: "display_name_failed", message: errMessage(e) });
   }

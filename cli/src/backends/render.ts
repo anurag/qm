@@ -290,8 +290,9 @@ async function inventory(
   missing = false,
   retired: readonly string[] = [],
 ) {
+  let project: Project | undefined;
   if (state.projectId) {
-    const project = await request<Project>(`/projects/${state.projectId}`);
+    project = await request<Project>(`/projects/${state.projectId}`);
     if (
       project.owner.id !== state.workspaceId ||
       project.name !== `${state.appPrefix}-qm` ||
@@ -348,7 +349,7 @@ async function inventory(
     )
       throw new CliError("The saved Render Postgres does not match this deployment");
   }
-  return { services, postgres };
+  return { services, postgres, environmentIds: project?.environmentIds ?? [] };
 }
 async function assertAvailable(
   request: RenderRequest,
@@ -570,6 +571,7 @@ function serviceEnv(
   workload: Workload,
   values: Map<string, string>,
   databaseUrl: string,
+  appDatabaseEndpoint: string,
   state: State,
   services: Map<string, RenderService>,
   existing: Record<string, string>,
@@ -611,7 +613,10 @@ function serviceEnv(
       databaseUrl,
       coreUrl: core ? renderInternalUrl(core) : "http://127.0.0.1:8080",
       ...(web ? { webUiUrl: web.type === "private_service" ? renderInternalUrl(web) : publicUrl(web) } : {}),
+      projectId: state.projectId,
       environmentId: state.environmentId,
+      postgresId: state.postgresId,
+      appDatabaseEndpoint,
     },
     workload.plugin,
   );
@@ -839,9 +844,25 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         }
         saveState(ctx, state);
         const postgres = await provision(ctx, request, state);
-        const info = await request<{ internalConnectionString: string }>(`/postgres/${postgres.id}/connection-info`);
+        const info = await request<{ internalConnectionString: string; externalConnectionString: string }>(
+          `/postgres/${postgres.id}/connection-info`,
+        );
         if (!info.internalConnectionString)
           throw new CliError("Render returned no internal Postgres connection string");
+        let appDatabaseUrl: URL;
+        try {
+          appDatabaseUrl = new URL(info.externalConnectionString);
+          if (!["postgres:", "postgresql:"].includes(appDatabaseUrl.protocol) || !appDatabaseUrl.hostname)
+            throw new Error();
+        } catch {
+          throw new CliError("Render returned no valid external Postgres connection string");
+        }
+        appDatabaseUrl.username = "";
+        appDatabaseUrl.password = "";
+        appDatabaseUrl.pathname = "/";
+        appDatabaseUrl.search = "?sslmode=verify-full";
+        appDatabaseUrl.hash = "";
+        const appDatabaseEndpoint = appDatabaseUrl.href;
         const { services } = await inventory(ctx, request, state);
         const envs = new Map<string, Record<string, string>>();
         for (const workload of desired) {
@@ -850,7 +871,16 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           if (!service) {
             const name = `${state.appPrefix}-${workload.name}`;
             await assertAvailable(request, "/services", "service", name, state.workspaceId);
-            env = serviceEnv(ctx, workload, values, info.internalConnectionString, state, services, env);
+            env = serviceEnv(
+              ctx,
+              workload,
+              values,
+              info.internalConnectionString,
+              appDatabaseEndpoint,
+              state,
+              services,
+              env,
+            );
             const result = await createResource<{ service: RenderService; deployId: string }>(
               ctx,
               request,
@@ -906,7 +936,16 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         for (const workload of desired) {
           const service = services.get(workload.name)!;
           const existing = envs.get(workload.name)!;
-          const env = serviceEnv(ctx, workload, values, info.internalConnectionString, state, services, existing);
+          const env = serviceEnv(
+            ctx,
+            workload,
+            values,
+            info.internalConnectionString,
+            appDatabaseEndpoint,
+            state,
+            services,
+            existing,
+          );
           const pending = state.dirtyServices?.includes(workload.name) ?? false;
           state.dirtyServices = [...new Set([...(state.dirtyServices ?? []), workload.name])];
           saveState(ctx, state);
@@ -1053,11 +1092,12 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           "service",
         );
         const owned = new Set(Object.values(state.services).map((service) => service.id));
+        const environments = new Set(bound.environmentIds);
         for (const service of hosted) {
           if (
             owned.has(service.id) ||
             service.ownerId !== state.workspaceId ||
-            service.environmentId !== state.environmentId ||
+            !environments.has(service.environmentId) ||
             service.type !== "private_service" ||
             (!opts.purge && service.suspended === "suspended")
           )

@@ -7,10 +7,108 @@ import { createInsecureTestServer, createServer } from "../src/api/server.ts";
 import type { App } from "../src/api/app.ts";
 import { createAdminService } from "../src/admin/admin-service.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
+import type { Deployment } from "../src/deploy/deploy-store.ts";
+import { scopeId } from "../src/types.ts";
 
 function appWith(endpoint: Record<string, unknown>): App {
   return { reachDeployment: async () => ({ status: "ok", endpoint }) } as unknown as App;
 }
+
+test("deployment mutation responses omit gateway credentials and runtime fields", async () => {
+  const deployment: Deployment = {
+    id: "550e8400-e29b-41d4-a716-446655440000",
+    ownerScopeId: scopeId("personal", "owner"),
+    createdBy: "owner",
+    name: "app",
+    currentVersion: 1,
+    status: "running",
+    endpoint: {
+      host: "gateway.onrender.com",
+      port: 443,
+      tls: true,
+      proxyHeaders: { "X-Qm-Gateway-Token": "owner-wide-secret", "X-Qm-App-Id": "app" },
+    },
+    versions: [
+      {
+        version: 1,
+        createdAt: 1,
+        entrypoint: "node server.js",
+        snapshotDir: "/private-snapshot",
+        env: { SECRET: "app-secret" },
+      },
+    ],
+  };
+  const server = createInsecureTestServer({
+    deploy: async () => deployment,
+    redeploy: async () => deployment,
+    renameDeployment: async () => deployment,
+    setDeploymentDisplayName: async () => deployment,
+    getDeployment: async () => deployment,
+    listDeployments: async () => [deployment],
+  } as unknown as App);
+  server.listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  try {
+    for (const [path, body] of [
+      ["", { ownerScopeId: "personal:owner", createdBy: "owner", entrypoint: "node server.js", files: [] }],
+      [`/${deployment.id}/redeploy`, { entrypoint: "node server.js", files: [] }],
+      [`/${deployment.id}/name`, { name: "changed" }],
+      [`/${deployment.id}/display-name`, { displayName: "Changed" }],
+    ] as const) {
+      const response = await fetch(`${base}/v1/deployments${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 200, path);
+      const text = await response.text();
+      assert.equal(text.includes("owner-wide-secret"), false, path);
+      assert.equal(text.includes("app-secret"), false, path);
+      const value = JSON.parse(text).deployment;
+      assert.equal(value.id, deployment.id);
+      assert.equal(value.endpoint, undefined);
+      assert.equal(value.versions[0].snapshotDir, undefined);
+      assert.equal(value.versions[0].env, undefined);
+    }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("deployment proxy replaces client gateway headers with the selected app credentials", async () => {
+  const upstream = createHttpServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ headers: req.headers, rawHeaders: req.rawHeaders, path: req.url }));
+  });
+  upstream.listen(0);
+  const server = createInsecureTestServer(
+    appWith({
+      host: "127.0.0.1",
+      port: (upstream.address() as AddressInfo).port,
+      proxyHeaders: { "X-Qm-Gateway-Token": "core-gateway-token", "X-Qm-App-Id": "authorized-app" },
+    }),
+  );
+  server.listen(0);
+  try {
+    const response = await fetch(`http://localhost:${(server.address() as AddressInfo).port}/d/app/path?q=1`, {
+      headers: { "x-qm-gateway-token": "forged", "x-qm-app-id": "other-app", authorization: "Bearer app-token" },
+    });
+    assert.equal(response.status, 200);
+    const seen = (await response.json()) as { headers: Record<string, string>; rawHeaders: string[]; path: string };
+    assert.equal(seen.headers["x-qm-gateway-token"], "core-gateway-token");
+    assert.equal(seen.headers["x-qm-app-id"], "authorized-app");
+    assert.equal(seen.headers.authorization, "Bearer app-token");
+    assert.equal(seen.path, "/path?q=1");
+    for (const header of ["x-qm-gateway-token", "x-qm-app-id"])
+      assert.equal(
+        seen.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === header).length,
+        1,
+      );
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
 
 test("/d/ proxy attaches the endpoint's proxyHeaders — the internal path authenticates to a token-gated deployment", async () => {
   let seenCookie: string | undefined;
