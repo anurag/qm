@@ -114,10 +114,12 @@ ${bold("DEPLOY (operator)")} ${dim("— runs in the deployment directory")}
   init [path] [--org <id>] [--target ${HOSTING_PROVIDER_IDS.join("|")}]
        [--model-provider ${MODEL_PROVIDERS.join("|")}]
        [--email-transport ${EMAIL_TRANSPORTS.join("|")}]
+       [--repo <HTTPS-GitHub-URL> --branch <name>]
                                            scaffold a deployment directory (the base model
                                            provider defaults to anthropic; its API key is a
                                            required secret; sign-in emails default to resend,
                                            and only the chosen transport's keys are scaffolded)
+                                           repo and branch select Render Git builds (Render only)
   setup [path]                             interactive wizard: scaffold if needed, then walk the
                                            missing secrets with per-provider instructions
   up                                       build images and bring the deployment up
@@ -153,7 +155,7 @@ ${bold("DEPLOY (operator)")} ${dim("— runs in the deployment directory")}
                                            value is given, so the secret never hits shell history
   status                                   show what's running
   logs [<service>] [-f] [--tail <n>]       tail service logs (omit <service> for all, interleaved)
-  down [--purge]                           stop the deployment (--purge drops docker volumes)
+  down [--purge]                           stop the deployment (--purge deletes Docker or Render data)
   rollback [--to <target>]                 roll back workloads (AWS: prior deployment manifest,
                                            or manifest id/release label)
   sandbox build [--from <img>] [--tag <t>] [--dry-run]
@@ -171,8 +173,8 @@ ${bold("DEVELOP (contributor)")} ${dim("— runs in the QM repo")}
 
   help · version
 
-${dim("target is set in the config: docker runs local containers, fly deploys Fly apps, and aws deploys ECS.")}
-${dim("status/logs/down act on the configured target. Fly uses Fly Machines; AWS uses Lambda MicroVMs.")}
+${dim("target is set in the config: docker runs local containers, fly deploys Fly apps, aws deploys ECS, and render deploys Render services.")}
+${dim("status/logs/down act on the configured target. Render uses Render Sandboxes.")}
 `;
 
 const deploymentBackend = (ctx: DeployContext) => hostingProvider(ctx.target).createBackend(ctx);
@@ -260,12 +262,14 @@ async function dispatch(argv: string[]): Promise<void> {
     }
 
     case "init": {
-      rejectUnknownFlags(flags, ["org", "target", "model-provider", "email-transport"]);
+      rejectUnknownFlags(flags, ["org", "target", "model-provider", "email-transport", "repo", "branch"]);
       rejectExtraPositionals(positionals, 1);
       const target = targetFlag(flags);
       const modelProvider = modelProviderFlag(flags);
       const emailTransport = emailTransportFlag(flags);
       const org = strFlag(flags, "org");
+      const repo = strFlag(flags, "repo");
+      const branch = strFlag(flags, "branch");
       const dir = positionals[0] !== undefined ? resolve(positionals[0]) : resolve(process.cwd());
       runInit({
         dir,
@@ -273,6 +277,8 @@ async function dispatch(argv: string[]): Promise<void> {
         ...(target ? { target } : {}),
         ...(modelProvider ? { modelProvider } : {}),
         ...(emailTransport ? { emailTransport } : {}),
+        ...(repo !== undefined ? { repo } : {}),
+        ...(branch !== undefined ? { branch } : {}),
       });
       return;
     }
@@ -523,6 +529,8 @@ async function dispatch(argv: string[]): Promise<void> {
       rejectUnknownFlags(flags, ["config", "env-file", "sandbox-dir", "target", "from", "tag", "dry-run"]);
       const ctx = deployContext(flags);
       runChecks(ctx.config, ctx.configDir, ctx.sandboxDir, { report: false });
+      if (ctx.target === "render")
+        throw new CliError("Render Sandboxes use the native Render base image; sandbox build is not supported");
       const from = strFlag(flags, "from");
       const tag = strFlag(flags, "tag");
       runSandboxBuild({

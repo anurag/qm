@@ -17,6 +17,19 @@ const AWS_RENDER_ENV_DEFAULTS: Readonly<Record<string, Readonly<Record<string, s
 
 export const TARGET_ENV_DEFAULTS: Record<Target, TargetEnvDefaults> = {
   docker: () => undefined,
+  render: (config, service, name) =>
+    service === "core"
+      ? (
+          {
+            SANDBOX_BACKEND: config.sandbox?.backend ?? "render",
+            DEPLOY_PROVIDER: "render",
+            HARNESS: "pi",
+            WORKSPACE_STORE: "s3",
+            SNAPSHOT_STORE: "s3",
+            TRANSFER_STORE: "s3",
+          } as Record<string, string>
+        )[name]
+      : undefined,
   fly: (_config, service, name) => FLY_TEMPLATE_ENV_DEFAULTS[service]?.[name],
   aws: (config, service, name) => {
     const rendered = AWS_RENDER_ENV_DEFAULTS[service]?.[name];

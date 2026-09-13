@@ -32,6 +32,30 @@ The CLI deploys long-running QM services; it is not the runtime. Docker runs
 them locally, Fly runs them as Fly apps with Fly Machines for agent computers, and AWS
 runs digest-pinned ARM64 tasks on ECS Fargate with Lambda MicroVM agent computers.
 
+## Render
+
+```bash
+npm exec qm -- init . --org acme --target render \
+  --repo https://github.com/acme/qm --branch main
+npm install
+npm exec qm -- setup
+npm exec qm -- check
+npm exec qm -- plan
+npm exec qm -- up --yes
+npm exec qm -- check --live
+```
+
+Set `render.workspaceId` and the email access gate before setup. Render builds
+from Git and creates one project for QM services, a worker Workflow, Postgres,
+and bundled MinIO. Native Render Sandboxes are workspace resources. Published
+apps have no disk; each app uses its own database and scoped object storage.
+No AWS account or external object store is needed.
+
+Each update resolves the Git branch to one commit and deploys that commit. The
+CLI retains unchanged MinIO during routine updates. It records the previous
+service builds and Workflow task for `qm rollback`. Archive and restore apps
+through QM to retain their data. See the [Render runbook](templates/deployment/references/render.md).
+
 ## Deployment directory
 
 ```text

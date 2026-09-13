@@ -148,7 +148,7 @@ export async function doctorCommon(
 ): Promise<void> {
   if (opts.requiredSecretValues) {
     const missing = computedSecrets(config)
-      .filter((secret) => secret.required)
+      .filter((secret) => secret.required && (config.target !== "render" || secret.managedBy === "operator"))
       .filter((secret) => {
         const value = deploymentSecretValue(secret.name, secrets.get(secret.name));
         return isInvalidSecret(secret.name, value);
@@ -161,6 +161,8 @@ export async function doctorCommon(
   }
   if (localSandboxActive(config)) {
     step("local Docker sandbox: configured");
+  } else if (config.target === "render" || config.sandbox?.backend === "render") {
+    step("Render sandbox: configured");
   } else if (config.target === "aws") {
     step("AWS Lambda MicroVM sandbox: configured");
   } else if (config.sandbox) {

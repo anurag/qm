@@ -284,3 +284,129 @@ export const awsScaffold: ProviderScaffold = {
   finalCommand: "terraform -chdir=infra init && terraform -chdir=infra apply",
   finalWhy: "create inert infrastructure; finish the edge + portal steps in AGENTS.md before up",
 };
+
+export const renderScaffold: ProviderScaffold = {
+  renderConfig: (orgId, modelProvider, emailTransport) =>
+    JSON.stringify(
+      {
+        contract: 1,
+        orgId,
+        publicUrl: `https://${orgId}-portal.onrender.com`,
+        apiUrl: `https://${orgId}-core.onrender.com`,
+        target: "render",
+        modelProvider,
+        render: {
+          workspaceId: "tea-replaceme",
+          source: { repo: "https://github.com/yc-software/qm", branch: "main" },
+          region: "oregon",
+          corePlan: "1c-2g",
+          servicePlan: "0.5c-512mb",
+          postgresPlan: "0.5c-1g",
+          postgresDiskSizeGB: 10,
+          storage: { type: "minio", plan: "0.5c-512mb", diskSizeGB: 10 },
+        },
+        services: ["core", "slack", "web-ui", "admin", "portal", "auth"],
+        plugins: [],
+        skills: [],
+        sandbox: { backend: "render" },
+        env: {
+          core: {
+            HARNESS: "pi",
+            SANDBOX_BACKEND: "render",
+            DEPLOY_PROVIDER: "render",
+            WORKSPACE_STORE: "s3",
+            SNAPSHOT_STORE: "s3",
+            TRANSFER_STORE: "s3",
+          },
+          slack: { SLACK_IDENTITY_EMAIL: "1" },
+          auth: { AUTH_EMAIL_TRANSPORT: emailTransport },
+        },
+        secretEnv: { core: { ADMIN_GRANTS: "ADMIN_GRANTS" } },
+      },
+      null,
+      2,
+    ) + "\n",
+  ignores: [
+    ".env",
+    "node_modules/",
+    ".generated/",
+    ".render.lock/",
+    "render.resources.json",
+    "render.resources.json.*.tmp",
+  ],
+  agentsAppendix: `
+## Render deployment
+
+Set render.workspaceId and the email access gate in qm.config.jsonc. Run qm setup
+for the Render, model, and email credentials. The CLI generates MinIO credentials.
+No AWS account or AWS credentials are required for bundled storage.
+
+Run qm check and qm plan, then qm up. The CLI uses the Render API to create or
+update one project with a production environment. It provisions the services,
+disks, and Postgres, then uploads the deployment layer after core is healthy.
+The deployment does not need a Blueprint.
+
+Set render.source.repo to an HTTPS GitHub repository URL and render.source.branch
+to a branch name to build QM from that repository on Render.
+qm init --target render --repo <url> --branch <name> sets these fields. Each qm up
+builds the configured branch for diskless services. MinIO rebuilds only when its
+source or configuration changes, so a routine update retains storage availability. Automatic Git deploys are disabled. App deployment
+and restore build the app runner from that branch. Private repositories require
+local Git read access and a Render GitHub connection with repository access.
+No local Docker or image
+publication is required. Render always builds from Git. Place plugin Dockerfiles
+in the repository under plugins/<name>/Dockerfile. Image overrides are not supported.
+
+The default stack has QM core, web UI, portal, Postgres, and MinIO built from
+a Dockerfile with a pinned base image. Slack runs in core; admin runs in web UI; auth runs in portal. After MinIO
+is ready, QM starts a one-off initialization job to create a private qm-storage
+bucket and a scoped identity. Core gets this identity through its environment.
+MinIO root credentials stay on MinIO. Its HTTPS endpoint lets isolated app
+environments reach scoped object storage.
+
+Render Workflows execute queued runs. The workflow is in the same project and
+uses the same Postgres and object store as core. Native Render Sandboxes are
+workspace resources; the Render API does not attach them to project environments.
+
+Core uses temporary files at /data. Postgres stores sessions, runs, and file
+metadata. MinIO stores workspace bytes, portable sandbox backups, and file
+artifacts on its persistent disk. A MinIO deploy interrupts storage briefly.
+
+qm rollback restores the prior successful service builds. It retains stored data
+and does not reverse database migrations. Render retains the current environment
+values when it rolls back a build.
+
+qm down retains Postgres and MinIO data. Storage charges continue. Published apps
+and runtime sandboxes are separate resources. Remove them through QM. Use
+qm down --purge only when the deployment and its stored data can be deleted.
+Do not expire durable objects or automatically move data between storage targets.
+`,
+  files: () => [
+    {
+      segments: ["sandbox", "skills", "render-platform", "SKILL.md"],
+      content: `---
+name: render-platform
+description: Build and publish apps on this QM Render deployment. Use when an app needs persistent data, background work, or a deployment update.
+---
+Use the built-in deployment tools to publish, update, archive, and restore apps.
+The platform creates diskless app services in this deployment's Render project.
+Use the provided DATABASE_URL for persistent relational data. Use the provided
+S3 bucket, endpoint, and scoped credentials for persistent files and objects.
+Local files, including SQLite databases, are temporary and are lost at deploy.
+Use PORT for the listening port and bind the server to 0.0.0.0.
+
+Keep app credentials inside the app environment. Never give an app the Render API
+key, the core database URL, or MinIO administrator credentials. Each app receives
+its own database and object prefix. Archive retains data. Restore reuses that data.
+
+The agent executes in native Render Sandboxes. Save useful workspace changes
+before an operation that replaces a sandbox. Sandboxes are workspace resources;
+app services, Workflows, Postgres, and MinIO belong to this deployment's project.
+Do not create infrastructure outside that project or change DNS or Cloudflare rules.
+`,
+    },
+  ],
+  configurationHint: "render: set workspaceId, region, and the email access gate before setup",
+  finalCommand: "npm exec qm -- up",
+  finalWhy: "provision Render services and upload the QM deployment layer",
+};
