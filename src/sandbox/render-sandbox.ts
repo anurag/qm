@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { collectBytes } from "../util/bytes.ts";
-import { createHomeSnapshotOps, HOME_SNAPSHOT_PRUNE } from "./home-snapshot.ts";
+import { createHomeSnapshotOps, HOME_SNAPSHOT_PRUNE, snapshotDue } from "./home-snapshot.ts";
 import type { RenderSnapshotStore } from "./render-snapshot-store.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { CredentialPathSpec } from "../credentials/resident-paths.ts";
@@ -42,6 +42,7 @@ export interface StoredRenderSandbox extends RenderSandboxResources {
   expiresAtMs: number;
   lastActivityMs: number;
   homeCheckpointAtMs?: number;
+  homeDirty?: boolean;
   retiredResources?: RenderSandboxResources[];
   retirementError?: string;
   checkpointCurrent?: boolean;
@@ -56,6 +57,7 @@ export interface RenderSandboxOptions extends BlobStagingOptions {
   namePrefix?: string;
   homeDir?: string;
   defaultTimeoutSec?: number;
+  checkpointIntervalMs?: number;
   extraTools?: string[];
   credentialPaths?: CredentialPathSpec[];
   layerToolFiles?: () => readonly LayerInstallFile[];
@@ -67,6 +69,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   const prefix = opts.namePrefix ?? "qm";
   const homeDir = opts.homeDir ?? "/root";
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
+  const checkpointIntervalMs = opts.checkpointIntervalMs ?? 5 * 60_000;
   const expiryCheckpointWindowMs = Math.max((defaultTimeoutSec + 60) * 1000, 20 * 60_000);
   const scratch = new Map<string, RenderSandboxInfo>();
   const nameFor = (scope: string): string => sandboxScopeName(prefix, scope);
@@ -96,7 +99,9 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     const scope = scopeFor(name);
     const stored = await store.get(scope);
     if (!stored || stored.discarded) throw new Error(`Render sandbox is not provisioned: ${name}`);
-    if (Date.now() - stored.lastActivityMs >= 60_000) await store.merge(scope, { lastActivityMs: Date.now() });
+    const touch = Date.now() - stored.lastActivityMs >= 60_000;
+    if (touch || stored.homeDirty === false)
+      await store.merge(scope, { homeDirty: true, ...(touch ? { lastActivityMs: Date.now() } : {}) });
     return stored.sandboxId;
   };
   const exec = async (name: string, script: string, timeoutSec: number): Promise<ExecResult> => {
@@ -239,6 +244,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       const saved = await store.merge(scope, {
         homeSnapshotKey,
         homeCheckpointAtMs: Date.now(),
+        homeDirty: false,
         checkpointCurrent: false,
         pendingCheckpoint: undefined,
         retiredResources: retiredResources.length ? retiredResources : undefined,
@@ -517,7 +523,8 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       await withLock(handle.id, async () => {
         const stored = await store.get(scope);
         if (!stored) return;
-        await checkpoint(scope, stored);
+        const bookkeeping = { lastSnapshotMs: stored.homeCheckpointAtMs, homeDirty: stored.homeDirty };
+        if (snapshotDue(bookkeeping, options, checkpointIntervalMs)) await checkpoint(scope, stored);
         await store.merge(scope, { lastActivityMs: Date.now() });
       });
     },
@@ -536,7 +543,8 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       let reaped = 0;
       const cutoff = idleMs > 0 ? Date.now() - idleMs : -Infinity;
       const due = (stored: StoredRenderSandbox): boolean =>
-        stored.lastActivityMs <= cutoff || stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs;
+        stored.expiresAtMs > Date.now() &&
+        (stored.lastActivityMs <= cutoff || stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs);
       for (const [scope, candidate] of await store.entries()) {
         if (!due(candidate) && !candidate.discarded && !candidate.retiredResources?.length) continue;
         await withLock(nameFor(scope), async () => {

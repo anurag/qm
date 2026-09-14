@@ -43,13 +43,14 @@ function setup(t: { after(fn: () => void): void }) {
   const store = createMemoryMap<StoredRenderSandbox>();
   const advisoryLock = createMemoryAdvisoryLock();
   const snapshots = createTestSnapshotStore();
-  const make = (snapshotStore: RenderSnapshotStore = snapshots) =>
+  const make = (snapshotStore: RenderSnapshotStore = snapshots, checkpointIntervalMs = 0) =>
     createRenderSandbox(workspace, {
       client: fake.client,
       store,
       advisoryLock,
       blobTransfer,
       snapshots: snapshotStore,
+      checkpointIntervalMs,
     });
   const scope = scopeId("personal", "tester");
   const layers = [{ scopeId: scope, mountPath: "/", mode: "rw" as const }];
@@ -647,4 +648,33 @@ test("Render saves a home before the rotation window without stopping its sandbo
   const next = make();
   const restored = await next.provision(layers);
   assert.equal(await next.readFile(restored, "latest"), "retained before rotation");
+});
+
+test("Render checkpoints at teardown once per interval and skips an unused computer", async (t) => {
+  const { make, layers, store, scope } = setup(t);
+  const sandbox = make(undefined, 5 * 60_000);
+  const handle = await sandbox.provision(layers);
+  const initial = (await store.get(scope))!.homeSnapshotKey;
+  await sandbox.writeFile(handle, "recent", "written within the interval");
+  await sandbox.teardown(handle, { keepWarm: true });
+  assert.equal((await store.get(scope))!.homeSnapshotKey, initial);
+  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 6 * 60_000 });
+  await sandbox.teardown(handle, { keepWarm: true });
+  const afterWrite = (await store.get(scope))!.homeSnapshotKey;
+  assert.notEqual(afterWrite, initial);
+  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 6 * 60_000 });
+  await sandbox.teardown(handle, { homeUnchanged: true });
+  assert.equal((await store.get(scope))!.homeSnapshotKey, afterWrite);
+  await sandbox.teardown(handle);
+  assert.notEqual((await store.get(scope))!.homeSnapshotKey, afterWrite);
+});
+
+test("Render leaves scopes whose sandbox already expired alone until they are provisioned again", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  const sandbox = make();
+  await sandbox.provision(layers);
+  await store.merge(scope, { expiresAtMs: Date.now() - 1, lastActivityMs: Date.now() - 7200_000 });
+  const get = t.mock.method(fake.client, "get");
+  assert.deepEqual(await sandbox.reapDeepIdle!(3600_000), { reaped: 0 });
+  assert.equal(get.mock.callCount(), 0);
 });
