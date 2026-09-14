@@ -27,6 +27,70 @@ If a legacy Oregon workspace has no fixed outbound IP ranges, set
 project and connect across regions to Postgres with verified TLS and MinIO with
 HTTPS.
 
+## Architecture
+
+This diagram shows the standard deployment with Portal enabled. Solid arrows
+show runtime traffic. Dotted arrows show provisioning and builds.
+
+```mermaid
+flowchart TB
+    operator["Operator: qm CLI"]
+    source["Configured Git repository"]
+    control["Render API<br/>and Git builds"]
+    browser["Browser"]
+
+    subgraph workspace["Render workspace"]
+        subgraph project["One QM project"]
+            subgraph production["Production environment"]
+                portal["Portal<br/>Authentication"]
+                web["Private web UI<br/>Admin"]
+                core["QM core API"]
+                worker["Render Workflow<br/>qm_run"]
+                postgres[("Render Postgres<br/>Core DB and app DBs")]
+                minio[("Bundled MinIO<br/>QM files and app prefixes")]
+                disk["Persistent MinIO disk"]
+            end
+            subgraph isolated["One isolated environment per published app"]
+                runner["Diskless runner<br/>Git bootstrap and gateway"]
+                app["App process<br/>Unprivileged user"]
+            end
+        end
+        sandbox["Native Render Sandboxes<br/>and checkpoints"]
+    end
+
+    operator -.->|Create and update| control
+    source -.->|Pinned source commits| control
+    control -.->|Resources and deployments| project
+
+    browser -->|HTTPS| portal
+    portal --> web
+    web -->|Signed requests| core
+    portal -->|Identity and app requests| core
+    core -->|Dispatch run ID| worker
+    core -->|State and workspace files| postgres
+    worker --> postgres
+    core -->|Files and home backups| minio
+    worker --> minio
+    minio --- disk
+    core -->|Native SDK| sandbox
+    worker -->|Native SDK| sandbox
+
+    core <-->|HTTPS: app proxy and Git| runner
+    runner -->|Loopback HTTP| app
+    app -->|App database over TLS| postgres
+    app -->|App prefix over HTTPS| minio
+```
+
+Render builds the QM services, Workflow, and app runner from the configured
+repository. The runner then fetches the published app's source from the core Git
+endpoint. Core proxies app traffic through the runner's authenticated gateway.
+Core and Workflow tasks use the Render API to manage app resources.
+
+Only MinIO has an attached service disk. Core and Workflow tasks share durable
+Postgres and object storage. An app can use only its own database and object
+prefix, and its environment has no private network access to core or peer apps.
+Archive and restore retain these data stores and credentials.
+
 ## Git builds and updates
 
 Render builds every service from the configured repository. Core, web UI, and
