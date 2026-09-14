@@ -9,10 +9,10 @@ import {
 } from "../src/deploy/render-app-database.ts";
 import { createMemoryMap, createPostgresMapFactory, type DurableMap } from "../src/persistence/durable-map.ts";
 
-const TEST_URL = process.env.RENDER_APP_DATABASE_TEST_URL;
+const TEST_URL = process.env.RENDER_APP_DATABASE_TEST_URL ?? process.env.DATABASE_URL;
 if (TEST_URL && !["127.0.0.1", "localhost", "[::1]"].includes(new URL(TEST_URL).hostname))
   throw new Error("Render app database tests require a local PostgreSQL test server");
-const skip = TEST_URL ? false : "set RENDER_APP_DATABASE_TEST_URL to a local test PostgreSQL server";
+const skip = TEST_URL ? false : "set DATABASE_URL to a local test PostgreSQL server";
 const keyMaterial = "render-app-database-test-key";
 
 function replaceDatabase(url: string, database: string): string {
