@@ -65,7 +65,7 @@ and the derived slug, then initialize its root with the current CLI:
 
 ```bash
 npm exec --yes --package=@yc-software/qm@latest -- \
-  qm init . --org <slug> --target <fly-or-aws> --model-provider <provider>
+  qm init . --org <slug> --target <fly-aws-or-render> --model-provider <provider>
 npm install
 ```
 
@@ -211,6 +211,7 @@ preflight and setup order:
 
 - Fly.io: `.codex/skills/deploy-qm/references/fly.md`
 - AWS: `.codex/skills/deploy-qm/references/aws.md`
+- Render: `.codex/skills/deploy-qm/references/render.md`
 
 ## 4. Deploy and prove the web surface
 

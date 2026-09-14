@@ -22,7 +22,7 @@ test("qm init --target render creates a Git deployment with native sandbox guida
   assert.equal(config.sandbox!.backend, "render");
   assert.equal(config.render!.storage.type, "minio");
   assert.match(result.stdout, /Render builds .* branch main/);
-  assert.match(readFileSync(join(dir, "AGENTS.md"), "utf8"), /Render Workflows execute queued runs/);
+  assert.match(readFileSync(join(dir, "AGENTS.md"), "utf8"), /Native Render Sandboxes are workspace resources/);
   const skill = readFileSync(join(dir, "sandbox", "skills", "render-platform", "SKILL.md"), "utf8");
   assert.match(skill, /Each app receives\nits own database and object prefix/);
   assert.ok(existsSync(join(dir, ".codex", "skills", "deploy-qm", "references", "render.md")));

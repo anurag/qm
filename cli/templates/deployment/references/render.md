@@ -5,7 +5,8 @@ Set `render.workspaceId` to the authorized test or production workspace. Set
 `render.source.repo` and `render.source.branch` to a GitHub repository and branch
 that local Git and Render can read. `--repo <url> --branch <name>` sets both at initialization.
 
-Run `qm setup`, `qm check`, `qm plan`, then `qm up`. Keep the generated `.env`
+Run `qm setup`, `qm check`, `qm plan`, then `qm up`. The CLI uses the Render API
+directly; the deployment needs no Blueprint. Keep the generated `.env`
 private. Render stores the runtime values. The CLI records resource IDs in
 `render.resources.json`; retain this file so updates act on the same resources.
 After an unknown creation result, a retry searches the workspace for the named
@@ -121,7 +122,8 @@ compatibility before a rollback that follows a configuration or schema change.
 
 Core stores durable state in Render Postgres and durable files in MinIO.
 `/data` on core is temporary. A deployment must not depend on files that exist
-only on a service's local filesystem.
+only on a service's local filesystem. Do not expire durable objects or move data
+between storage targets automatically.
 
 Published apps have no disk. Each app receives its own Postgres database and
 scoped object storage credentials. Apps must use these stores for persistent

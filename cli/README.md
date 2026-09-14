@@ -46,18 +46,10 @@ npm exec qm -- check --live
 ```
 
 Set `render.workspaceId` and the email access gate before setup. Render builds
-from Git and creates one project for QM services, a run worker, Postgres,
-and bundled MinIO. Native Render Sandboxes are workspace resources. Published
-apps have no disk; each app uses its own database and scoped object storage.
-No AWS account or external object store is needed.
-
-Each update resolves the Git branch to one commit and deploys that commit. The
-CLI retains unchanged MinIO during routine updates. It records the previous
-service builds for `qm rollback`. Archive and restore apps
-through QM to retain their data. See the [Render runbook](templates/deployment/references/render.md).
-For permanent removal, follow the runbook's cleanup procedure. Archived app
-services must also be deleted in Render before `qm down --purge` can delete
-the shared database and object storage.
+every service from Git and creates one project for the QM services, a run
+worker, Postgres, and bundled MinIO; no AWS account or external object store is
+needed. The [Render runbook](templates/deployment/references/render.md) covers
+updates, rollback, archive and restore, and permanent cleanup.
 
 ## Deployment directory
 

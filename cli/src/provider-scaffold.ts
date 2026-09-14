@@ -343,54 +343,16 @@ export const renderScaffold: ProviderScaffold = {
   agentsAppendix: `
 ## Render deployment
 
-Set render.workspaceId and the email access gate in qm.config.jsonc. Run qm setup
-for the Render, model, and email credentials. The CLI generates MinIO credentials.
-No AWS account or AWS credentials are required for bundled storage.
+Render builds every service from render.source in Git; no local Docker or image
+publication is involved. qm up creates one project with a production environment
+for core, the run worker, web UI, portal, Render Postgres, and bundled MinIO, then
+uploads the deployment layer. Native Render Sandboxes are workspace resources.
+Published apps have no disk; each app uses its own database and scoped object
+storage. qm down retains Postgres and MinIO data, and qm rollback restores the
+prior service builds without reversing database migrations.
 
-Run qm check and qm plan, then qm up. The CLI uses the Render API to create or
-update one project with a production environment. It provisions the services,
-disks, and Postgres, then uploads the deployment layer after core is healthy.
-The deployment does not need a Blueprint.
-
-Set render.source.repo to an HTTPS GitHub repository URL and render.source.branch
-to a branch name to build QM from that repository on Render.
-qm init --target render --repo <url> --branch <name> sets these fields. Each qm up
-builds the configured branch for diskless services. MinIO rebuilds only when its
-source or configuration changes, so a routine update retains storage availability. Automatic Git deploys are disabled. App deployment
-and restore build the app runner from that branch. Private repositories require
-local Git read access and a Render GitHub connection with repository access.
-No local Docker or image
-publication is required. Render always builds from Git. Place plugin Dockerfiles
-in the repository under plugins/<name>/Dockerfile. Image overrides are not supported.
-
-The default stack has QM core, web UI, portal, Postgres, and MinIO built from
-a Dockerfile with a pinned base image. Slack runs in core; admin runs in web UI; auth runs in portal. After MinIO
-is ready, QM starts a one-off initialization job to create a private qm-storage
-bucket and a scoped identity. Core gets this identity through its environment.
-MinIO root credentials stay on MinIO. Its HTTPS endpoint lets isolated app
-environments reach scoped object storage.
-
-A background worker service built from the core Dockerfile executes queued runs.
-It is in the same project and uses the same Postgres and object store as core;
-core itself runs no workers. Native Render Sandboxes are workspace resources; the
-Render API does not attach them to project environments.
-
-Core uses temporary files at /data. Postgres stores sessions, runs, and file
-metadata. MinIO stores workspace bytes, portable sandbox backups, and file
-artifacts on its persistent disk. A MinIO deploy interrupts storage briefly.
-
-qm rollback restores the prior successful service builds. It retains stored data
-and does not reverse database migrations. Render retains the current environment
-values when it rolls back a build.
-
-qm down retains Postgres and MinIO data. Storage charges continue. Archive apps
-through QM before stopping the deployment. Archive suspends their Render services
-and retains app data; it does not delete those services. For permanent cleanup,
-follow .codex/skills/deploy-qm/references/render.md: back up data, archive apps,
-retire sandboxes, delete the verified app services in Render, then run
-qm down --purge. Purge deletes the shared database and object storage, including
-retained app data. Do not expire durable objects or automatically move data
-between storage targets.
+.codex/skills/deploy-qm/references/render.md is the Render reference: setup,
+updates, data and credentials, archive and restore, and permanent cleanup.
 `,
   files: () => [
     {
