@@ -17,6 +17,27 @@ export interface RenderApi {
   request<T>(method: string, path: string, body?: unknown, allowMissing?: boolean): Promise<T | null>;
 }
 
+export async function list<T>(
+  api: RenderApi,
+  path: string,
+  key: string,
+  query: Record<string, string> = {},
+): Promise<T[]> {
+  const rows: T[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  for (;;) {
+    const params = new URLSearchParams({ ...query, limit: "100", ...(cursor ? { cursor } : {}) });
+    const page = await api.request<Array<Record<string, unknown> & { cursor?: string }>>("GET", `${path}?${params}`);
+    if (!Array.isArray(page)) throw new Error(`Render returned an invalid ${key} list`);
+    rows.push(...page.map((row) => row[key] as T));
+    if (page.length < 100) return rows;
+    cursor = page.at(-1)?.cursor;
+    if (!cursor || cursors.has(cursor)) throw new Error(`Render ${key} pagination did not advance`);
+    cursors.add(cursor);
+  }
+}
+
 export function createRenderApi(opts: { apiKey: string; fetchImpl?: typeof fetch }): RenderApi {
   const fetchImpl = opts.fetchImpl ?? fetch;
   return {

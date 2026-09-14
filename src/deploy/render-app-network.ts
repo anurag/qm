@@ -3,7 +3,7 @@ import type { DurableMap } from "../persistence/durable-map.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { Deployment } from "./deploy-store.ts";
 import type { StoredRenderDeploy } from "./render-deploy-provider.ts";
-import { RenderApiError, type RenderApi } from "./render-api.ts";
+import { list, RenderApiError, type RenderApi } from "./render-api.ts";
 
 interface Environment {
   id: string;
@@ -64,27 +64,8 @@ export function createRenderAppNetwork(opts: {
   };
   async function named(deployment: Deployment): Promise<Environment | undefined> {
     const name = opts.name(deployment);
-    const matches: Environment[] = [];
-    let cursor: string | undefined;
-    const cursors = new Set<string>();
-    do {
-      const query = new URLSearchParams({ projectId: opts.projectId, name, limit: "100" });
-      if (cursor) query.set("cursor", cursor);
-      const found = await api.request<Array<{ environment: Environment; cursor?: string }>>(
-        "GET",
-        `/environments?${query}`,
-      );
-      if (!Array.isArray(found)) throw new Error("Render returned an invalid app environment list");
-      matches.push(
-        ...found
-          .map(({ environment }) => environment)
-          .filter((env) => env.name === name && env.projectId === opts.projectId),
-      );
-      if (found.length < 100) break;
-      cursor = found.at(-1)?.cursor;
-      if (!cursor || cursors.has(cursor)) throw new Error("Render environment pagination did not advance");
-      cursors.add(cursor);
-    } while (cursor);
+    const found = await list<Environment>(api, "/environments", "environment", { projectId: opts.projectId, name });
+    const matches = found.filter((env) => env.name === name && env.projectId === opts.projectId);
     return matches.sort((a, b) => a.id.localeCompare(b.id))[0];
   }
   return {

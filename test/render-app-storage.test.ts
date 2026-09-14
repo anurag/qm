@@ -423,7 +423,7 @@ for (const failure of ["request", "missing cursor", "repeated cursor", "invalid 
     const pending = structuredClone(await store.get(id));
     await assert.rejects(
       createRenderAppStorage(opts).suspend(id),
-      /HTTP 503|omitted.*cursor|repeated.*cursor|invalid.*list/,
+      /HTTP 503|pagination did not advance|invalid job list/,
     );
     assert.equal(posts, 1);
     assert.equal(pages, failure === "missing cursor" ? 1 : 2);

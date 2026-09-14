@@ -6,7 +6,7 @@ import { createKeyedQueue, sleep } from "../util/async.ts";
 import type { DeployProvider } from "./deploy-provider.ts";
 import type { Deployment, DeploymentVersion, DeployEndpoint } from "./deploy-store.ts";
 import type { RenderDeployArtifacts } from "./render-deploy-artifacts.ts";
-import { createRenderApi, RenderApiError } from "./render-api.ts";
+import { createRenderApi, list, RenderApiError } from "./render-api.ts";
 import { createRenderAppNetwork } from "./render-app-network.ts";
 
 const FAILED = new Set(["build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"]);
@@ -145,46 +145,15 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       if (!service) throw new Error("The retained Render app service is missing; restore it before retrying");
       return owned(service, deployment);
     }
-    let cursor = "";
-    const cursors = new Set<string>();
-    for (;;) {
-      const query = new URLSearchParams({
-        name: name(deployment),
-        ownerId: opts.workspaceId,
-        limit: "100",
-        ...(cursor ? { cursor } : {}),
-      });
-      const page = await api.request<Array<{ service: Service; cursor?: string }>>("GET", `/services?${query}`);
-      if (!Array.isArray(page)) throw new Error("Render returned an invalid app service list");
-      const service = page.find((row) => row.service.name === name(deployment))?.service;
-      if (service) return owned(service, deployment);
-      if (page.length < 100) return null;
-      const next = page.at(-1)?.cursor;
-      if (!next || cursors.has(next)) throw new Error("Render service pagination did not advance");
-      cursors.add(next);
-      cursor = next;
-    }
+    const services = await list<Service>(api, "/services", "service", {
+      name: name(deployment),
+      ownerId: opts.workspaceId,
+    });
+    const service = services.find((row) => row.name === name(deployment));
+    return service ? owned(service, deployment) : null;
   }
 
-  async function deployments(service: Service): Promise<Deploy[]> {
-    const result: Deploy[] = [];
-    let cursor = "";
-    const cursors = new Set<string>();
-    for (;;) {
-      const query = new URLSearchParams({ limit: "100", ...(cursor ? { cursor } : {}) });
-      const page = await api.request<Array<{ deploy: Deploy; cursor?: string }>>(
-        "GET",
-        `${path(service)}/deploys?${query}`,
-      );
-      if (!Array.isArray(page)) throw new Error("Render returned an invalid app deployment list");
-      result.push(...page.map((row) => row.deploy));
-      if (page.length < 100) return result;
-      const next = page.at(-1)?.cursor;
-      if (!next || cursors.has(next)) throw new Error("Render deploy pagination did not advance");
-      cursors.add(next);
-      cursor = next;
-    }
-  }
+  const deployments = (service: Service) => list<Deploy>(api, `${path(service)}/deploys`, "deploy");
 
   function endpoint(service: Service, record: StoredRenderDeploy): DeployEndpoint {
     const value = service.serviceDetails.url;
@@ -217,7 +186,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
 
   async function latest(service: Service): Promise<Deploy | undefined> {
     const page = await api.request<Array<{ deploy: Deploy }>>("GET", `${path(service)}/deploys?limit=1`);
-    if (!Array.isArray(page)) throw new Error("Render returned an invalid app deployment list");
+    if (!Array.isArray(page)) throw new Error("Render returned an invalid deploy list");
     return page[0]?.deploy;
   }
 

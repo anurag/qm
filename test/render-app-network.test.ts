@@ -73,10 +73,7 @@ for (const result of ["accepted", "absent", "missing_cursor", "repeated_cursor",
       assert.equal(pages, result === "absent" ? 4 : 2);
       assert.equal(posts, result === "absent" ? 1 : 0);
     } else {
-      await assert.rejects(
-        network.ensure(deployment, initial),
-        /pagination did not advance|invalid app environment list/,
-      );
+      await assert.rejects(network.ensure(deployment, initial), /pagination did not advance|invalid environment list/);
       assert.deepEqual(await store.get(deployment.id), initial);
       assert.equal(posts, 0);
     }

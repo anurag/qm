@@ -476,7 +476,7 @@ for (const status of [undefined, 200])
       await assert.rejects(f.provider.apply(d, { ...v1, version: 2 }), /connection lost|bootstrap is unconfirmed/);
       const posts = f.calls.filter((call) => call.method === "POST").length;
       f.failNextRequest("GET", `${path}?`, status);
-      await assert.rejects(f.restart(sha).apply(d, { ...v1, version: 2 }), /connection lost|invalid app/);
+      await assert.rejects(f.restart(sha).apply(d, { ...v1, version: 2 }), /connection lost|invalid .* list/);
       assert.equal(f.calls.filter((call) => call.method === "POST").length, posts);
     }
   });

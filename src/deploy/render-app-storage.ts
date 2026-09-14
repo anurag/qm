@@ -3,7 +3,7 @@ import { decryptSecret, deriveConnectorKey, encryptSecret } from "../connectors/
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { sleep } from "../util/async.ts";
 import { shq } from "../util/shell.ts";
-import { createRenderApi, RenderApiError, type RenderApi } from "./render-api.ts";
+import { createRenderApi, list, RenderApiError, type RenderApi } from "./render-api.ts";
 
 export interface StoredRenderAppStorage {
   deploymentId: string;
@@ -175,33 +175,17 @@ run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(
   async function findSubmittedJob(
     request: NonNullable<StoredRenderAppStorage["jobRequest"]>,
   ): Promise<string | undefined> {
-    const deadline = Date.now() + (opts.timeoutMs ?? 180_000);
-    let cursor: string | undefined;
-    const cursors = new Set<string>();
     let match: string | undefined;
-    do {
-      const query = new URLSearchParams({ limit: "100", createdAfter: request.createdAfter });
-      if (cursor) query.set("cursor", cursor);
-      const entries = await api.request<Array<{ job: Job; cursor: string }>>("GET", `${path}/jobs?${query}`);
-      if (!Array.isArray(entries)) throw new Error("Render returned an invalid app storage job list");
-      for (const { job } of entries) {
-        if (
-          job.serviceId === opts.minioServiceId &&
-          job.startCommand &&
-          hashCommand(job.startCommand) === request.commandHash
-        ) {
-          if (match && match !== job.id) throw new Error("Render returned duplicate app storage job submissions");
-          match = job.id;
-        }
+    for (const job of await list<Job>(api, `${path}/jobs`, "job", { createdAfter: request.createdAfter })) {
+      if (
+        job.serviceId === opts.minioServiceId &&
+        job.startCommand &&
+        hashCommand(job.startCommand) === request.commandHash
+      ) {
+        if (match && match !== job.id) throw new Error("Render returned duplicate app storage job submissions");
+        match = job.id;
       }
-      cursor = entries.length === 100 ? entries.at(-1)?.cursor : undefined;
-      if (entries.length === 100 && !cursor) throw new Error("Render omitted an app storage job list cursor");
-      if (cursor) {
-        if (cursors.has(cursor)) throw new Error("Render repeated an app storage job list cursor");
-        cursors.add(cursor);
-      }
-      if (Date.now() >= deadline) throw new Error("Render app storage job submission is still unconfirmed");
-    } while (cursor);
+    }
     return match;
   }
 
