@@ -78,6 +78,7 @@ export async function runRenderApp({
   env = process.env,
   gatewayPort = 8080,
   appPort = 8081,
+  shutdownGraceMs = SHUTDOWN_GRACE_MS,
 } = {}) {
   const gatewayToken = env.QM_RENDER_APP_TOKEN;
   if (typeof gatewayToken !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(gatewayToken))
@@ -179,11 +180,11 @@ export async function runRenderApp({
     stopping = true;
     appReady = false;
     forward(signal);
-    const deadline = Date.now() + SHUTDOWN_GRACE_MS;
+    const deadline = Date.now() + shutdownGraceMs;
     shutdownTimer = setTimeout(() => {
       for (const socket of sockets) socket.destroy();
       forward("SIGKILL");
-    }, SHUTDOWN_GRACE_MS);
+    }, shutdownGraceMs);
     shutdown = Promise.all([
       new Promise((done) => {
         server.close(() => {

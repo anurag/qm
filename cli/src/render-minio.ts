@@ -60,10 +60,11 @@ mc_config=$(mktemp -d /tmp/qm-minio.XXXXXX)
 trap 'rm -rf "$mc_config"' EXIT
 trap 'exit 1' HUP INT TERM
 unset MC_HOST_qm MC_CONFIG_ENV_FILE
+mc_quiet() { timeout -s TERM -k 5 30 mc --config-dir "$mc_config" --no-color "$@" >/dev/null 2>&1; }
 run_mc() {
   operation=$1
   shift
-  if ! timeout -s TERM -k 5 30 mc --config-dir "$mc_config" --no-color "$@" >/dev/null 2>&1; then
+  if ! mc_quiet "$@"; then
     printf 'MinIO initialization failed: %s\\n' "$operation" >&2
     exit 1
   fi
@@ -77,7 +78,10 @@ ${JSON.stringify(storagePolicy)}
 QM_MINIO_POLICY
 run_mc 'storage policy' admin policy create qm qm-storage "$mc_config/policy.json"
 printf '%s\\n' "$QM_STORAGE_SECRET_KEY" | run_mc 'storage user' admin user add qm qm-storage
-run_mc 'storage policy attachment' admin policy attach qm qm-storage --user qm-storage
+if ! mc_quiet admin policy attach qm qm-storage --user qm-storage; then
+  run_mc 'storage policy detachment' admin policy detach qm qm-storage --user qm-storage
+  run_mc 'storage policy attachment' admin policy attach qm qm-storage --user qm-storage
+fi
 printf 'MinIO storage is ready\\n'
 `;
   return `/bin/sh -c printf %s ${Buffer.from(script).toString("base64")} | base64 -d | timeout -s TERM -k 10 120 /bin/sh`;

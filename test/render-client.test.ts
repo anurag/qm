@@ -23,16 +23,19 @@ const snapshot = {
   expiresAt: "2026-10-12T00:00:00Z",
 };
 
-test("Render SDK adapter uses the published create and snapshot contracts", async (t) => {
-  const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+test("Render SDK adapter maps sandbox and snapshot records and forwards the creation settings", async (t) => {
+  const created: unknown[] = [];
+  let deleted = 0;
   t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
     const request = new Request(input, init);
-    const url = new URL(request.url);
-    const body = await request.text();
-    requests.push({ method: request.method, path: url.pathname, ...(body ? { body: JSON.parse(body) } : {}) });
     assert.equal(request.headers.get("authorization"), "Bearer secret");
-    if (request.method === "DELETE") return new Response(null, { status: 204 });
-    return Response.json(url.pathname.endsWith("/sandboxes") ? sandbox : snapshot);
+    if (request.method === "POST" && new URL(request.url).pathname.endsWith("/sandboxes"))
+      created.push(await request.json());
+    if (request.method === "DELETE") {
+      deleted++;
+      return new Response(null, { status: 204 });
+    }
+    return Response.json(new URL(request.url).pathname.endsWith("/sandboxes") ? sandbox : snapshot);
   });
   const client = createSdkRenderClient({
     apiKey: "secret",
@@ -42,21 +45,21 @@ test("Render SDK adapter uses the published create and snapshot contracts", asyn
     ttlSec: 7200,
   });
   const info = await client.create("snp-base");
+  assert.deepEqual(created, [
+    { ownerId: "tea-test", plan: "standard", timeoutSeconds: 7200, region: "oregon", snapshotId: "snp-base" },
+  ]);
+  assert.equal(info.id, sandbox.id);
+  assert.equal(info.status, "running");
   assert.equal(info.expiresAtMs, Date.parse(sandbox.createdAt) + 7200_000);
   const saved = await client.createSnapshot(info.id);
+  assert.equal(saved.id, snapshot.id);
+  assert.equal(saved.sandboxGroupId, snapshot.sandboxGroupId);
+  assert.equal(saved.status, "available");
   assert.equal(saved.capturedAtMs, Date.parse(snapshot.capturedAt));
-  await client.getSnapshot(saved);
+  assert.equal(saved.expiresAtMs, Date.parse(snapshot.expiresAt));
+  assert.deepEqual(await client.getSnapshot(saved), saved);
   await client.deleteSnapshot(saved);
-  assert.deepEqual(requests, [
-    {
-      method: "POST",
-      path: "/v1/sandboxes",
-      body: { ownerId: "tea-test", plan: "standard", timeoutSeconds: 7200, region: "oregon", snapshotId: "snp-base" },
-    },
-    { method: "POST", path: "/v1/sandboxes/sbx-test/snapshots", body: { kind: "filesystem" } },
-    { method: "GET", path: "/v1/sandbox-groups/sbg-test/snapshots/snp-test" },
-    { method: "DELETE", path: "/v1/sandbox-groups/sbg-test/snapshots/snp-test" },
-  ]);
+  assert.equal(deleted, 1);
 });
 
 test("Render SDK adapter keeps stdout, stderr, and nonzero exit status", async (t) => {

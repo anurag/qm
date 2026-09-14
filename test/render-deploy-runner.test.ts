@@ -175,7 +175,12 @@ async function runUntilReadyThenExit(input: {
   }
 }
 
-async function startApp(t: TestContext, appSource: string, entrypoint?: string) {
+async function startApp(
+  t: TestContext,
+  appSource: string,
+  entrypoint?: string,
+  options: { shutdownGraceMs?: number } = {},
+) {
   const f = await fixture(t, appSource, entrypoint);
   const manifest = await f.artifacts.prepare(f.d, f.d.versions[0]!);
   const manifestPath = join(f.root, "artifact.json");
@@ -188,6 +193,7 @@ async function startApp(t: TestContext, appSource: string, entrypoint?: string) 
     gatewayPort,
     appPort,
     env: { ...process.env, QM_RENDER_APP_TOKEN: "a".repeat(43) },
+    ...options,
   });
   void running.catch(() => {});
   let finished = false;
@@ -507,6 +513,25 @@ process.on("SIGTERM", () => {
   assert.equal(await app.running, 143);
   assert.equal(await readFile(join(app.appDir, "cleanup.txt"), "utf8"), "complete");
 });
+
+test(
+  "Render runner kills an app that ignores SIGTERM once the shutdown grace period ends",
+  { timeout: 45_000 },
+  async (t) => {
+    const app = await startApp(
+      t,
+      `const server = require("node:http").createServer((_req, res) => res.end("ready"));
+server.listen(Number(process.env.PORT), "127.0.0.1");
+process.on("SIGTERM", () => {});`,
+      undefined,
+      { shutdownGraceMs: 500 },
+    );
+    const stopped = Date.now();
+    process.emit("SIGTERM", "SIGTERM");
+    assert.equal(await app.running, 1);
+    assert.ok(Date.now() - stopped < 10_000);
+  },
+);
 
 async function upgrade(t: TestContext, port: number, token?: string, head = "", until?: string) {
   const socket = connect(port, "127.0.0.1");

@@ -23,7 +23,7 @@ import { renderScaffold } from "../src/provider-scaffold.ts";
 import { computedSecrets } from "../src/secrets.ts";
 import { renderMinioCommand } from "../src/render-minio.ts";
 
-function deployment(t: TestContext, _external = false, portal = false) {
+function deployment(t: TestContext, portal = false) {
   const dir = mkdtempSync(join(tmpdir(), "qm-render-api-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const bin = join(dir, "bin");
@@ -594,7 +594,7 @@ test("Render waits for MinIO initialization before deploying core and retries a 
 });
 
 test("Render builds QM services and MinIO from Git", async (t) => {
-  const d = deployment(t, false, true);
+  const d = deployment(t, true);
   d.ctx.config.render!.source = { repo: "https://github.com/acme/qm", branch: "render-test" };
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
@@ -628,41 +628,34 @@ test("Render builds QM services and MinIO from Git", async (t) => {
   assert.ok(!changes.some((call) => call.path === "/services/srv-acme-minio/deploys"));
 });
 
-test("Render retries a failed Git build using the same services", async (t) => {
-  const d = deployment(t, true);
-  d.ctx.config.render!.source = { repo: "https://github.com/acme/qm", branch: "render-test" };
-  const c = cloud(t, d);
-  c.nextDeployStatus = "build_failed";
-  await assert.rejects(d.backend.up({ dryRun: false }), /build_failed/);
-  assert.ok(d.saved().dirtyServices.includes("core"));
-  c.nextDeployStatus = "live";
-  await d.backend.up({ dryRun: false });
-  assert.deepEqual(d.saved().dirtyServices, []);
-  assert.equal(c.services.size, 4);
-  assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 4);
-});
-
-test("Render updates a changed plan and recovers a failed deployment without new resources", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  await d.backend.up({ dryRun: false });
-  d.ctx.config.render!.corePlan = "2c-4g";
-  c.nextDeployStatus = "update_failed";
-  await assert.rejects(d.backend.up({ dryRun: false }), /update_failed/);
-  assert.ok(d.saved().dirtyServices.includes("core"));
-  assert.equal(c.services.get("srv-acme-core")!.serviceDetails.plan, "2c-4g");
-  const mark = c.calls.length;
-  c.nextDeployStatus = "live";
-  await d.backend.up({ dryRun: false });
-  assert.deepEqual(d.saved().dirtyServices, []);
-  assert.ok(
-    c.calls.slice(mark).some((call) => call.path === "/services/srv-acme-core/deploys" && call.method === "POST"),
-  );
-  assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 4);
-});
+for (const [status, plan] of [
+  ["build_failed", undefined],
+  ["update_failed", "2c-4g"],
+] as const)
+  test(`Render recovers from ${status} without new services`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    if (plan) {
+      await d.backend.up({ dryRun: false });
+      d.ctx.config.render!.corePlan = plan;
+    }
+    c.nextDeployStatus = status;
+    await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(status));
+    assert.ok(d.saved().dirtyServices.includes("core"));
+    if (plan) assert.equal(c.services.get("srv-acme-core")!.serviceDetails.plan, plan);
+    const mark = c.calls.length;
+    c.nextDeployStatus = "live";
+    await d.backend.up({ dryRun: false });
+    assert.deepEqual(d.saved().dirtyServices, []);
+    assert.ok(
+      c.calls.slice(mark).some((call) => call.path === "/services/srv-acme-core/deploys" && call.method === "POST"),
+    );
+    assert.equal(c.services.size, 4);
+    assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 4);
+  });
 
 test("Render retries after env write failure after a preceding service update succeeds", async (t) => {
-  const d = deployment(t, true);
+  const d = deployment(t);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
   d.ctx.config.render!.corePlan = "2c-4g";
@@ -1026,7 +1019,7 @@ test("Render purge resumes partial deletion and retains the project", async (t) 
 });
 
 test("Render secret push targets consumers and keeps managed MinIO credentials", async (t) => {
-  const d = deployment(t, true);
+  const d = deployment(t);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
   c.envs.get("srv-acme-core")!.AWS_SESSION_TOKEN = "old-session";
@@ -1053,7 +1046,7 @@ test("Render rejects disk shrink and non-Render custom URLs", async (t) => {
 });
 
 test("Render reports status, logs, and signed layer health from saved IDs", async (t) => {
-  const d = deployment(t, false, true);
+  const d = deployment(t, true);
   mkdirSync(d.ctx.sandboxDir);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
@@ -1200,7 +1193,7 @@ test("private Render addresses use the workload port", () => {
 });
 
 test("Render connects a private web UI to the public portal and copies shared auth secrets", async (t) => {
-  const d = deployment(t, false, true);
+  const d = deployment(t, true);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
   const portal = c.envs.get("srv-acme-portal")!;

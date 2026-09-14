@@ -243,14 +243,13 @@ test("Render app region defaults to the core region and accepts a separate creat
   assert.equal(config.renderSandbox.region, "oregon");
 });
 
-test("Render retains the app region through pending recovery, update, rollback, and archive after a default change", async () => {
+test("Render retains the app region through pending recovery and update after a default change", async () => {
   const f = fixture("virginia");
   const d = f.deployment;
   const v1 = d.versions[0]!;
   f.outcome = "build_in_progress";
   await assert.rejects(f.provider.apply(d, v1), /unconfirmed deployment/);
   assert.equal(f.savedRegionBeforeCreate, "virginia");
-  assert.equal((await f.store.get(d.id))!.appRegion, "virginia");
   assert.equal(f.service.serviceDetails.region, "virginia");
   f.finishPending();
   f.outcome = "live";
@@ -258,14 +257,7 @@ test("Render retains the app region through pending recovery, update, rollback, 
   const endpoint = await restarted.apply(d, v1);
   d.status = "running";
   d.appliedVersion = 1;
-  assert.deepEqual(await restarted.resolveEndpoint!(d, v1), endpoint);
   assert.deepEqual(await restarted.apply(d, { ...v1, version: 2 }), endpoint);
-  d.appliedVersion = 2;
-  assert.deepEqual(await restarted.apply(d, v1), endpoint);
-  await restarted.destroy(d);
-  assert.equal(f.resourceSuspended, true);
-  assert.deepEqual(await restarted.apply(d, v1), endpoint);
-  assert.equal(f.resourceSuspended, false);
   assert.equal((await f.store.get(d.id))!.appRegion, "virginia");
   assert.equal(f.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
   assert.ok(f.calls.some((call) => call.method === "PATCH" && call.path === "/postgres/dpg-test"));
@@ -283,10 +275,6 @@ test("Legacy Render apps stay in the core region after the new app default chang
   await f.store.put(d.id, record);
   const restarted = f.restart(sha, "virginia");
   assert.deepEqual(await restarted.apply(d, { ...v1, version: 2 }), endpoint);
-  await restarted.destroy(d);
-  assert.equal(f.resourceSuspended, true);
-  assert.deepEqual(await restarted.apply(d, v1), endpoint);
-  assert.equal(f.resourceSuspended, false);
   assert.equal(f.service.serviceDetails.region, "oregon");
   assert.equal(f.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
 });

@@ -10,6 +10,29 @@ import {
   type RenderSandboxInfo,
   type RenderSnapshot,
 } from "../../src/sandbox/render-client.ts";
+import type { RenderApi } from "../../src/deploy/render-api.ts";
+
+export interface FakeRenderApiCall {
+  method: string;
+  path: string;
+  query: URLSearchParams;
+  body?: unknown;
+}
+
+export function createFakeRenderApi(
+  handle: (call: FakeRenderApiCall) => unknown,
+): RenderApi & { calls: FakeRenderApiCall[] } {
+  const calls: FakeRenderApiCall[] = [];
+  return {
+    calls,
+    async request<T>(method: string, path: string, body?: unknown): Promise<T | null> {
+      const url = new URL(path, "https://render.test");
+      const call = { method, path: url.pathname, query: url.searchParams, body };
+      calls.push(call);
+      return (await handle(call)) as T | null;
+    },
+  };
+}
 
 export function createFakeRender() {
   const execute = promisify(execFile);

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { renderMinioInitCommand } from "../src/render-minio.ts";
 
-test("MinIO initialization executes with Render shell arguments and reports failed operations", (t) => {
+test("MinIO initialization executes with Render shell arguments, re-attaches its policy, and reports failed operations", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-minio-command-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const log = join(dir, "calls");
@@ -31,6 +31,13 @@ case "$*" in
     read -r secret
     [ "$secret" = "$QM_STORAGE_SECRET_KEY" ] || exit 1
     ;;
+  *'admin policy attach'*)
+    [ -e "$QM_TEST_MC_STATE" ] && exit 1
+    : > "$QM_TEST_MC_STATE"
+    ;;
+  *'admin policy detach'*)
+    rm -f "$QM_TEST_MC_STATE"
+    ;;
 esac
 if [ "$QM_TEST_FAIL" = 1 ]; then exit 1; fi
 `,
@@ -43,6 +50,7 @@ if [ "$QM_TEST_FAIL" = 1 ]; then exit 1; fi
     MINIO_ROOT_PASSWORD: "test-root-password",
     QM_STORAGE_SECRET_KEY: "test-storage-secret",
     QM_TEST_MC_LOG: log,
+    QM_TEST_MC_STATE: join(dir, "attached"),
     QM_TEST_FAIL: "0",
   };
   const command = renderMinioInitCommand("minio-private");
@@ -56,6 +64,14 @@ if [ "$QM_TEST_FAIL" = 1 ]; then exit 1; fi
   assert.match(operations, /mb --ignore-existing qm\/qm-storage/);
   assert.match(operations, /admin policy attach qm qm-storage --user qm-storage/);
   for (const secret of [env.MINIO_ROOT_PASSWORD, env.QM_STORAGE_SECRET_KEY]) assert.ok(!operations.includes(secret));
+  const rerunLog = join(dir, "rerun-calls");
+  const rerun = spawnSync("/bin/sh", args, { encoding: "utf8", env: { ...env, QM_TEST_MC_LOG: rerunLog } });
+  assert.equal(rerun.status, 0, rerun.stderr);
+  assert.equal(rerun.stdout, "MinIO storage is ready\n");
+  assert.match(
+    readFileSync(rerunLog, "utf8"),
+    /admin policy attach qm qm-storage --user qm-storage\n[^\n]*admin policy detach qm qm-storage --user qm-storage\n[^\n]*admin policy attach qm qm-storage --user qm-storage\n$/,
+  );
   const failed = spawnSync("/bin/sh", args, { encoding: "utf8", env: { ...env, QM_TEST_FAIL: "1" } });
   assert.notEqual(failed.status, 0);
   assert.match(failed.stderr, /MinIO initialization failed: root connection/);
