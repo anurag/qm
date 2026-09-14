@@ -40,6 +40,7 @@ interface RenderPending {
   runnerCommit: string;
   readinessNonce: string;
   previousDeployId?: string;
+  previousDeployIds?: string[];
   deployId?: string;
 }
 
@@ -178,18 +179,34 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     };
   }
 
-  async function ready(service: Service, record: StoredRenderDeploy, nonce: string): Promise<boolean> {
+  async function probe(
+    service: Service,
+    record: StoredRenderDeploy,
+  ): Promise<{ address: DeployEndpoint; response?: Response }> {
     const address = endpoint(service, record);
     try {
-      const response = await fetchImpl(`https://${address.host}:${address.port}/__qm_ready`, {
-        headers: address.proxyHeaders,
-        redirect: "manual",
-        signal: AbortSignal.timeout(3_000),
-      });
-      await response.body?.cancel();
-      return response.status === 204 && response.headers.get("x-qm-render-app-ready") === nonce;
+      const request = async (target: DeployEndpoint) => {
+        const response = await fetchImpl(`https://${target.host}:${target.port}/__qm_ready`, {
+          headers: target.proxyHeaders,
+          redirect: "manual",
+          signal: AbortSignal.timeout(3_000),
+        });
+        await response.body?.cancel();
+        return response;
+      };
+      const response = await request(address);
+      if (response.status === 403 || (response.status === 204 && !response.headers.has("x-qm-render-app-ready"))) {
+        const legacy = {
+          ...address,
+          proxyHeaders: { ...address.proxyHeaders, [RENDER_APP_AUTH_HEADER]: record.token },
+        };
+        const accepted = await request(legacy);
+        if (accepted.status === 204 && accepted.headers.has("x-qm-render-app-ready"))
+          return { address: legacy, response: accepted };
+      }
+      return { address, response };
     } catch {
-      return false;
+      return { address };
     }
   }
 
@@ -212,8 +229,14 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
   async function finish(
     deployment: Deployment,
     initial: StoredRenderDeploy & { pending: RenderPending },
-  ): Promise<{ service: Service; record: StoredRenderDeploy }> {
+  ): Promise<{ service: Service; record: StoredRenderDeploy; address: DeployEndpoint }> {
     let record = initial;
+    const isPrevious = (id: string) =>
+      id === record.pending.previousDeployId || record.pending.previousDeployIds?.includes(id);
+    if (record.pending.deployId && isPrevious(record.pending.deployId)) {
+      record = { ...record, pending: { ...record.pending, deployId: undefined } };
+      await save(record);
+    }
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       const service = await find(deployment, record);
@@ -224,9 +247,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         if (!record.pending.deployId) {
           const own = (deploy: Deploy | undefined) =>
-            deploy && deploy.id !== record.pending.previousDeployId && deploy.commit?.id === record.pending.runnerCommit
-              ? deploy
-              : undefined;
+            deploy && !isPrevious(deploy.id) && deploy.commit?.id === record.pending.runnerCommit ? deploy : undefined;
           let found = own(await latest(service));
           if (!found) {
             try {
@@ -255,14 +276,19 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
             await save({ ...record, pending: undefined });
             throw new Error(`Render deploy ${deploy.id} ${deploy.status}`);
           }
-          if (deploy?.status === "live" && (await ready(service, record, readinessNonce))) {
+          const checked = deploy?.status === "live" ? await probe(service, record) : undefined;
+          if (
+            deploy &&
+            checked?.response?.status === 204 &&
+            checked.response.headers.get("x-qm-render-app-ready") === readinessNonce
+          ) {
             if (deploy.commit?.id !== runnerCommit) {
               await save({ ...record, pending: undefined });
               throw new Error("The Render app runner was built from a different Git commit");
             }
             const live: StoredRenderDeploy = { ...record, liveVersion: version, suspended: false, pending: undefined };
             await save(live);
-            return { service, record: live };
+            return { service, record: live, address: checked.address };
           }
         }
       }
@@ -294,7 +320,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     if (record.pending) {
       const recovered = await finish(deployment, { ...record, pending: record.pending });
       record = recovered.record;
-      if (record.liveVersion === version.version) return endpoint(recovered.service, record);
+      if (record.liveVersion === version.version) return recovered.address;
     }
     let service = await find(deployment, record);
     if (
@@ -304,7 +330,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       record.liveVersion === version.version &&
       deployment.appliedVersion !== version.version
     )
-      return endpoint(service, record);
+      return (await probe(service, record)).address;
     const source = { repo: opts.source.repo, branch: opts.source.branch, rootDir: "", autoDeploy: "no" };
     const runtime = {
       runtime: "docker",
@@ -383,7 +409,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     };
     await save(submitted);
     const live = await finish(deployment, submitted);
-    return endpoint(live.service, live.record);
+    return live.address;
   }
 
   return {
@@ -397,8 +423,9 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       if (cached) return cached;
       const service = await find(deployment, record);
       if (!service || service.suspended === "suspended") return null;
-      const address = endpoint(service, record);
-      endpoints.set(deployment.id, address);
+      const { address, response } = await probe(service, record);
+      if (response?.status === 204 && response.headers.has("x-qm-render-app-ready"))
+        endpoints.set(deployment.id, address);
       return address;
     },
     destroy: (deployment) =>

@@ -37,6 +37,7 @@ function fixture(appRegion?: string) {
   let activeEnv: any[] = [];
   let manifestNonce: string | undefined;
   let readinessNonce: string | null | undefined;
+  let legacyGateway = false;
   const data = new Map<string, string>();
   let resourceSuspended = false;
   let savedRegionBeforeCreate: string | undefined;
@@ -86,6 +87,9 @@ function fixture(appRegion?: string) {
         throw new TypeError("connection lost before write");
       }
       if (url.hostname === "qm-private") {
+        const token = new Headers(init?.headers).get("x-qm-render-app-token");
+        const raw = (await store.get(deployment.id))!.token;
+        if (legacyGateway ? token !== raw : token === raw) return new Response(null, { status: 204 });
         const nonce = readinessNonce === undefined ? manifestNonce : readinessNonce;
         return new Response(null, { status: 204, headers: nonce ? { "x-qm-render-app-ready": nonce } : {} });
       }
@@ -212,6 +216,9 @@ function fixture(appRegion?: string) {
     },
     set readinessNonce(value: string | null | undefined) {
       readinessNonce = value;
+    },
+    set legacyGateway(value: boolean) {
+      legacyGateway = value;
     },
     set outcome(value: string) {
       outcome = value;
@@ -552,6 +559,56 @@ test("A restarted Render provider reconciles a pending deploy against its saved 
   assert.equal((await f.store.get(f.deployment.id))!.liveVersion, 1);
   assert.equal((await f.store.get(f.deployment.id))!.pending, undefined);
   assert.equal(f.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length, 1);
+});
+
+for (const adopted of [false, true])
+  test(`Render excludes all deploy IDs saved by an older pending update with an ${adopted ? "incorrectly adopted" : "unassigned"} deploy`, async () => {
+    const f = fixture();
+    const d = f.deployment;
+    const v1 = d.versions[0]!;
+    await f.provider.apply(d, v1);
+    d.appliedVersion = 1;
+    f.failNextRequest("POST", "/services/srv-app/deploys");
+    const v2 = { ...v1, version: 2 };
+    await assert.rejects(f.provider.apply(d, v2), /connection lost/);
+    const record = (await f.store.get(d.id))!;
+    const previous = record.pending!.previousDeployId!;
+    await f.store.put(d.id, {
+      ...record,
+      pending: {
+        ...record.pending!,
+        previousDeployId: undefined,
+        previousDeployIds: ["dep-old", previous],
+        deployId: adopted ? previous : undefined,
+      },
+    });
+    const posts = () => f.calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys")).length;
+    const before = posts();
+    await f.restart(sha).apply(d, v2);
+    assert.equal(posts(), before + 1);
+    assert.equal((await f.store.get(d.id))!.liveVersion, 2);
+    assert.equal((await f.store.get(d.id))!.pending, undefined);
+    await f.restart(sha).destroy(d);
+    assert.equal(f.resourceSuspended, true);
+  });
+
+test("Render keeps older runners reachable and uses signed tokens after a runner update", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  f.legacyGateway = true;
+  const original = await f.provider.apply(d, v1);
+  const token = (await f.store.get(d.id))!.token;
+  assert.equal(original.proxyHeaders!["x-qm-render-app-token"], token);
+  d.status = "running";
+  d.appliedVersion = 1;
+  const restarted = f.restart(sha);
+  assert.deepEqual(await restarted.resolveEndpoint!(d, v1), original);
+  f.legacyGateway = false;
+  const updated = await restarted.apply(d, { ...v1, version: 2 });
+  assert.match(updated.proxyHeaders!["x-qm-render-app-token"]!, /^\d+\.[a-zA-Z0-9_-]{43}$/);
+  assert.notEqual(updated.proxyHeaders!["x-qm-render-app-token"], token);
+  assert.deepEqual(await restarted.resolveEndpoint!(d, v1), updated);
 });
 
 test("Render waits for the new instance nonce through old responses, lost deploy replies, and restarts", async () => {
