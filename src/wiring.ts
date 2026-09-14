@@ -1,4 +1,3 @@
-import { createRenderDeployService } from "./deploy/render-deploy-service.ts";
 import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/render-deploy-provider.ts";
 import {
   createRenderDeployArtifacts,
@@ -1488,8 +1487,7 @@ export function buildApp(
   membership.managesArtifactHome = managesArtifactHome;
   const deployGitSecret = config.signingSecret;
   const deployGitBase = config.apiBaseUrl;
-  const deployService = (config.deployProvider === "render" ? createRenderDeployService : createDeployService)({
-    renderStore: renderDeployBodies,
+  const deployService = createDeployService({
     deployStore,
     provider: deployProvider,
     deployDir: join(config.dataDir, "deployments"),

@@ -1,18 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   createRenderDeployProvider,
   type RenderDeployProviderOptions,
   type StoredRenderDeploy,
 } from "../src/deploy/render-deploy-provider.ts";
-import { createRenderDeployService } from "../src/deploy/render-deploy-service.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
-import { createDeployStore, type Deployment } from "../src/deploy/deploy-store.ts";
-import { createAclStore } from "../src/acl/acl-store.ts";
+import type { Deployment } from "../src/deploy/deploy-store.ts";
 import { scopeId } from "../src/types.ts";
 import { loadConfig } from "../src/config.ts";
 
@@ -580,38 +575,6 @@ test("Render refuses changed service ownership and missing retained infrastructu
     f.calls.slice(before).some((c) => c.method !== "GET"),
     false,
   );
-});
-
-test("Render service resets a confirmed failed version while retaining its history", async (t) => {
-  const f = fixture();
-  const root = await mkdtemp(join(tmpdir(), "qm-render-service-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const deployStore = createDeployStore({ git: { repoRoot: join(root, "git") } });
-  const deploy = createRenderDeployService({
-    deployStore,
-    provider: f.provider,
-    renderStore: f.store,
-    deployDir: root,
-    acl: createAclStore(),
-    auditLog: { record() {}, events: async () => [], tail: async () => [] },
-  });
-  const d = await deploy.deploy({
-    ownerScopeId: scopeId("personal", "U1"),
-    createdBy: "U1",
-    name: "sample",
-    entrypoint: "node app.js",
-    files: [{ path: "app.js", data: "first" }],
-  });
-  f.outcome = "build_failed";
-  await assert.rejects(
-    deploy.redeploy(d.id, { entrypoint: "node app.js", files: [{ path: "app.js", data: "second" }] }),
-    /build_failed/,
-  );
-  const after = await deploy.getDeployment(d.id);
-  assert.equal(after!.currentVersion, 1);
-  assert.equal(after!.appliedVersion, 1);
-  assert.equal(after!.versions.length, 2);
-  assert.equal((await deploy.reachDeployment(d.id, "U1")).status, "ok");
 });
 
 test("Render resumes a dashboard-suspended service before reusing its live version", async () => {
