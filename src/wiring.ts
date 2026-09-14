@@ -1395,6 +1395,7 @@ export function buildApp(
       appEndpoint: render.appDatabaseEndpoint,
       store: artifactMap<StoredRenderAppDatabase>("render_app_databases"),
       keyMaterial: config.connectorSecretKey,
+      advisoryLock,
     });
     const storage = createRenderAppStorage({
       apiKey: render.apiKey,

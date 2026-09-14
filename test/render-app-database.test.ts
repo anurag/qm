@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { test, type TestContext } from "node:test";
@@ -64,7 +65,13 @@ async function fixture(t: TestContext) {
   await query(adminUrl.toString(), "CREATE TABLE core_secrets (id integer PRIMARY KEY, value text)");
   await query(adminUrl.toString(), "INSERT INTO core_secrets VALUES (1, 'private')");
   const create = (backing: DurableMap<StoredRenderAppDatabase> = store, appEndpoint?: string) =>
-    createRenderAppDatabase({ adminUrl: adminUrl.toString(), store: backing, keyMaterial, appEndpoint });
+    createRenderAppDatabase({
+      adminUrl: adminUrl.toString(),
+      store: backing,
+      keyMaterial,
+      appEndpoint,
+      advisoryLock: createMemoryAdvisoryLock(),
+    });
   return { root, store, maps, create, adminUrl: adminUrl.toString(), adminRole, coreDatabase };
 }
 

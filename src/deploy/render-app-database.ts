@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import pg from "pg";
 import { decryptSecret, deriveConnectorKey, encryptSecret } from "../connectors/connector-client-store.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
+import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 
 export interface StoredRenderAppDatabase {
   deploymentId: string;
@@ -60,6 +61,7 @@ export function createRenderAppDatabase(opts: {
   appEndpoint?: string;
   store: DurableMap<StoredRenderAppDatabase>;
   keyMaterial: string | Buffer;
+  advisoryLock?: AdvisoryLock;
 }): { ensure(deploymentId: string): Promise<Record<string, string>>; suspend(deploymentId: string): Promise<void> } {
   let adminUrl: URL;
   try {
@@ -80,6 +82,21 @@ export function createRenderAppDatabase(opts: {
   const appEndpoint = opts.appEndpoint ? parseRenderAppDatabaseEndpoint(opts.appEndpoint) : adminUrl;
   if (!opts.keyMaterial.length) throw new Error("Render app databases require an encryption key");
   const key = deriveConnectorKey(opts.keyMaterial, "render-app-database");
+  const locks = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const provisioning = <T>(run: (client: pg.Client) => Promise<T>): Promise<T> =>
+    locks.withLock("render-app-databases", async () => {
+      const client = new pg.Client({ connectionString: opts.adminUrl, connectionTimeoutMillis: 10_000 });
+      client.on("error", () => {});
+      try {
+        await client.connect();
+        await client.query("SET statement_timeout = '30s'");
+        return await run(client);
+      } catch (error) {
+        throw provisioningFailure(error);
+      } finally {
+        await client.end();
+      }
+    });
   const identifier = pg.escapeIdentifier;
   const literal = pg.escapeLiteral;
   const marker = (record: StoredRenderAppDatabase) => `qm:render-app:${record.deploymentId}:${record.ownershipToken}`;
@@ -144,13 +161,8 @@ export function createRenderAppDatabase(opts: {
   }
 
   return {
-    async suspend(deploymentId) {
-      const client = new pg.Client({ connectionString: opts.adminUrl, connectionTimeoutMillis: 10_000 });
-      client.on("error", () => {});
-      try {
-        await client.connect();
-        await client.query("SET statement_timeout = '30s'");
-        await client.query("SELECT pg_advisory_lock(hashtextextended('qm:render-app-databases', 0))");
+    suspend: (deploymentId) =>
+      provisioning(async (client) => {
         const record = await opts.store.get(deploymentId);
         if (!record) return;
         const found = await client.query<{ marker: string }>(
@@ -171,21 +183,11 @@ export function createRenderAppDatabase(opts: {
         );
         if (remaining.rowCount)
           throw new ProvisioningError("The Render app database sessions did not stop before the deadline");
-      } catch (error) {
-        throw provisioningFailure(error);
-      } finally {
-        await client.end();
-      }
-    },
+      }),
     async ensure(deploymentId) {
       if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(deploymentId))
         throw new Error("Render app databases require a deployment UUID");
-      const client = new pg.Client({ connectionString: opts.adminUrl, connectionTimeoutMillis: 10_000 });
-      client.on("error", () => {});
-      try {
-        await client.connect();
-        await client.query("SET statement_timeout = '30s'");
-        await client.query("SELECT pg_advisory_lock(hashtextextended('qm:render-app-databases', 0))");
+      return provisioning(async (client) => {
         const identity = await client.query<{ database: string; admin: string }>(
           "SELECT current_database() AS database, current_user AS admin",
         );
@@ -291,11 +293,7 @@ export function createRenderAppDatabase(opts: {
         }
         if (!record.ready) await opts.store.put(deploymentId, { ...record, ready: true });
         return { DATABASE_URL: connectionUrl(appEndpoint, record.database, login) };
-      } catch (error) {
-        throw provisioningFailure(error);
-      } finally {
-        await client.end();
-      }
+      });
     },
   };
 }
