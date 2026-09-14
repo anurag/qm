@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -127,6 +128,43 @@ test("Render uses its durable home archive when a native checkpoint expires", as
   assert.ok(fake.deleted.includes(stored.checkpoint!.id));
   assert.equal((await store.get(scope))!.retiredResources, undefined);
 });
+
+for (const native of ["stale", "expired", "missing"])
+  test(`Render restores an older home archive with a ${native} native checkpoint and retires its old resources`, async (t) => {
+    const { make, fake, layers, store, scope, snapshots } = setup(t);
+    await make().provision(layers);
+    const stored = (await store.get(scope))!;
+    const key = randomUUID();
+    const retiredKey = randomUUID();
+    const archive = await makeTar([{ path: "workspace/retained", data: Buffer.from("newer portable backup") }]);
+    await snapshots.put(key, archive);
+    await snapshots.put(retiredKey, archive);
+    await snapshots.delete(scope);
+    const pending = await fake.client.createSnapshot(stored.sandboxId);
+    await store.merge(scope, {
+      homeSnapshotKey: key,
+      checkpointCurrent: native !== "stale",
+      pendingCheckpoint: pending,
+      retiredResources: [{ homeSnapshotKey: retiredKey }],
+    });
+    if (native === "expired") fake.snapshots.get(stored.checkpoint!.id)!.expiresAtMs = Date.now() - 1;
+    if (native === "missing") await fake.client.deleteSnapshot(stored.checkpoint!);
+    await fake.client.terminate(stored.sandboxId);
+    const target = make();
+    const restored = await target.provision(layers);
+    assert.equal(await target.readFile(restored, "retained"), "newer portable backup");
+    assert.equal(fake.createdFrom[1], undefined);
+    assert.equal(await readBackup(snapshots, retiredKey), null);
+    assert.ok(await readBackup(snapshots, key));
+    await target.teardown(restored);
+    assert.equal(await readBackup(snapshots, key), null);
+    assert.ok(await readBackup(snapshots, scope));
+    assert.equal(fake.snapshots.has(pending.id), false);
+    assert.equal((await store.get(scope))!.homeSnapshotKey, undefined);
+    assert.equal((await store.get(scope))!.checkpointCurrent, undefined);
+    await target.destroyScope!(scope);
+    assert.equal(await readBackup(snapshots, scope), null);
+  });
 
 test("Render refuses a blank replacement when the recorded home archive is missing", async (t) => {
   const { make, fake, layers, store, scope, snapshots } = setup(t);
@@ -410,6 +448,35 @@ test("Render cleans a first-import native checkpoint when its staging record wri
   assert.equal(await store.get(scope), null);
   assert.equal(fake.snapshots.size, 0);
   assert.equal(fake.sandboxes.get("sbx-1")?.status, "terminated");
+});
+
+test("Render retries abandoned import cleanup after its record deletion fails", async (t) => {
+  const { make, fake, layers, store, scope, blobTransfer } = setup(t);
+  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("discarded") }]));
+  fake.failCheckpoint(new Error("native snapshot outage"));
+  fake.failTerminate(new Error("terminate outage"), "sbx-1");
+  await assert.rejects(make().adoptHomeSnapshot!(scope, blob.blobId), /native snapshot outage/);
+  fake.failCheckpoint();
+  fake.failTerminate(undefined, "sbx-1");
+  const remove = store.delete;
+  let failDelete = true;
+  t.mock.method(store, "delete", async (key: string) => {
+    if (failDelete) {
+      failDelete = false;
+      throw new Error("record delete outage");
+    }
+    await remove(key);
+  });
+  await assert.rejects(make().provision(layers), /record delete outage/);
+  assert.equal((await store.get(scope))!.discarded, true);
+  assert.equal((await store.get(scope))!.retiredResources, undefined);
+  assert.equal(fake.sandboxes.get("sbx-1")?.status, "terminated");
+  const next = make();
+  assert.equal((await next.computerStatus!(scope)).provisioned, false);
+  const handle = await next.provision(layers);
+  assert.equal(handle.coldStart, true);
+  assert.equal(await next.readFile(handle, "work"), null);
+  assert.equal((await store.get(scope))!.discarded, undefined);
 });
 
 test("Render cleans an import after the first staging write fails over an existing home", async (t) => {
@@ -705,4 +772,71 @@ test("Render reaper checkpoints changes a throttled teardown left behind", async
   await store.merge(scope, { homeCheckpointAtMs: stale });
   assert.deepEqual(await sandbox.reapDeepIdle!(3600_000), { reaped: 0 });
   assert.equal((await store.get(scope))!.homeCheckpointAtMs, stale);
+});
+
+test("Render saves completed work after a recent checkpoint near sandbox expiry", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const sandbox = make(undefined, 5 * 60_000);
+  const handle = await sandbox.provision(layers);
+  const stored = (await store.get(scope))!;
+  const processPath = "/root/.agent-proc/11111111-1111-1111-1111-111111111111";
+  await fake.client.writeFileBytes(stored.sandboxId, `${processPath}/cmd`, Buffer.from("background work"));
+  await fake.client.writeFileBytes(stored.sandboxId, `${processPath}/started`, Buffer.from("1"));
+  await sandbox.writeFile(handle, "final-output", "in progress");
+  const expiresAtMs = now + 4 * 60_000;
+  fake.sandboxes.get(stored.sandboxId)!.expiresAtMs = expiresAtMs;
+  await store.merge(scope, { expiresAtMs, homeCheckpointAtMs: now - 6 * 60_000 });
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  assert.equal((await store.get(scope))!.homeCheckpointAtMs, now);
+  now += 60_000;
+  await fake.client.writeFileBytes(stored.sandboxId, `${processPath}/code`, Buffer.from("0"));
+  await sandbox.writeFile(handle, "final-output", "complete");
+  await sandbox.teardown(handle, { keepWarm: true });
+  assert.equal((await store.get(scope))!.homeCheckpointAtMs, now);
+  assert.equal((await store.get(scope))!.homeDirty, false);
+  now = expiresAtMs + 1;
+  await fake.client.terminate(stored.sandboxId);
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  const next = make();
+  const restored = await next.provision(layers);
+  assert.equal(await next.readFile(restored, "final-output"), "complete");
+});
+
+test("Render backs up each interval of a detached process and its completed output", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const sandbox = make(undefined, 5 * 60_000);
+  const handle = await sandbox.provision(layers);
+  const initial = (await store.get(scope))!;
+  const processPath = "/root/.agent-proc/11111111-1111-1111-1111-111111111111";
+  await fake.client.writeFileBytes(initial.sandboxId, `${processPath}/cmd`, Buffer.from("background work"));
+  await fake.client.writeFileBytes(initial.sandboxId, `${processPath}/started`, Buffer.from("1"));
+  await sandbox.writeFile(handle, "foreground-output", "complete");
+  await sandbox.teardown(handle, { keepWarm: true });
+  assert.equal((await store.get(scope))!.homeCheckpointAtMs, initial.homeCheckpointAtMs);
+  assert.equal((await store.get(scope))!.homeDirty, true);
+  now += 6 * 60_000;
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  assert.equal((await store.get(scope))!.homeCheckpointAtMs, now);
+  assert.equal((await store.get(scope))!.homeDirty, true);
+  assert.equal(fake.sandboxes.get(initial.sandboxId)?.status, "running");
+  await fake.client.writeFileBytes(initial.sandboxId, "/root/workspace/detached-output", Buffer.from("in progress"));
+  now += 6 * 60_000;
+  await sandbox.reapDeepIdle!(0);
+  assert.equal((await store.get(scope))!.homeCheckpointAtMs, now);
+  assert.equal((await store.get(scope))!.homeDirty, true);
+  await fake.client.writeFileBytes(initial.sandboxId, "/root/workspace/detached-output", Buffer.from("complete"));
+  await fake.client.writeFileBytes(initial.sandboxId, `${processPath}/code`, Buffer.from("0"));
+  now += 6 * 60_000;
+  await sandbox.reapDeepIdle!(0);
+  assert.equal((await store.get(scope))!.homeCheckpointAtMs, now);
+  assert.equal((await store.get(scope))!.homeDirty, false);
+  await fake.client.terminate(initial.sandboxId);
+  const next = make();
+  const restored = await next.provision(layers);
+  assert.equal(await next.readFile(restored, "foreground-output"), "complete");
+  assert.equal(await next.readFile(restored, "detached-output"), "complete");
 });

@@ -29,14 +29,18 @@ import {
 interface RenderSandboxResources {
   sandboxId?: string;
   checkpoint?: RenderSnapshot;
+  pendingCheckpoint?: RenderSnapshot;
+  homeSnapshotKey?: string;
 }
 
 export interface StoredRenderSandbox extends RenderSandboxResources {
   sandboxId: string;
+  discarded?: boolean;
   expiresAtMs: number;
   lastActivityMs: number;
   homeCheckpointAtMs?: number;
   homeDirty?: boolean;
+  checkpointCurrent?: boolean;
   retiredResources?: RenderSandboxResources[];
   retirementError?: string;
   recoveryError?: string;
@@ -87,7 +91,8 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     return scope;
   };
   const cleanupOnly = (stored: StoredRenderSandbox): boolean =>
-    stored.retiredResources?.some((resources) => resources.sandboxId === stored.sandboxId) ?? false;
+    stored.discarded === true ||
+    (stored.retiredResources?.some((resources) => resources.sandboxId === stored.sandboxId) ?? false);
   const idFor = async (name: string): Promise<string> => {
     const temporary = scratch.get(name);
     if (temporary) return temporary.id;
@@ -142,11 +147,15 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   const resourcesFor = (stored: StoredRenderSandbox): RenderSandboxResources => ({
     sandboxId: stored.sandboxId,
     checkpoint: stored.checkpoint,
+    pendingCheckpoint: stored.pendingCheckpoint,
+    homeSnapshotKey: stored.homeSnapshotKey,
   });
 
   async function disposeResources(resources: RenderSandboxResources): Promise<void> {
     if (resources.sandboxId) await client.terminate(resources.sandboxId);
     if (resources.checkpoint) await client.deleteSnapshot(resources.checkpoint);
+    if (resources.pendingCheckpoint) await client.deleteSnapshot(resources.pendingCheckpoint);
+    if (resources.homeSnapshotKey) await opts.snapshots.delete(resources.homeSnapshotKey);
   }
 
   async function cleanupRetired(scope: string, stored: StoredRenderSandbox): Promise<StoredRenderSandbox> {
@@ -160,6 +169,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       }
       retired.shift();
       stored = (await store.merge(scope, {
+        ...(cleanupOnly(stored) ? { discarded: true } : {}),
         retiredResources: retired.length ? retired : undefined,
         retirementError: undefined,
       }))!;
@@ -184,12 +194,24 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
 
   async function checkpoint(scope: string, stored: StoredRenderSandbox): Promise<StoredRenderSandbox> {
     if (cleanupOnly(stored)) throw new Error(`Render sandbox is not provisioned: ${scope}`);
+    const active = await hasLiveProcesses(stored.sandboxId);
     await homeSnapshots.snapshotHome(scope, stored.sandboxId);
     const published = await store.merge(scope, {
       homeCheckpointAtMs: Date.now(),
-      homeDirty: false,
+      homeDirty: active,
       checkpoint: undefined,
-      ...(stored.checkpoint ? { retiredResources: retire(stored, { checkpoint: stored.checkpoint }) } : {}),
+      checkpointCurrent: undefined,
+      pendingCheckpoint: undefined,
+      homeSnapshotKey: undefined,
+      ...(stored.checkpoint || stored.pendingCheckpoint || stored.homeSnapshotKey
+        ? {
+            retiredResources: retire(stored, {
+              checkpoint: stored.checkpoint,
+              pendingCheckpoint: stored.pendingCheckpoint,
+              homeSnapshotKey: stored.homeSnapshotKey,
+            }),
+          }
+        : {}),
     });
     if (!published) throw new Error(`Render sandbox home backup lost its scope: ${scope}`);
     stored = await cleanupRetired(scope, published);
@@ -244,7 +266,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       } else if (info && info.status !== "terminated" && info.status !== "errored") {
         throw new Error(`Render sandbox ${info.id} is ${info.status}; retry after its transition ends`);
       }
-      if (stored.checkpoint && stored.checkpoint.expiresAtMs > Date.now()) {
+      if (stored.checkpointCurrent !== false && stored.checkpoint && stored.checkpoint.expiresAtMs > Date.now()) {
         const snapshot = await client.getSnapshot(stored.checkpoint).catch((error) => {
           if (error instanceof RenderSnapshotGoneError) return null;
           throw error;
@@ -267,7 +289,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       if (info.expiresAtMs <= Date.now() + (defaultTimeoutSec + 60) * 1000) {
         throw new Error("Render sandbox lifetime must exceed the command timeout by at least 60 seconds");
       }
-      if (stored && !snapshotId && !(await homeSnapshots.hydrateHome(scope, info.id))) {
+      if (stored && !snapshotId && !(await homeSnapshots.hydrateHome(stored.homeSnapshotKey ?? scope, info.id))) {
         throw new Error("Render sandbox home checkpoint is missing; refusing a blank replacement");
       }
       if (snapshotId) {
@@ -411,6 +433,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           } else {
             await store.put(scope, {
               sandboxId: info.id,
+              discarded: true,
               expiresAtMs: info.expiresAtMs,
               lastActivityMs: 0,
               retiredResources,
@@ -478,7 +501,11 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
         if (!options?.homeUnchanged && stored.homeDirty !== true)
           stored = (await store.merge(scope, { homeDirty: true })) ?? stored;
         const bookkeeping = { lastSnapshotMs: stored.homeCheckpointAtMs, homeDirty: stored.homeDirty };
-        if (snapshotDue(bookkeeping, options, checkpointIntervalMs)) await checkpoint(scope, stored);
+        if (
+          snapshotDue(bookkeeping, options, checkpointIntervalMs) ||
+          (stored.homeDirty === true && stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs)
+        )
+          await checkpoint(scope, stored);
         await store.merge(scope, { lastActivityMs: Date.now() });
       });
     },
@@ -504,7 +531,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs ||
           stale(stored));
       for (const [scope, candidate] of await store.entries()) {
-        if (!due(candidate) && !candidate.retiredResources?.length) continue;
+        if (!due(candidate) && !candidate.discarded && !candidate.retiredResources?.length) continue;
         await withLock(nameFor(scope), async () => {
           let stored = await store.get(scope);
           if (stored) stored = await recoverStored(scope, stored);
@@ -516,7 +543,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           const idle = stored.lastActivityMs <= cutoff;
           if (!expiresSoon && !idle && !stale(stored)) return;
           const active = await hasLiveProcesses(info.id);
-          if (active && !expiresSoon) return;
+          if (active && !expiresSoon && !stale(stored)) return;
           if (
             (!active && (idle || rotate || stale(stored))) ||
             Date.now() - (stored.homeCheckpointAtMs ?? 0) >= checkpointIntervalMs
