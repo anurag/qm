@@ -10,7 +10,6 @@ import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/re
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { S3Client } from "@aws-sdk/client-s3";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
-import { createRenderAdvisoryLock } from "./persistence/render-advisory-lock.ts";
 import { createRenderSnapshotStore } from "./sandbox/render-snapshot-store.ts";
 import { createRenderSandbox, type StoredRenderSandbox } from "./sandbox/render-sandbox.ts";
 import { createSdkRenderClient } from "./sandbox/render-client.ts";
@@ -581,7 +580,7 @@ export function buildApp(
     : createNoopLeaderLease();
   const renderSelected = enabledSandboxBackends(config).includes("render") || config.deployProvider === "render";
   const advisoryLock: AdvisoryLock = pgArtifactMap
-    ? (renderSelected ? createRenderAdvisoryLock : createPostgresAdvisoryLock)(pgArtifactMap.pool)
+    ? createPostgresAdvisoryLock(pgArtifactMap.pool)
     : createMemoryAdvisoryLock();
   const configStore = createMemoryConfigStore(config.orgId, {
     connectorClients: artifactMap<StoredConnectorClient>("connector_clients"),
@@ -713,7 +712,6 @@ export function buildApp(
   const resolution = createResolutionService(config.orgId, configStore, acl);
 
   if (renderSelected && !config.databaseUrl) throw new Error("Render requires DATABASE_URL");
-  const renderLock = advisoryLock;
   const s3 = new S3Client({
     ...(config.s3Region ? { region: config.s3Region } : {}),
     ...(config.s3Endpoint ? { endpoint: config.s3Endpoint } : {}),
@@ -953,7 +951,7 @@ export function buildApp(
         prefix: `${config.s3Prefix ?? ""}render-home`,
         s3,
       }),
-      advisoryLock: renderLock,
+      advisoryLock,
       extraTools: deploymentLayer.advertisedTools,
       credentialPaths: deploymentLayer.credentialPaths,
       layerToolFiles: () => deploymentLayer.installFiles,
@@ -1418,7 +1416,7 @@ export function buildApp(
       environmentId: render.environmentId,
       store: renderDeployBodies,
       artifacts: renderArtifacts,
-      advisoryLock: renderLock,
+      advisoryLock,
       resources: {
         ensure: async (id) => ({ ...(await database.ensure(id)), ...(await storage.ensure(id)) }),
         suspend: async (id) => {
@@ -1498,7 +1496,7 @@ export function buildApp(
     auditLog,
     acl,
     leaderLease,
-    advisoryLock: renderLock,
+    advisoryLock,
     canReadScope,
     canWriteScope,
     managesArtifactHome,
