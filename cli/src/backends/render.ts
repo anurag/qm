@@ -675,7 +675,7 @@ function serviceEnv(
   for (const secret of computedSecrets(ctx.config)) {
     if (secret.managedBy !== "operator" || resolved.has(secret.name)) continue;
     const names = runtimeSecretNames(
-      workload.name,
+      renderEnvService(workload.name),
       secret,
       ctx.config.plugins.filter((item) => item.coreAccess !== false).map((item) => item.name),
     );

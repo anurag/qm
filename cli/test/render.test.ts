@@ -1107,6 +1107,17 @@ test("Render secret push targets consumers and keeps managed MinIO credentials",
   assert.deepEqual(d.saved().dirtyServices, []);
 });
 
+test("Render updates retain stored operator secrets for the core and worker", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  for (const service of ["srv-acme-core", "srv-acme-worker"]) c.envs.get(service)!.RESEND_API_KEY = "re_stored_only";
+  await d.backend.up({ dryRun: false });
+  for (const service of ["srv-acme-core", "srv-acme-worker"])
+    assert.equal(c.envs.get(service)!.RESEND_API_KEY, "re_stored_only");
+  assert.equal(c.envs.get("srv-acme-web-ui")!.RESEND_API_KEY, undefined);
+});
+
 test("Render rejects disk shrink and non-Render custom URLs", async (t) => {
   const d = deployment(t);
   cloud(t, d);
