@@ -37,29 +37,25 @@ function releaseLock(lock: string, owner?: string): void {
   }
 }
 
-function reclaimStaleLock(lock: string): void {
-  let files: string[];
+function alive(pid: number): boolean {
   try {
-    files = readdirSync(lock);
+    process.kill(pid, 0);
+    return true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw error;
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
-  if (files.length > 1) return;
-  const owner = files[0];
-  let stale = Date.now() - statSync(lock).mtimeMs > 5_000;
-  if (owner) {
+}
+
+function reclaimStaleLock(lock: string): void {
+  try {
+    const [owner, ...others] = readdirSync(lock);
+    if (!owner || others.length) return;
     const pid = Number(readFileSync(join(lock, owner), "utf8"));
-    if (Number.isInteger(pid) && pid > 0) {
-      stale = false;
-      try {
-        process.kill(pid, 0);
-      } catch (error) {
-        stale = (error as NodeJS.ErrnoException).code === "ESRCH";
-      }
-    }
+    const held = Number.isInteger(pid) && pid > 0 ? alive(pid) : Date.now() - statSync(lock).mtimeMs <= 5_000;
+    if (!held) releaseLock(lock, owner);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  if (stale) releaseLock(lock, owner);
 }
 
 export async function withDeploymentLock<T>(lock: string, fn: () => Promise<T>): Promise<T> {

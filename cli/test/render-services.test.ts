@@ -225,7 +225,8 @@ test("Render storage validates settings and reserves bundled resource names", (t
     writeFileSync(path, JSON.stringify({ ...raw, render: { ...raw.render, storage } }));
     assert.throws(() => loadConfigAt(path), /render.storage/);
   }
-  const source = { ...raw, plugins: [{ name: "minio", image: "example.test/plugin:1" }] };
-  writeFileSync(path, JSON.stringify(source));
-  assert.throws(() => loadConfigAt(path), /conflicts with bundled Render storage/);
+  for (const name of ["minio", "worker"]) {
+    writeFileSync(path, JSON.stringify({ ...raw, plugins: [{ name, image: "example.test/plugin:1" }] }));
+    assert.throws(() => loadConfigAt(path), new RegExp(`conflicts with the bundled Render ${name} service`));
+  }
 });

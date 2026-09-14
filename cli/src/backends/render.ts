@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { appPrefixOf, updateConfigUrls, type QmConfig, type RenderConfig } from "../config.ts";
+import { appPrefixOf, renderPlanId, updateConfigUrls, type QmConfig, type RenderConfig } from "../config.ts";
 import { deploymentLayerRequest, httpDeploymentLayerTransport, syncDeploymentLayer } from "../deployment-layer.ts";
 import { CliError, errMessage, note, ok, step } from "../log.ts";
 import { renderMinioCommand, renderMinioInitCommand } from "../render-minio.ts";
@@ -747,7 +747,7 @@ async function reconcileService(
     buildChanged ||
     details.runtime !== "docker" ||
     service.autoDeploy !== "no" ||
-    details.plan !== workload.plan ||
+    renderPlanId(details.plan) !== workload.plan ||
     (details.envSpecificDetails.dockerCommand ?? "") !== (workload.command ?? "") ||
     (workload.health !== undefined && details.healthCheckPath !== workload.health) ||
     (!workload.diskSizeGB && details.maxShutdownDelaySeconds !== 300)
@@ -791,8 +791,6 @@ export function renderConfigErrors(
   if (Object.keys(config.imageOverrides).length || config.imageFrom)
     add("Render builds from Git; remove imageOverrides and imageFrom");
   for (const plugin of config.plugins) {
-    if (plugin.name === "minio") add(`Render reserves plugin name ${plugin.name} for bundled storage`);
-    if (plugin.name === "worker") add(`Render reserves plugin name ${plugin.name} for the run worker`);
     if (plugin.coreAccess === false && plugin.secrets?.some((secret) => secret.name === "DATABASE_URL"))
       add(`Render plugin ${plugin.name} cannot use the core DATABASE_URL when coreAccess is false`);
   }
@@ -899,8 +897,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           state.dirtyServices = state.dirtyServices?.filter((item) => item !== name);
         }
         saveState(ctx, state);
-        state.updateInProgress = true;
-        saveState(ctx, state);
         const postgres = await provision(ctx, request, state, bound.postgres);
         const info = await request<{ internalConnectionString: string; externalConnectionString: string }>(
           `/postgres/${postgres.id}/connection-info`,
@@ -985,6 +981,8 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         const updated = updateConfigUrls(current, urls);
         if (updated !== current) writeFileSync(ctx.configPath, updated);
         Object.assign(ctx.config, urls);
+        state.updateInProgress = true;
+        saveState(ctx, state);
         for (const workload of desired) {
           let service = services.get(workload.name)!;
           const existing = envs.get(workload.name)!;

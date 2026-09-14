@@ -11,6 +11,7 @@ import {
   readFileSync,
   rmSync,
   utimesSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -474,13 +475,76 @@ function hurryLockClock(t: TestContext): void {
   t.mock.method(Date, "now", () => (now += 1_000));
 }
 
-test("Render waits for a lock without a PID and reclaims it once it is stale", async (t) => {
+test("Render waits for a lock whose owner recorded no PID and reclaims it once it is stale", async (t) => {
   const d = deployment(t);
   const path = join(d.ctx.configDir, ".render.lock");
   mkdirSync(path);
+  writeFileSync(join(path, "owner-unknown"), "not a pid");
+  let waited = 0;
+  const now = Date.now;
+  t.mock.method(Date, "now", () => now() + 1_000 * waited++);
+  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+  assert.ok(waited > 5);
+  assert.equal(existsSync(path), false);
+});
+
+test("Render keeps waiting when a lock owner disappears during the probe", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  symlinkSync(join(path, "missing"), join(path, "owner-releasing"));
   hurryLockClock(t);
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
+  assert.deepEqual(readdirSync(path), ["owner-releasing"]);
+});
+
+test("Render waits for a lock holder that releases normally", { timeout: 10_000 }, async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { withDeploymentLock } from ${JSON.stringify(new URL("../src/state.ts", import.meta.url).href)};
+await withDeploymentLock(${JSON.stringify(path)}, async () => {
+  process.send("locked");
+  await new Promise((resolve) => setTimeout(resolve, 400));
+});`,
+    ],
+    { stdio: ["ignore", "ignore", "inherit", "ipc"] },
+  );
+  const exited = once(child, "exit");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+  });
+  const [message] = await once(child, "message");
+  assert.equal(message, "locked");
+  assert.match(readdirSync(path)[0]!, /^owner-/);
   await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
   assert.equal(existsSync(path), false);
+  assert.deepEqual(await exited, [0, null]);
+});
+
+test("Render config normalizes legacy compute plan names to plan IDs", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-render-plans-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const raw = parseConfigJson(renderScaffold.renderConfig("acme", "anthropic", "resend")) as Record<string, any>;
+  raw.render.workspaceId = "tea-acme";
+  raw.render.corePlan = "standard";
+  raw.render.servicePlan = "starter";
+  raw.render.postgresPlan = "standard";
+  raw.render.storage = { plan: "pro" };
+  delete raw.modelProvider;
+  delete raw.secretEnv;
+  const configPath = join(dir, "qm.config.jsonc");
+  writeFileSync(configPath, JSON.stringify(raw));
+  const render = loadConfigAt(configPath).config.render!;
+  assert.equal(render.corePlan, "1c-2g");
+  assert.equal(render.servicePlan, "0.5c-512mb");
+  assert.equal(render.storage.plan, "2c-4g");
+  assert.equal(render.postgresPlan, "standard");
 });
 
 test("Render keeps a lock when its owner cannot be probed", async (t) => {
@@ -620,12 +684,16 @@ test("Render builds QM services and MinIO from Git", async (t) => {
   );
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_REPO, "https://github.com/acme/qm");
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_BRANCH, "render-test");
+  c.services.get("srv-acme-minio")!.serviceDetails.plan = "starter";
+  c.services.get("srv-acme-core")!.serviceDetails.plan = "standard";
   const mark = c.calls.length;
   await d.backend.up({ dryRun: false });
   assert.deepEqual(d.saved().services, saved.services);
   const changes = writes(c.calls.slice(mark));
   assert.ok(changes.some((call) => call.path === "/services/srv-acme-worker/deploys" && call.method === "POST"));
   assert.ok(!changes.some((call) => call.path === "/services/srv-acme-minio/deploys"));
+  assert.ok(!changes.some((call) => call.path === "/services/srv-acme-minio" && call.method === "PATCH"));
+  assert.ok(!changes.some((call) => call.path === "/services/srv-acme-core" && call.method === "PATCH"));
 });
 
 for (const [status, plan] of [
@@ -741,11 +809,14 @@ test("Render cancels an active deploy before it submits an update", async (t) =>
   const previous = c.deploys.get("srv-acme-core")!;
   let canceled = false;
   let triggered = false;
+  let readsAfterCancel = 0;
   c.intercept = ({ path, method }) => {
     if (path === "/services/srv-acme-core/deploys" && method === "GET" && !triggered)
       return Response.json([
         { deploy: previous },
-        { deploy: { id: "dep-active", status: canceled ? "canceled" : "update_in_progress" } },
+        {
+          deploy: { id: "dep-active", status: canceled && ++readsAfterCancel > 1 ? "canceled" : "update_in_progress" },
+        },
       ]);
     if (path === "/services/srv-acme-core/deploys/dep-active/cancel" && method === "POST") {
       canceled = true;
@@ -760,6 +831,7 @@ test("Render cancels an active deploy before it submits an update", async (t) =>
   d.ctx.config.render!.corePlan = "2c-4g";
   await d.backend.up({ dryRun: false });
   assert.equal(triggered, true);
+  assert.ok(readsAfterCancel >= 2);
   assert.deepEqual(d.saved().dirtyServices, []);
 });
 

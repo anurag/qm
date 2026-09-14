@@ -748,9 +748,10 @@ function validate(raw: unknown, path: string): QmConfig {
     out.aws = validateAws(o["aws"], path, runnableServices(services), configuredSecretNames);
   }
   if (o["render"] !== undefined) out.render = validateRender(o["render"], path);
-  if (out.render?.storage.type === "minio") {
-    const collision = out.plugins.find((plugin) => plugin.name === "minio");
-    if (collision) throw new CliError(`${path}: plugin ${collision.name} conflicts with bundled Render storage`);
+  if (out.render) {
+    const reserved = out.plugins.find((plugin) => plugin.name === "minio" || plugin.name === "worker");
+    if (reserved)
+      throw new CliError(`${path}: plugin ${reserved.name} conflicts with the bundled Render ${reserved.name} service`);
   }
   if (target === "render" && !out.render) throw new CliError(`${path}: target "render" requires a "render" block`);
   if (target === "aws" && !out.aws) throw new CliError(`${path}: target "aws" requires an "aws" block`);
@@ -1440,6 +1441,19 @@ export function renderSource(raw: unknown, path: string): NonNullable<RenderConf
   return { repo, branch };
 }
 
+const legacyRenderPlans: Record<string, string> = {
+  starter: "0.5c-512mb",
+  standard: "1c-2g",
+  pro: "2c-4g",
+  pro_plus: "4c-8g",
+  pro_max: "4c-16g",
+  pro_ultra: "8c-32g",
+};
+
+export function renderPlanId(plan: unknown): unknown {
+  return typeof plan === "string" ? (legacyRenderPlans[plan] ?? plan) : plan;
+}
+
 function validateRender(raw: unknown, path: string): RenderConfig {
   if (!isPlainObject(raw)) throw new CliError(`${path}: "render" must be an object`);
   const allowed = new Set([
@@ -1462,7 +1476,7 @@ function validateRender(raw: unknown, path: string): RenderConfig {
   for (const key of Object.keys(storageRaw)) {
     if (!["type", "plan", "diskSizeGB"].includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
   }
-  const storagePlan = storageRaw.plan ?? "0.5c-512mb";
+  const storagePlan = renderPlanId(storageRaw.plan ?? "0.5c-512mb");
   if (typeof storagePlan !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(storagePlan) || storagePlan === "free")
     throw new CliError(`${path}: render.storage.plan must name a paid Render plan`);
   const diskSizeGB = storageRaw.diskSizeGB ?? 10;
@@ -1481,8 +1495,8 @@ function validateRender(raw: unknown, path: string): RenderConfig {
   const appRegion = raw.appRegion;
   if (appRegion !== undefined && (typeof appRegion !== "string" || !regions.includes(appRegion)))
     throw new CliError(`${path}: render.appRegion must be a Render region`);
-  const plan = (key: string, fallback: string): string => {
-    const value = raw[key] ?? fallback;
+  const plan = (key: string, fallback: string, compute = true): string => {
+    const value = compute ? renderPlanId(raw[key] ?? fallback) : (raw[key] ?? fallback);
     if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free") {
       throw new CliError(`${path}: render.${key} must name a paid Render plan`);
     }
@@ -1508,7 +1522,7 @@ function validateRender(raw: unknown, path: string): RenderConfig {
     ...(appRegion === undefined ? {} : { appRegion: appRegion as RenderConfig["region"] }),
     corePlan: plan("corePlan", "1c-2g"),
     servicePlan: plan("servicePlan", "0.5c-512mb"),
-    postgresPlan: plan("postgresPlan", "0.5c-1g"),
+    postgresPlan: plan("postgresPlan", "0.5c-1g", false),
     postgresDiskSizeGB,
   };
 }
