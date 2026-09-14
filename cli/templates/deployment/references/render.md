@@ -14,6 +14,11 @@ ID, restore its ID in this record before retrying.
 During service creation or resume, this record also stores encrypted credentials
 until the pinned deployment succeeds. Keep the same local `CORE_SIGNING_SECRET`
 until that operation finishes so a retry can restore the credentials.
+The CLI removes a lock left by a process that has exited. A live process keeps
+its lock. A lock without a valid PID has a five-second recovery delay; retry
+after that delay if the process stopped before it recorded its PID.
+Finish any Render operation started by an older CLI version before upgrading.
+Use one CLI version per deployment directory.
 
 The API creates one project and one production environment. The core services,
 Render Postgres, bundled MinIO, and the worker Workflow use that environment.
@@ -112,11 +117,6 @@ to that commit. Each routine update builds the diskless services. It retains Min
 MinIO source and configuration are unchanged. A deliberate MinIO build or disk
 change can interrupt object storage while Render starts its replacement.
 
-Test the exact production container before a live deployment. Run the affected
-tests, typecheck, lint, and an independent review. Verify create, update during an
-active request, rollback, and archive/restore with retained data. Repeat a check
-only after a relevant change or failure.
-
 `qm rollback` restores the previous successful service builds. It retains the
 current operator environment values and does not reverse database migrations.
 The prior commit and Workflow task are restored with the previous core build. Verify
@@ -141,10 +141,11 @@ creates a private bucket and the scoped QM storage identity. Core and the worker
 Workflow receive that identity. Do not rotate or replace the root credentials
 unless the stored data and dependent credentials have been checked.
 
-Archive an app with the built-in deployment tools to retain its database and
-objects. Restore the app with the same tools. Verify retained records and file
-contents after restore. Deleting a service through Render does not run the QM
-archive flow.
+Archive an app with the built-in deployment tools to suspend its Render service
+and disable its database and object storage credentials. Archive retains the
+service, database, and objects. Restore the app with the same tools. Verify
+retained records and file contents after restore. Direct Render service deletion
+is part of permanent cleanup below; it does not run the QM archive flow.
 
 ## Operations
 
@@ -152,8 +153,34 @@ archive flow.
 `qm secrets push` stores changed operator secrets. Run `qm up` to use them.
 `qm down` stops services and retains Postgres and the MinIO disk. Stored data
 continues to incur charges. Archive published apps before stopping their parent
-deployment. `qm down --purge` deletes the deployment's stored data, but retains the
-project and environment. Use purge only with explicit authorization to delete it.
+deployment.
+
+### Permanent cleanup
+
+`qm down --purge` deletes the recorded QM services, Workflow, Postgres, and MinIO
+disk. This deletes QM state, app databases, and stored objects. Archive cannot
+restore an app after its data has been purged. Use this procedure only with
+explicit authorization to delete the deployment and its stored data.
+
+1. Stop new app publication and agent work. Back up app source, databases, and
+   objects to storage outside this deployment before archive disables access.
+2. Archive each published app through QM. Confirm that each app is archived
+   and its Render service is suspended. Archive alone does not permit purge;
+   the CLI also refuses suspended app services that still use shared storage.
+3. Use QM's sandbox resource `retire` action for the deployment's sandboxes
+   while core is available. Retirement deletes the sandbox and its retained
+   snapshots. Export any files that must be kept before retirement.
+4. In Render, open the workspace and project recorded in
+   `render.resources.json`. Match each app service's `QM_DEPLOYMENT_ID`
+   environment variable to its QM app ID. Delete only these app services in
+   Render, or use `DELETE /v1/services/{serviceId}` for the verified IDs.
+   This removes the app runners; their databases and objects remain until purge.
+5. Run `qm down --purge` from this deployment directory. Keep
+   `render.resources.json` until cleanup succeeds. If cleanup is interrupted,
+   run the same command again to complete it.
+
+Purge retains the Render project and environments. It does not delete workspace
+sandboxes or snapshots; those must be retired before core is removed.
 
 Do not change unrelated infrastructure, DNS, or Cloudflare rules. The assigned
 `onrender.com` URLs are sufficient for this target.

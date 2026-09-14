@@ -331,7 +331,9 @@ export const renderScaffold: ProviderScaffold = {
     "node_modules/",
     ".generated/",
     ".render.lock/",
+    ".render.lock-*/",
     "render.resources.json",
+    "render.resources.json.tmp",
     "render.resources.json.*.tmp",
   ],
   agentsAppendix: `
@@ -376,10 +378,14 @@ qm rollback restores the prior successful service builds. It retains stored data
 and does not reverse database migrations. Render retains the current environment
 values when it rolls back a build.
 
-qm down retains Postgres and MinIO data. Storage charges continue. Published apps
-and runtime sandboxes are separate resources. Remove them through QM. Use
-qm down --purge only when the deployment and its stored data can be deleted.
-Do not expire durable objects or automatically move data between storage targets.
+qm down retains Postgres and MinIO data. Storage charges continue. Archive apps
+through QM before stopping the deployment. Archive suspends their Render services
+and retains app data; it does not delete those services. For permanent cleanup,
+follow .codex/skills/deploy-qm/references/render.md: back up data, archive apps,
+retire sandboxes, delete the verified app services in Render, then run
+qm down --purge. Purge deletes the shared database and object storage, including
+retained app data. Do not expire durable objects or automatically move data
+between storage targets.
 `,
   files: () => [
     {

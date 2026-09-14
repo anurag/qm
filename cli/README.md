@@ -55,6 +55,9 @@ Each update resolves the Git branch to one commit and deploys that commit. The
 CLI retains unchanged MinIO during routine updates. It records the previous
 service builds and Workflow task for `qm rollback`. Archive and restore apps
 through QM to retain their data. See the [Render runbook](templates/deployment/references/render.md).
+For permanent removal, follow the runbook's cleanup procedure. Archived app
+services must also be deleted in Render before `qm down --purge` can delete
+the shared database and object storage.
 
 ## Deployment directory
 

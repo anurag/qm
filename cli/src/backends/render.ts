@@ -1,5 +1,15 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { appPrefixOf, updateConfigUrls, type QmConfig, type RenderConfig } from "../config.ts";
 import { deploymentLayerRequest, httpDeploymentLayerTransport, syncDeploymentLayer } from "../deployment-layer.ts";
@@ -219,21 +229,57 @@ function saveState(ctx: DeployContext, state: State): void {
   writeFileSync(`${path}.tmp`, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
 }
+function removeRenderLock(path: string, owner?: string): void {
+  if (owner) rmSync(join(path, owner), { force: true });
+  try {
+    rmdirSync(path);
+  } catch (error) {
+    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  }
+}
 async function locked<T>(ctx: DeployContext, operation: () => Promise<T>): Promise<T> {
   const path = join(ctx.configDir, ".render.lock");
+  const candidate = mkdtempSync(`${path}-`);
+  const owner = `owner-${randomUUID()}`;
+  let acquired = false;
+  const busy = () => new CliError("Another Render operation holds .render.lock; wait for it to finish and retry");
   try {
-    mkdirSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    throw new CliError(
-      "Another Render operation holds .render.lock. If it has stopped, remove the lock directory and retry",
-    );
-  }
-  try {
-    writeFileSync(join(path, "pid"), String(process.pid));
+    writeFileSync(join(candidate, owner), String(process.pid));
+    for (;;) {
+      try {
+        const files = readdirSync(path);
+        const previous = files[0];
+        if (files.length > 1 || (previous && previous !== "pid" && !/^owner-[a-f0-9-]{36}$/.test(previous)))
+          throw busy();
+        let stale = Date.now() - statSync(path).mtimeMs > 5_000;
+        if (previous) {
+          const pid = Number(readFileSync(join(path, previous), "utf8"));
+          if (Number.isInteger(pid) && pid > 0) {
+            stale = false;
+            try {
+              process.kill(pid, 0);
+            } catch (error) {
+              stale = (error as NodeJS.ErrnoException).code === "ESRCH";
+            }
+          }
+        }
+        if (!stale) throw busy();
+        removeRenderLock(path, previous);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      try {
+        renameSync(candidate, path);
+        acquired = true;
+        break;
+      } catch (error) {
+        if (!["EEXIST", "ENOTEMPTY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      }
+    }
     return await operation();
   } finally {
-    rmSync(path, { recursive: true, force: true });
+    if (acquired) removeRenderLock(path, owner);
+    else rmSync(candidate, { recursive: true, force: true });
   }
 }
 function credentialValues(ctx: DeployContext, envFile = ctx.envFile): Map<string, string> {

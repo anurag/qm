@@ -1,5 +1,18 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -541,6 +554,106 @@ test("Render plan needs no API calls, Git repository, or state file", async (t) 
   await d.backend.up({ dryRun: true });
   assert.equal(c.calls.length, 0);
   assert.equal(existsSync(join(d.ctx.configDir, "render.resources.json")), false);
+});
+
+for (const pid of [undefined, "invalid", "0"]) {
+  test(`Render recovers an old lock with PID ${pid ?? "missing"}`, async (t) => {
+    const d = deployment(t);
+    const path = join(d.ctx.configDir, ".render.lock");
+    mkdirSync(path);
+    if (pid !== undefined) writeFileSync(join(path, "pid"), pid);
+    const expired = new Date(Date.now() - 10_000);
+    utimesSync(path, expired, expired);
+    await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+    assert.equal(existsSync(path), false);
+  });
+}
+
+test("Render leaves a new lock without a PID intact", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
+  assert.equal(existsSync(path), true);
+});
+
+test("Render keeps a lock when its owner cannot be probed", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  writeFileSync(join(path, "pid"), String(process.pid));
+  t.mock.method(process, "kill", () => {
+    throw Object.assign(new Error("Operation not permitted"), { code: "EPERM" });
+  });
+  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
+  assert.equal(readFileSync(join(path, "pid"), "utf8"), String(process.pid));
+});
+
+test("Render stale recovery preserves a replacement lock owner", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  const stalePid = process.pid + 1;
+  writeFileSync(join(path, "pid"), String(stalePid));
+  const replacement = `owner-${randomUUID()}`;
+  const kill = process.kill;
+  t.mock.method(process, "kill", (pid: number, signal?: number | NodeJS.Signals) => {
+    if (pid !== stalePid) return kill(pid, signal);
+    rmSync(path, { recursive: true });
+    mkdirSync(path);
+    writeFileSync(join(path, replacement), String(process.pid));
+    throw Object.assign(new Error("No such process"), { code: "ESRCH" });
+  });
+  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
+  assert.deepEqual(readdirSync(path), [replacement]);
+  assert.equal(readFileSync(join(path, replacement), "utf8"), String(process.pid));
+});
+
+test("Render protects a live owner and recovers its lock after SIGKILL", { timeout: 10_000 }, async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { createRenderBackend } from ${JSON.stringify(new URL("../src/backends/render.ts", import.meta.url).href)};
+process.on("message", () => {});
+globalThis.fetch = async () => {
+  process.send("locked");
+  return new Promise(() => {});
+};
+await createRenderBackend(${JSON.stringify(d.ctx)}).up({ dryRun: false });`,
+    ],
+    { stdio: ["ignore", "ignore", "pipe", "ipc"] },
+  );
+  let stderr = "";
+  child.stderr!.on("data", (data: Buffer) => {
+    stderr += data.toString();
+  });
+  const exited = once(child, "exit");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+  });
+  const [message] = await Promise.race([
+    once(child, "message"),
+    exited.then(() => {
+      throw new Error(`Render lock owner exited before the API call: ${stderr}`);
+    }),
+  ]);
+  assert.equal(message, "locked");
+  const owner = readdirSync(path)[0]!;
+  assert.match(owner, /^owner-/);
+  assert.equal(readFileSync(join(path, owner), "utf8"), String(child.pid));
+  const expired = new Date(Date.now() - 10_000);
+  utimesSync(path, expired, expired);
+  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
+  assert.equal(readFileSync(join(path, owner), "utf8"), String(child.pid));
+  child.kill("SIGKILL");
+  await exited;
+  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+  assert.equal(existsSync(path), false);
 });
 
 test("Render waits for MinIO initialization before deploying core and retries a failed job", async (t) => {
