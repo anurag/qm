@@ -446,7 +446,7 @@ server.listen(Number(process.env.PORT), "127.0.0.1");`,
   assert.equal((await app.request("/__qm_ready")).status, 204);
   await (await app.request("/refuse")).text();
   assert.equal((await app.request("/")).status, 502);
-  assert.equal((await app.request("/")).status, 503);
+  assert.equal((await app.request("/")).status, 502);
   assert.equal((await app.request("/__qm_ready")).status, 503);
   await delay(1_600);
   const recovered = await app.request("/__qm_ready");
@@ -593,14 +593,9 @@ test("Render gateway keeps healthy apps ready after clients disconnect", { timeo
         started.resolve();
       });
       await new Promise<void>((resolve) => application.listen(0, "127.0.0.1", resolve));
-      let ready = true;
       const gateway = createRenderAppGateway({
         token: "a".repeat(43),
         appPort: (application.address() as AddressInfo).port,
-        isReady: () => ready,
-        onUnavailable: () => {
-          ready = false;
-        },
       });
       await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
       t.after(() => {
@@ -628,7 +623,6 @@ test("Render gateway keeps healthy apps ready after clients disconnect", { timeo
       await started.promise;
       client.destroy();
       await closed.promise;
-      assert.equal(ready, true);
       const response = await fetch(`http://127.0.0.1:${gatewayPort}/`, {
         headers: { "x-qm-render-app-token": "a".repeat(43) },
       });

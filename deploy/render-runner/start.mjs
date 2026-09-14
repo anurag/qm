@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { createServer, request, ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
+const SHUTDOWN_GRACE_MS = 30_000;
+
 function git(args, cwd, env) {
   return new Promise((resolveGit, rejectGit) => {
     const child = spawn("git", args, { cwd, env, stdio: ["ignore", "pipe", "ignore"], timeout: 120_000 });
@@ -109,11 +111,11 @@ export async function runRenderApp({
   let appReady = false;
   let started = false;
   let stopping = false;
-  const checkReady = async () => {
+  const probe = async (timeoutMs) => {
     if (stopping) return false;
     const reachable = await fetch(`http://127.0.0.1:${appPort}/`, {
       redirect: "manual",
-      signal: AbortSignal.timeout(1_000),
+      signal: AbortSignal.timeout(timeoutMs),
     }).then(
       async (response) => {
         await response.body?.cancel();
@@ -129,10 +131,7 @@ export async function runRenderApp({
     readinessNonce: manifest.readinessNonce,
     appPort,
     isReady: () => appReady,
-    checkReady: () => started && checkReady(),
-    onUnavailable: () => {
-      appReady = false;
-    },
+    checkReady: () => started && probe(2_000),
   });
   const sockets = new Set();
   let connectionsClosed;
@@ -179,11 +178,11 @@ export async function runRenderApp({
     stopping = true;
     appReady = false;
     forward(signal);
-    const deadline = Date.now() + 30_000;
+    const deadline = Date.now() + SHUTDOWN_GRACE_MS;
     shutdownTimer = setTimeout(() => {
       for (const socket of sockets) socket.destroy();
       forward("SIGKILL");
-    }, 30_000);
+    }, SHUTDOWN_GRACE_MS);
     shutdown = Promise.all([
       new Promise((done) => {
         server.close(() => {
@@ -210,7 +209,7 @@ export async function runRenderApp({
     while (true) {
       if (spawnError || child.exitCode !== null || child.signalCode !== null)
         throw new Error("Render app exited before it was ready");
-      if (await checkReady()) break;
+      if (await probe(1_000)) break;
       if (Date.now() >= deadline) throw new Error("Render app did not become ready");
       await new Promise((done) => setTimeout(done, 200));
     }
@@ -231,7 +230,6 @@ export function createRenderAppGateway({
   appPort = 8081,
   isReady = () => true,
   checkReady = isReady,
-  onUnavailable = () => {},
 }) {
   const authorized = (req) => {
     const value = req.headers["x-qm-render-app-token"];
@@ -268,7 +266,6 @@ export function createRenderAppGateway({
     });
     upstream.on("error", () => {
       if (req.aborted || res.destroyed) return;
-      onUnavailable();
       if (!res.headersSent) res.writeHead(502);
       res.end();
     });
@@ -291,7 +288,6 @@ export function createRenderAppGateway({
     const upstream = request(options(req));
     upstream.on("error", () => {
       if (clientClosed || socket.destroyed) return;
-      onUnavailable();
       socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
     });
     upstream.on("response", (res) => {
