@@ -67,6 +67,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   const prefix = opts.namePrefix ?? "qm";
   const homeDir = opts.homeDir ?? "/root";
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
+  const expiryCheckpointWindowMs = Math.max((defaultTimeoutSec + 60) * 1000, 20 * 60_000);
   const scratch = new Map<string, RenderSandboxInfo>();
   const nameFor = (scope: string): string => sandboxScopeName(prefix, scope);
   const withLock = <T>(name: string, fn: () => Promise<T>): Promise<T> =>
@@ -92,8 +93,10 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   const idFor = async (name: string): Promise<string> => {
     const temporary = scratch.get(name);
     if (temporary) return temporary.id;
-    const stored = await store.get(scopeFor(name));
+    const scope = scopeFor(name);
+    const stored = await store.get(scope);
     if (!stored || stored.discarded) throw new Error(`Render sandbox is not provisioned: ${name}`);
+    if (Date.now() - stored.lastActivityMs >= 60_000) await store.merge(scope, { lastActivityMs: Date.now() });
     return stored.sandboxId;
   };
   const exec = async (name: string, script: string, timeoutSec: number): Promise<ExecResult> => {
@@ -273,9 +276,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     if (stored) {
       const info = await client.get(stored.sandboxId);
       if (info?.status === "running") {
-        const active = await hasLiveProcesses(info.id);
-        if (active && Date.now() - (stored.homeCheckpointAtMs ?? 0) >= 60_000) stored = await checkpoint(scope, stored);
-        if (info.expiresAtMs > Date.now() + (defaultTimeoutSec + 60) * 1000 || active) {
+        if (info.expiresAtMs > Date.now() + (defaultTimeoutSec + 60) * 1000 || (await hasLiveProcesses(info.id))) {
           await store.merge(scope, { lastActivityMs: Date.now() });
           return { coldStart: false };
         }
@@ -534,20 +535,25 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     async reapDeepIdle(idleMs) {
       let reaped = 0;
       const cutoff = idleMs > 0 ? Date.now() - idleMs : -Infinity;
-      for (const [scope] of await store.entries()) {
+      const due = (stored: StoredRenderSandbox): boolean =>
+        stored.lastActivityMs <= cutoff || stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs;
+      for (const [scope, candidate] of await store.entries()) {
+        if (!due(candidate) && !candidate.discarded && !candidate.retiredResources?.length) continue;
         await withLock(nameFor(scope), async () => {
           let stored = await store.get(scope);
           if (stored) stored = await recoverStored(scope, stored);
-          if (!stored) return;
+          if (!stored || !due(stored)) return;
           const info = await client.get(stored.sandboxId);
           if (info?.status !== "running") return;
-          const active = await hasLiveProcesses(info.id);
-          const expiresSoon = info.expiresAtMs <= Date.now() + (defaultTimeoutSec + 60) * 1000;
+          const expiresSoon = info.expiresAtMs <= Date.now() + expiryCheckpointWindowMs;
+          const rotate = info.expiresAtMs <= Date.now() + (defaultTimeoutSec + 60) * 1000;
           const idle = stored.lastActivityMs <= cutoff;
-          if (!active && !expiresSoon && !idle) return;
-          if (Date.now() - (stored.homeCheckpointAtMs ?? 0) >= 60_000 || (expiresSoon && !active) || idle)
+          if (!expiresSoon && !idle) return;
+          const active = await hasLiveProcesses(info.id);
+          if (active && !expiresSoon) return;
+          if ((!active && (idle || rotate)) || Date.now() - (stored.homeCheckpointAtMs ?? 0) >= 5 * 60_000)
             await checkpoint(scope, stored);
-          if (active || (!idle && !expiresSoon)) return;
+          if (active || (!idle && !rotate)) return;
           await client.terminate(info.id);
           reaped++;
         }).catch((error) => reportError("idle_checkpoint_failed", error, scope));

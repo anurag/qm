@@ -2194,7 +2194,7 @@ export function buildApp(
           leaderLease.hold("sandbox:deep-idle-reaper", () =>
             sandbox.reapDeepIdle!(deepIdleMachineMs, devIdleMachineMs),
           ),
-        enabledBackends.has("render") ? 60_000 : Math.max(60_000, Math.min(...sweepFractions)),
+        enabledBackends.has("render") ? 5 * 60_000 : Math.max(60_000, Math.min(...sweepFractions)),
         { immediate: true },
       )
     : null;

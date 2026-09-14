@@ -483,10 +483,15 @@ test("Render checkpoints background changes before TTL even when idle reaping is
   await fake.client.writeFileBytes(stored.sandboxId, `${processPath}/cmd`, Buffer.from("background work"));
   await fake.client.writeFileBytes(stored.sandboxId, `${processPath}/started`, Buffer.from("1"));
   await sandbox.writeFile(handle, "background", "retained output");
-  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 120_000 });
-  fake.sandboxes.get(stored.sandboxId)!.expiresAtMs = Date.now() + 300_000;
+  const expiresAtMs = Date.now() + 16 * 60_000;
+  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 360_000, expiresAtMs });
+  fake.sandboxes.get(stored.sandboxId)!.expiresAtMs = expiresAtMs;
   assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
   assert.equal(fake.sandboxes.get(stored.sandboxId)?.status, "running");
+  const checkpointKey = (await store.get(scope))!.homeSnapshotKey;
+  assert.notEqual(checkpointKey, stored.homeSnapshotKey);
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  assert.equal((await store.get(scope))!.homeSnapshotKey, checkpointKey);
   await fake.client.terminate(stored.sandboxId);
   const other = make();
   const restored = await other.provision(layers);
@@ -518,7 +523,9 @@ for (const operation of ["file import", "provision preparation"] as const) {
         ? sandbox.importFiles!(handle, [{ path: "latest", data: Buffer.from("completed operation") }])
         : sandbox.provision([...layers, { scopeId: layerScope, mountPath: "", mode: "ro" }]);
     await uploading.promise;
-    fake.sandboxes.get(stored.sandboxId)!.expiresAtMs = Date.now() + 60_000;
+    const expiresAtMs = Date.now() + 60_000;
+    fake.sandboxes.get(stored.sandboxId)!.expiresAtMs = expiresAtMs;
+    await store.merge(scope, { expiresAtMs });
     let reaped = false;
     const reaping = other.reapDeepIdle!(0).then((result) => {
       reaped = true;
@@ -540,3 +547,104 @@ for (const operation of ["file import", "provision preparation"] as const) {
     assert.equal(await other.readFile(restored, "latest"), "completed operation");
   });
 }
+
+test("Render skips remote probes and checkpoints for a recently used sandbox", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  const sandbox = make();
+  await sandbox.provision(layers);
+  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 360_000 });
+  const before = (await store.get(scope))!;
+  const get = t.mock.method(fake.client, "get");
+  const commands = fake.commands.length;
+  assert.deepEqual(await sandbox.reapDeepIdle!(3600_000), { reaped: 0 });
+  assert.equal(get.mock.callCount(), 0);
+  assert.equal(fake.commands.length, commands);
+  assert.equal((await store.get(scope))!.homeSnapshotKey, before.homeSnapshotKey);
+  await make().provision(layers);
+  assert.ok(fake.commands.slice(commands).every((command) => !command.includes(".agent-proc")));
+  assert.equal((await store.get(scope))!.homeSnapshotKey, before.homeSnapshotKey);
+});
+
+test("Render leaves an idle sandbox with a running process alone until its TTL is near", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  const sandbox = make();
+  await sandbox.provision(layers);
+  const before = (await store.get(scope))!;
+  const processPath = "/root/.agent-proc/11111111-1111-1111-1111-111111111111";
+  await fake.client.writeFileBytes(before.sandboxId, `${processPath}/cmd`, Buffer.from("background work"));
+  await fake.client.writeFileBytes(before.sandboxId, `${processPath}/started`, Buffer.from("1"));
+  await store.merge(scope, { lastActivityMs: Date.now() - 7200_000, homeCheckpointAtMs: Date.now() - 360_000 });
+  assert.deepEqual(await sandbox.reapDeepIdle!(3600_000), { reaped: 0 });
+  assert.equal((await store.get(scope))!.homeSnapshotKey, before.homeSnapshotKey);
+  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "running");
+});
+
+test("Render records command and file activity without a write for each operation", async (t) => {
+  const { make, layers, store, scope } = setup(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const sandbox = make();
+  const handle = await sandbox.provision(layers);
+  await store.merge(scope, { lastActivityMs: now - 7200_000 });
+  const merge = t.mock.method(store, "merge");
+  await sandbox.run(handle, "true");
+  await sandbox.writeFile(handle, "activity", "retained");
+  assert.equal(await sandbox.readFile(handle, "activity"), "retained");
+  assert.equal((await store.get(scope))!.lastActivityMs, now);
+  assert.equal(merge.mock.callCount(), 1);
+  assert.deepEqual(await make().reapDeepIdle!(3600_000), { reaped: 0 });
+  now += 60_000;
+  assert.equal(await sandbox.readFile(handle, "activity"), "retained");
+  assert.equal((await store.get(scope))!.lastActivityMs, now);
+  assert.equal(merge.mock.callCount(), 2);
+});
+
+test("Render rechecks activity after it waits for a sandbox operation", async (t) => {
+  const { make, fake, layers, store, scope, advisoryLock } = setup(t);
+  const sandbox = make();
+  const handle = await sandbox.provision(layers);
+  await store.merge(scope, { lastActivityMs: Date.now() - 7200_000 });
+  const held = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const holding = advisoryLock.withLock(`render-sandbox:${handle.id}`, async () => {
+    held.resolve();
+    await release.promise;
+  });
+  await held.promise;
+  const listed = Promise.withResolvers<void>();
+  const entries = store.entries;
+  t.mock.method(store, "entries", async () => {
+    const result = await entries();
+    listed.resolve();
+    return result;
+  });
+  const get = t.mock.method(fake.client, "get");
+  const reaping = sandbox.reapDeepIdle!(3600_000);
+  await listed.promise;
+  await store.merge(scope, { lastActivityMs: Date.now() });
+  release.resolve();
+  await holding;
+  assert.deepEqual(await reaping, { reaped: 0 });
+  assert.equal(get.mock.callCount(), 0);
+});
+
+test("Render saves a home before the rotation window without stopping its sandbox", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  const sandbox = make();
+  const handle = await sandbox.provision(layers);
+  await sandbox.writeFile(handle, "latest", "retained before rotation");
+  const before = (await store.get(scope))!;
+  const expiresAtMs = Date.now() + 16 * 60_000;
+  fake.sandboxes.get(before.sandboxId)!.expiresAtMs = expiresAtMs;
+  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 360_000, expiresAtMs });
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  assert.notEqual((await store.get(scope))!.homeSnapshotKey, before.homeSnapshotKey);
+  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "running");
+  const rotationExpiresAtMs = Date.now() + 10 * 60_000;
+  fake.sandboxes.get(before.sandboxId)!.expiresAtMs = rotationExpiresAtMs;
+  await store.merge(scope, { expiresAtMs: rotationExpiresAtMs });
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 1 });
+  const next = make();
+  const restored = await next.provision(layers);
+  assert.equal(await next.readFile(restored, "latest"), "retained before rotation");
+});
