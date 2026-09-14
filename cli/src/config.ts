@@ -284,7 +284,7 @@ function stripTrailingCommas(text: string): string {
   return out;
 }
 
-const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
+export const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
 
 const skipWs = (s: string, i: number): number => {
   while (i < s.length && /\s/.test(s[i]!)) i++;

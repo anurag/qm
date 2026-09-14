@@ -295,13 +295,7 @@ export function runInit(opts: {
   const modelProvider: ModelProvider = opts.modelProvider ?? "anthropic";
   const emailTransport: EmailTransport = opts.emailTransport ?? "resend";
   const provider = hostingProvider(target);
-  let scaffold = provider.scaffold.renderConfig(orgId, modelProvider, emailTransport);
-  if (source) {
-    const raw = JSON.parse(scaffold) as { render: { source?: typeof source } };
-    raw.render.source = source;
-    scaffold = `${JSON.stringify(raw, null, 2)}\n`;
-  }
-  writeFileSync(configPath, scaffold);
+  writeFileSync(configPath, provider.scaffold.renderConfig(orgId, modelProvider, emailTransport, source));
   ok(`wrote ${CONFIG_FILENAME} (orgId=${orgId}, target=${target}, modelProvider=${modelProvider})`);
 
   const config = loadConfigAt(configPath).config;

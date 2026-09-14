@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { hostingProvider, type DeployContext } from "../src/backends/registry.ts";
 import { renderConfigErrors, renderDeploymentLayerTransport, renderInternalUrl } from "../src/backends/render.ts";
-import { loadConfigAt } from "../src/config.ts";
+import { loadConfigAt, parseConfigJson } from "../src/config.ts";
 import { renderScaffold } from "../src/provider-scaffold.ts";
 import { computedSecrets } from "../src/secrets.ts";
 import { renderMinioCommand } from "../src/render-minio.ts";
@@ -35,7 +35,7 @@ function deployment(t: TestContext, _external = false, portal = false) {
   t.after(() => {
     process.env.PATH = originalPath;
   });
-  const raw = JSON.parse(renderScaffold.renderConfig("acme", "anthropic", "resend"));
+  const raw = parseConfigJson(renderScaffold.renderConfig("acme", "anthropic", "resend")) as Record<string, any>;
   raw.render.workspaceId = "tea-acme";
   raw.services = portal ? ["core", "web-ui", "portal", "auth", "admin"] : ["core", "web-ui"];
   raw.env = {

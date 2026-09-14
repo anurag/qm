@@ -10,7 +10,12 @@ interface ScaffoldFile {
 }
 
 export interface ProviderScaffold {
-  renderConfig(orgId: string, modelProvider: ModelProvider, emailTransport: EmailTransport): string;
+  renderConfig(
+    orgId: string,
+    modelProvider: ModelProvider,
+    emailTransport: EmailTransport,
+    source?: { repo: string; branch: string },
+  ): string;
   ignores: readonly string[];
   agentsAppendix: string;
   files(config: QmConfig): ScaffoldFile[];
@@ -286,46 +291,46 @@ export const awsScaffold: ProviderScaffold = {
 };
 
 export const renderScaffold: ProviderScaffold = {
-  renderConfig: (orgId, modelProvider, emailTransport) =>
-    JSON.stringify(
-      {
-        contract: 1,
-        orgId,
-        publicUrl: `https://${orgId}-portal.onrender.com`,
-        apiUrl: `https://${orgId}-core.onrender.com`,
-        target: "render",
-        modelProvider,
-        render: {
-          workspaceId: "tea-replaceme",
-          source: { repo: "https://github.com/yc-software/qm", branch: "main" },
-          region: "oregon",
-          corePlan: "1c-2g",
-          servicePlan: "0.5c-512mb",
-          postgresPlan: "0.5c-1g",
-          postgresDiskSizeGB: 10,
-          storage: { type: "minio", plan: "0.5c-512mb", diskSizeGB: 10 },
-        },
-        services: ["core", "slack", "web-ui", "admin", "portal", "auth"],
-        plugins: [],
-        skills: [],
-        sandbox: { backend: "render" },
-        env: {
-          core: {
-            HARNESS: "pi",
-            SANDBOX_BACKEND: "render",
-            DEPLOY_PROVIDER: "render",
-            WORKSPACE_STORE: "s3",
-            SNAPSHOT_STORE: "s3",
-            TRANSFER_STORE: "s3",
-          },
-          slack: { SLACK_IDENTITY_EMAIL: "1" },
-          auth: { AUTH_EMAIL_TRANSPORT: emailTransport },
-        },
-        secretEnv: { core: { ADMIN_GRANTS: "ADMIN_GRANTS" } },
-      },
-      null,
-      2,
-    ) + "\n",
+  renderConfig: (
+    orgId,
+    modelProvider,
+    emailTransport,
+    source = { repo: "https://github.com/yc-software/qm", branch: "main" },
+  ) =>
+    renderConfig(orgId, {
+      target: "render",
+      modelProvider,
+      publicUrl: `https://${orgId}-portal.onrender.com`,
+      providerFields: `
+  // The core API address. Render assigns both URLs; qm up rewrites them here.
+  "apiUrl": ${JSON.stringify(`https://${orgId}-core.onrender.com`)},
+
+  // Render coordinates. workspaceId is the workspace that owns the deployment
+  // (tea-...). Every service builds from source.repo at source.branch; each qm up
+  // resolves that branch to one commit and pins every build to it. Plans name
+  // Render instance types; storage is the bundled MinIO service and its disk.
+  "render": {
+    "workspaceId": "tea-replaceme",
+    "source": ${JSON.stringify(source)},
+    "region": "oregon",
+    "corePlan": "1c-2g",
+    "servicePlan": "0.5c-512mb",
+    "postgresPlan": "0.5c-1g",
+    "postgresDiskSizeGB": 10,
+    "storage": { "type": "minio", "plan": "0.5c-512mb", "diskSizeGB": 10 }
+  },
+`,
+      services: ["core", "slack", "web-ui", "admin", "portal", "auth"],
+      env: `{ "core": { "HARNESS": "pi", "SANDBOX_BACKEND": "render", "DEPLOY_PROVIDER": "render", "WORKSPACE_STORE": "s3", "SNAPSHOT_STORE": "s3", "TRANSFER_STORE": "s3" }, "slack": { "SLACK_IDENTITY_EMAIL": "1" }, "auth": { "AUTH_EMAIL_TRANSPORT": ${JSON.stringify(emailTransport)} } }`,
+      secretEnv: `,
+
+  // The initial admin seed is kept in the provider secret store, never in config.
+  "secretEnv": { "core": { "ADMIN_GRANTS": "ADMIN_GRANTS" } }`,
+      sandbox: `,
+
+  // Agent computers run as native Render Sandboxes in this workspace.
+  "sandbox": { "backend": "render" }`,
+    }),
   ignores: [
     ".env",
     "node_modules/",

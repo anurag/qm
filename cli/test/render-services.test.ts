@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import { loadConfigAt, renderSource } from "../src/config.ts";
+import { loadConfigAt, parseConfigJson, renderSource } from "../src/config.ts";
 import { renderMinioImage } from "../src/render-minio.ts";
 import { renderScaffold } from "../src/provider-scaffold.ts";
 import { renderBuild, renderServiceEnv, renderWorkloads } from "../src/render-services.ts";
@@ -18,7 +18,7 @@ interface ScaffoldConfig {
 function deployment(t: TestContext, change?: (raw: ScaffoldConfig) => void) {
   const dir = mkdtempSync(join(tmpdir(), "qm-render-services-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const raw = JSON.parse(renderScaffold.renderConfig("acme", "anthropic", "resend")) as ScaffoldConfig;
+  const raw = parseConfigJson(renderScaffold.renderConfig("acme", "anthropic", "resend")) as ScaffoldConfig;
   change?.(raw);
   const path = join(dir, "qm.config.jsonc");
   writeFileSync(path, JSON.stringify(raw));
