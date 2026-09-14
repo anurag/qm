@@ -264,7 +264,8 @@ function requireSecrets(ctx: DeployContext, values: ReadonlyMap<string, string>)
     );
 }
 async function requestArray<T>(request: RenderRequest, path: string): Promise<T[]> {
-  const page = (await request<unknown>(path)) ?? [];
+  const page = await request<unknown>(path);
+  if (page === null) return [];
   if (!Array.isArray(page)) throw new CliError(`Render GET ${path.split("?")[0]} returned an invalid list response`);
   return page as T[];
 }
@@ -426,6 +427,21 @@ async function assertAvailable(
       `Render ${name} already exists without a saved resource ID. Refusing to adopt it; inspect the resource and restore this deployment's render.resources.json`,
     );
 }
+async function recoverPendingCreate(ctx: DeployContext, request: RenderRequest, state: State): Promise<void> {
+  if (!state.pendingCreate) return;
+  const pending = /^\/(projects|postgres|workflows|services): (.+)$/.exec(state.pendingCreate);
+  if (!pending) throw new CliError("The saved Render creation request is invalid; restore render.resources.json");
+  const collection = pending[1]!;
+  await assertAvailable(
+    request,
+    `/${collection}`,
+    collection === "postgres" ? collection : collection.slice(0, -1),
+    pending[2]!,
+    state.workspaceId,
+  );
+  delete state.pendingCreate;
+  saveState(ctx, state);
+}
 async function poll(label: string, check: () => Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 20 * 60_000;
   let nextUpdate = Date.now() + 30_000;
@@ -548,7 +564,7 @@ async function prepareBootstrap(
   }
   const bootstrap = bootstraps[workload.name]!;
   if (bootstrap.drained) return service;
-  if (!bootstrap.requested) {
+  if (!bootstrap.requested || service.suspended === "suspended") {
     await request(`/services/${service.id}/env-vars`, "PUT", []);
     await request(`/services/${service.id}/secret-files`, "PUT", []);
     await request(`/services/${service.id}`, "PATCH", {
@@ -1096,10 +1112,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         if (pendingCommits.size > 1)
           throw new CliError("Render bootstrap has conflicting source commits; restore the resource record");
         state.sourceCommit = [...pendingCommits][0] ?? commit;
-        if (state.pendingCreate)
-          throw new CliError(
-            `Render creation has an unknown result (${state.pendingCreate}). Inspect Render and restore the saved resource ID before retrying; do not remove the record without checking for the created resource`,
-          );
         if (state.pendingPurge)
           throw new CliError("Render cleanup is incomplete; run qm down --purge before deployment");
         if (state.rollbackProgress)
@@ -1111,6 +1123,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         await doctorCommon(ctx.config, values, { requiredSecretValues: true, configDir: ctx.configDir });
         const request = api(ctx);
         await request(`/owners/${state.workspaceId}`);
+        await recoverPendingCreate(ctx, request, state);
         const retired = Object.keys(state.services).filter((name) => !desired.some((item) => item.name === name));
         const bound = await inventory(ctx, request, state, false, retired);
         for (const name of retired) {
@@ -1408,10 +1421,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       locked(ctx, async () => {
         const request = api(ctx);
         const state = readState(ctx);
-        if (state.pendingCreate)
-          throw new CliError(
-            "A Render resource creation has an unknown result; recover render.resources.json before cleanup",
-          );
+        await recoverPendingCreate(ctx, request, state);
         if (state.pendingPurge && !opts.purge) throw new CliError("Render cleanup is incomplete; run qm down --purge");
         const bound = await inventory(ctx, request, state, !!opts.purge);
         const hosted = await list<RenderService>(
@@ -1464,6 +1474,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           delete state.workflowBootstrap;
           if (bound.postgres) await request(`/postgres/${bound.postgres.id}`, "DELETE");
           delete state.postgresId;
+          delete state.bootstrapServices;
           delete state.pendingPurge;
           delete state.dirtyServices;
           saveState(ctx, state);

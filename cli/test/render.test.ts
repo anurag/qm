@@ -753,19 +753,114 @@ for (const [initial, terminal] of [
   });
 }
 
-test("Render refuses retries after an uncertain create response", async (t) => {
+for (const failure of ["connection closed", "HTTP 503"]) {
+  for (const path of ["/projects", "/postgres", "/services", "/workflows"]) {
+    test(`Render retries ${path} after ${failure} before creation`, async (t) => {
+      const d = deployment(t);
+      const c = cloud(t, d);
+      c.intercept = (call) => {
+        if (call.path !== path || call.method !== "POST") return undefined;
+        if (failure === "connection closed") throw new TypeError(failure);
+        return new Response(null, { status: 503 });
+      };
+      await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
+      assert.ok(d.saved().pendingCreate.startsWith(`${path}: `));
+      c.intercept =
+        path === "/workflows"
+          ? (call) => (call.path === path && call.method === "GET" ? Response.json(null) : undefined)
+          : undefined;
+      const backend = hostingProvider("render").createBackend(d.ctx);
+      await backend.up({ dryRun: false });
+      assert.equal(d.saved().pendingCreate, undefined);
+      assert.equal(c.projects.size, 1);
+      assert.equal(c.services.size, 3);
+      assert.ok(c.database);
+      assert.ok(c.workflow);
+      await backend.down({ purge: true });
+      assert.equal(c.services.size, 0);
+      assert.equal(c.database, undefined);
+      assert.equal(c.workflow, undefined);
+    });
+  }
+
+  test(`Render permits cleanup after ${failure} before creation`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    c.intercept = ({ path, method }) => {
+      if (path !== "/services" || method !== "POST") return undefined;
+      if (failure === "connection closed") throw new TypeError(failure);
+      return new Response(null, { status: 503 });
+    };
+    await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
+    c.intercept = undefined;
+    await hostingProvider("render").createBackend(d.ctx).down({ purge: true });
+    assert.equal(d.saved().pendingCreate, undefined);
+    assert.equal(d.saved().bootstrapServices, undefined);
+    assert.equal(c.services.size, 0);
+    assert.equal(c.database, undefined);
+    writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"b".repeat(40)}' "$4"\n`);
+    await hostingProvider("render").createBackend(d.ctx).up({ dryRun: false });
+    assert.equal(d.saved().releaseCommit, "b".repeat(40));
+  });
+}
+
+test("Render retains the creation request when its recovery lookup fails", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
-  c.intercept = (call) => {
-    if (call.path === "/services" && call.method === "POST") throw new TypeError("connection closed");
+  c.intercept = ({ path, method }) => {
+    if (path === "/projects" && method === "POST") throw new TypeError("connection closed");
     return undefined;
   };
   await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
-  assert.equal(d.saved().pendingCreate, "/services: acme-minio");
+  c.intercept = ({ path, method }) =>
+    path === "/projects" && method === "GET" ? new Response(null, { status: 503 }) : undefined;
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(d.saved().pendingCreate, undefined);
+});
+
+test("Render retains the creation request when its recovery lookup returns an empty body", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path === "/projects" && method === "POST") throw new TypeError("connection closed");
+    return undefined;
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
+  c.intercept = ({ path, method }) =>
+    path === "/projects" && method === "GET" ? new Response(null, { status: 200 }) : undefined;
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /invalid list response/);
+  await assert.rejects(async () => d.backend.down({ purge: true }), /invalid list response/);
+  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
+});
+
+test("Render refuses to adopt a resource after its accepted creation response is lost", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path !== "/projects" || method !== "POST") return undefined;
+    c.projects.set("prj-acme", {
+      id: "prj-acme",
+      name: "acme-qm",
+      owner: { id: "tea-acme" },
+      environmentIds: ["evm-acme"],
+    });
+    throw new TypeError("connection closed");
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
   c.intercept = undefined;
   const mark = c.calls.length;
-  await assert.rejects(d.backend.up({ dryRun: false }), /unknown result/);
-  assert.equal(c.calls.length, mark);
+  await assert.rejects(d.backend.up({ dryRun: false }), /Refusing to adopt/);
+  await assert.rejects(async () => d.backend.down({ purge: true }), /Refusing to adopt/);
+  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.equal(c.projects.size, 1);
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
 });
 
 test("Render retries a resource creation rejected by rate limiting", async (t) => {
@@ -1343,6 +1438,34 @@ test("Render retries a rejected resume without losing retained storage credentia
   assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, password);
   assert.deepEqual(d.saved().bootstrapServices, {});
 });
+
+for (const failure of ["connection closed", "HTTP 503"]) {
+  test(`Render retries ${failure} before resume and retains storage credentials`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    await d.backend.up({ dryRun: false });
+    const storage = { ...c.envs.get("srv-acme-minio")! };
+    await d.backend.down({});
+    c.intercept = ({ path, method }) => {
+      if (path !== "/services/srv-acme-minio/resume" || method !== "POST") return undefined;
+      if (failure === "connection closed") throw new TypeError(failure);
+      return new Response(null, { status: 503 });
+    };
+    await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
+    assert.equal(d.saved().bootstrapServices.minio.requested, true);
+    assert.equal(c.services.get("srv-acme-minio")!.suspended, "suspended");
+    c.intercept = undefined;
+    const backend = hostingProvider("render").createBackend(d.ctx);
+    await backend.up({ dryRun: false });
+    assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
+    assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, storage.QM_STORAGE_SECRET_KEY);
+    assert.deepEqual(d.saved().bootstrapServices, {});
+    assert.equal(c.calls.filter((call) => call.path === "/services/srv-acme-minio/resume").length, 2);
+    await backend.down({ purge: true });
+    assert.equal(c.services.size, 0);
+    assert.equal(c.database, undefined);
+  });
+}
 
 test("Render waits for the initial workflow registration to fail before adding credentials", async (t) => {
   const d = deployment(t);
