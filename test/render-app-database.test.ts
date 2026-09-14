@@ -321,14 +321,90 @@ test("Render app database archive revokes login and restore retains records and 
   const id = randomUUID();
   const manager = f.create();
   const first = (await manager.ensure(id)).DATABASE_URL!;
+  const peer = (await manager.ensure(randomUUID())).DATABASE_URL!;
+  const record = (await f.store.get(id))!;
   await query(first, "CREATE TABLE archive_records (value text)");
   await query(first, "INSERT INTO archive_records VALUES ('retained')");
-  await manager.suspend(id);
+  const admin = new pg.Client({ connectionString: f.adminUrl });
+  const active = new pg.Client({ connectionString: first });
+  const other = new pg.Client({ connectionString: peer });
+  active.on("error", () => {});
+  other.on("error", () => {});
+  admin.on("error", () => {});
+  try {
+    await Promise.all([admin.connect(), active.connect(), other.connect()]);
+    const privileges = await admin.query(
+      "SELECT rolsuper, rolcreatedb, rolcreaterole, pg_has_role(current_user, 'pg_signal_backend', 'USAGE') AS can_signal_all FROM pg_roles WHERE rolname = current_user",
+    );
+    assert.deepEqual(privileges.rows, [
+      { rolsuper: false, rolcreatedb: true, rolcreaterole: true, can_signal_all: false },
+    ]);
+    const pid = (await active.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+    await manager.suspend(id);
+    assert.equal((await f.root.query("SELECT 1 FROM pg_stat_activity WHERE pid = $1", [pid])).rowCount, 0);
+    assert.deepEqual((await other.query("SELECT 1 AS alive")).rows, [{ alive: 1 }]);
+    assert.deepEqual((await admin.query("SELECT * FROM core_secrets")).rows, [{ id: 1, value: "private" }]);
+    assert.deepEqual(
+      (await admin.query("SELECT pg_has_role($1, $2, 'MEMBER') AS member", [record.loginRole, f.adminRole])).rows,
+      [{ member: false }],
+    );
+    const membership = await admin.query(
+      "SELECT inherit_option, set_option FROM pg_auth_members WHERE member = current_user::regrole AND roleid = $1::regrole AND inherit_option",
+      [record.loginRole],
+    );
+    assert.deepEqual(membership.rows, [{ inherit_option: true, set_option: false }]);
+    assert.equal(
+      (await admin.query("SELECT pg_has_role(current_user, 'pg_signal_backend', 'USAGE') AS allowed")).rows[0].allowed,
+      false,
+    );
+  } finally {
+    await Promise.all([admin.end(), active.end(), other.end()]);
+  }
   await assert.rejects(query(first, "SELECT 1"), /not permitted to log in/);
   const restored = (await f.create().ensure(id)).DATABASE_URL!;
   assert.equal(restored, first);
   assert.deepEqual((await query(restored, "SELECT * FROM archive_records")).rows, [{ value: "retained" }]);
 });
+
+for (const stillActive of [false, true])
+  test(
+    `Render archive checks remaining sessions when termination returns false (active=${stillActive})`,
+    { skip },
+    async (t) => {
+      const f = await fixture(t);
+      const id = randomUUID();
+      const manager = f.create();
+      const url = (await manager.ensure(id)).DATABASE_URL!;
+      const active = new pg.Client({ connectionString: url });
+      active.on("error", () => {});
+      await active.connect();
+      const original = pg.Client.prototype.query;
+      const mocked = t.mock.method(pg.Client.prototype, "query", async function (this: pg.Client, ...args: unknown[]) {
+        if (typeof args[0] === "string" && args[0].startsWith("SELECT pg_terminate_backend")) {
+          if (!stillActive) await active.end();
+          return { rows: [{ terminated: false }], rowCount: 1 };
+        }
+        return Reflect.apply(original, this, args);
+      });
+      try {
+        if (stillActive) {
+          await assert.rejects(manager.suspend(id), /sessions did not stop before the deadline/);
+          assert.deepEqual((await active.query("SELECT 1 AS alive")).rows, [{ alive: 1 }]);
+        } else await manager.suspend(id);
+        await assert.rejects(query(url, "SELECT 1"), /not permitted to log in/);
+        mocked.mock.restore();
+        await manager.suspend(id);
+        const record = (await f.store.get(id))!;
+        assert.equal(
+          (await f.root.query("SELECT 1 FROM pg_stat_activity WHERE usename = $1", [record.loginRole])).rowCount,
+          0,
+        );
+      } finally {
+        mocked.mock.restore();
+        await active.end();
+      }
+    },
+  );
 
 test(
   "Render app database rejects unsafe core column, sequence, function, and schema privileges",

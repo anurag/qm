@@ -159,11 +159,18 @@ export function createRenderAppDatabase(opts: {
         );
         if (found.rows[0]?.marker !== marker(record))
           throw new ProvisioningError("The retained Render app database role is missing or has a different owner");
+        await client.query(`GRANT ${identifier(record.loginRole)} TO CURRENT_USER WITH INHERIT TRUE, SET FALSE`);
         await client.query(`ALTER ROLE ${identifier(record.loginRole)} NOLOGIN`);
         await client.query(
-          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()",
+          "SELECT pg_terminate_backend(pid, 10000) AS terminated FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()",
           [record.loginRole],
         );
+        const remaining = await client.query(
+          "SELECT 1 FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid() LIMIT 1",
+          [record.loginRole],
+        );
+        if (remaining.rowCount)
+          throw new ProvisioningError("The Render app database sessions did not stop before the deadline");
       } catch (error) {
         throw provisioningFailure(error);
       } finally {
