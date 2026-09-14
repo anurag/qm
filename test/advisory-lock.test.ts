@@ -10,7 +10,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createPgPool, type PgPool, type PoolClient } from "../src/persistence/pg-pool.ts";
-import { createPostgresAdvisoryLock, createNoopAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import {
+  createMemoryAdvisoryLock,
+  createNoopAdvisoryLock,
+  createPostgresAdvisoryLock,
+} from "../src/persistence/advisory-lock.ts";
 
 const URL = process.env.DATABASE_URL;
 const skip = URL ? false : "set DATABASE_URL (a Postgres) to run the advisory-lock tests";
@@ -286,6 +290,47 @@ test("pg mutex: sibling acquisitions within one outer session are serialized", a
   });
   assert.deepEqual(events, ["first", "released", "second"]);
   assert.equal(fake.connections(), 1);
+});
+
+test("memory mutex: nested locks re-enter a held key and tryWithLock skips a busy key", async () => {
+  const lock = createMemoryAdvisoryLock();
+  const nested = await lock.withLock("a", () => lock.withLock("a", () => lock.tryWithLock!("a", async () => "inner")));
+  assert.equal(nested, "inner");
+  let release!: () => void;
+  const holding = lock.withLock("b", () => new Promise<void>((resolve) => (release = resolve)));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await lock.tryWithLock!("b", async () => "skipped"), null);
+  release();
+  await holding;
+  assert.equal(await lock.tryWithLock!("b", async () => "free"), "free");
+});
+
+test("pg mutex: a failing body's error survives a failing unlock", async () => {
+  let released: Error | undefined;
+  const pg = {
+    async sessionPool() {
+      return {
+        async connect() {
+          return {
+            async query(sql: string) {
+              if (sql.includes("pg_advisory_unlock")) throw new Error("unlock failed");
+              return { rows: [{ locked: true }] };
+            },
+            release(error?: Error) {
+              released = error;
+            },
+          } as unknown as PoolClient;
+        },
+      };
+    },
+  } as PgPool;
+  await assert.rejects(
+    createPostgresAdvisoryLock(pg).withLock("scope", async () => {
+      throw new Error("body failed");
+    }),
+    /body failed/,
+  );
+  assert.equal(released?.message, "unlock failed");
 });
 
 test("pg mutex: a session whose unlock fails is discarded instead of returned to the pool", async () => {

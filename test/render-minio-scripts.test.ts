@@ -52,6 +52,20 @@ test(
   { skip, timeout: 900_000 },
   async (t) => {
     const image = (await docker("build", "--quiet", "--file", `${minioContext}/Dockerfile`, minioContext)).trim();
+    const tools = await run([
+      "run",
+      "--rm",
+      "--entrypoint",
+      "/bin/sh",
+      image,
+      "-c",
+      "command -v sh mc timeout mktemp base64",
+    ]);
+    assert.equal(
+      tools.status,
+      0,
+      `the MinIO image lacks a tool the Render job scripts need: ${tools.stdout}${tools.stderr}`,
+    );
     const container = `qm-minio-${randomUUID()}`;
     const storageSecret = randomUUID();
     await docker(
@@ -85,6 +99,7 @@ test(
         () => false,
       ))
     ) {
+      assert.equal((await docker("inspect", "--format", "{{.State.Running}}", container)).trim(), "true");
       assert.ok(Date.now() < deadline, "MinIO did not become healthy");
       await delay(250);
     }

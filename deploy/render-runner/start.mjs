@@ -90,7 +90,11 @@ export async function runRenderApp({
   )
     throw new Error("Invalid Render app readiness nonce");
   const entrypoint = await prepareRenderApp(manifestPath, appDir, env);
-  await chmod(manifestPath, 0o600).catch(() => rm(manifestPath, { force: true }).catch(() => undefined));
+  await chmod(manifestPath, 0o600).catch(() =>
+    rm(manifestPath, { force: true }).catch(() =>
+      console.error(`Render app runner could not restrict or remove ${manifestPath}`),
+    ),
+  );
   const appEnv = { ...env, ...manifest.runtimeEnv, PORT: String(appPort) };
   delete appEnv.QM_RENDER_APP_TOKEN;
   const privileged = process.getuid?.() === 0;

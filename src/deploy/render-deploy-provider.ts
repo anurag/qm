@@ -203,7 +203,9 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
 
   async function settle(service: Service): Promise<void> {
     for (const deploy of (await deployments(service)).filter(active))
-      await api.request("POST", `${path(service)}/deploys/${encodeURIComponent(deploy.id)}/cancel`);
+      await api.request("POST", `${path(service)}/deploys/${encodeURIComponent(deploy.id)}/cancel`).catch((error) => {
+        if (!(error instanceof RenderApiError && error.rejected)) throw error;
+      });
     await idle(service);
   }
 
@@ -222,7 +224,9 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         if (!record.pending.deployId) {
           const own = (deploy: Deploy | undefined) =>
-            deploy && deploy.id !== record.pending.previousDeployId ? deploy : undefined;
+            deploy && deploy.id !== record.pending.previousDeployId && deploy.commit?.id === record.pending.runnerCommit
+              ? deploy
+              : undefined;
           let found = own(await latest(service));
           if (!found) {
             try {

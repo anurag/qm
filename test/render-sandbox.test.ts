@@ -119,6 +119,28 @@ test("Render uses its durable home archive when a native checkpoint expires", as
   assert.equal(restored.coldStart, false);
   assert.equal(fake.createdFrom.length, 2);
   assert.equal(fake.createdFrom[1], undefined);
+  assert.deepEqual(
+    (await store.get(scope))!.retiredResources?.map((resources) => resources.checkpoint?.id),
+    [stored.checkpoint!.id],
+  );
+  await target.teardown(restored);
+  assert.ok(fake.deleted.includes(stored.checkpoint!.id));
+  assert.equal((await store.get(scope))!.retiredResources, undefined);
+});
+
+test("Render refuses a blank replacement when the recorded home archive is missing", async (t) => {
+  const { make, fake, layers, store, scope, snapshots } = setup(t);
+  const source = make();
+  const handle = await source.provision(layers);
+  await source.writeFile(handle, "long-lived", "must not vanish");
+  await source.teardown(handle);
+  const stored = (await store.get(scope))!;
+  fake.snapshots.get(stored.checkpoint!.id)!.expiresAtMs = Date.now() - 1;
+  await fake.client.terminate(stored.sandboxId);
+  await snapshots.delete(scope);
+  await assert.rejects(make().provision(layers), /home checkpoint is missing; refusing a blank replacement/);
+  assert.equal(fake.sandboxes.get("sbx-2")?.status, "terminated");
+  assert.equal((await store.get(scope))!.sandboxId, stored.sandboxId);
 });
 
 test("Render rotates a sandbox near expiry only after it saves a new checkpoint", async (t) => {
@@ -228,6 +250,36 @@ test("Render recovers from an expired staged native checkpoint with the durable 
   assert.equal(await target.readFile(restored, "recovered"), "retained");
   assert.equal(fake.createdFrom[0], undefined);
   assert.equal((await store.get(scope))?.retiredResources, undefined);
+});
+
+test("Render keeps the previous home archive when an import cannot publish its record", async (t) => {
+  const { make, fake, layers, store, scope, blobTransfer, snapshots } = setup(t);
+  const source = make();
+  const handle = await source.provision(layers);
+  await source.writeFile(handle, "work", "original value");
+  await source.teardown(handle);
+  const before = (await store.get(scope))!;
+  const put = store.put;
+  let failed = false;
+  store.put = async (key, value) => {
+    if (
+      !failed &&
+      value.sandboxId !== before.sandboxId &&
+      !value.retiredResources?.some((r) => r.sandboxId === value.sandboxId)
+    ) {
+      failed = true;
+      throw new Error("publish record outage");
+    }
+    await put(key, value);
+  };
+  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("replacement") }]));
+  await assert.rejects(source.adoptHomeSnapshot!(scope, blob.blobId), /publish record outage/);
+  assert.deepEqual(await store.get(scope), before);
+  assert.ok((await readBackup(snapshots, scope))!.includes("original value"));
+  assert.equal(fake.snapshots.size, 1);
+  assert.equal(fake.sandboxes.get("sbx-2")?.status, "terminated");
+  const restored = await make().provision(layers);
+  assert.equal(await source.readFile(restored, "work"), "original value");
 });
 
 test("Render keeps the original body and backup when import checkpoint creation fails", async (t) => {

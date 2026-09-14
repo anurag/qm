@@ -29,6 +29,8 @@ function fixture(appRegion?: string) {
   let outcome = "live";
   let builtCommit: string | undefined;
   let foreignDeployOnEnvWrite: string | undefined;
+  let foreignDeployAfterSnapshot: string | undefined;
+  let rejectCancel = false;
   let loseCreate = false;
   let loseUpdate = false;
   let failure: { method: string; path: string; status?: number } | undefined;
@@ -140,8 +142,19 @@ function fixture(appRegion?: string) {
         manifestNonce = body.length ? JSON.parse(body[0].content).readinessNonce : undefined;
         return response(body);
       }
-      if (path.startsWith("/services/srv-app/deploys?") && method === "GET")
+      if (path.startsWith("/services/srv-app/deploys?") && method === "GET") {
+        const pending = (await store.get(deployment.id))?.pending;
+        if (foreignDeployAfterSnapshot && pending && !pending.deployId) {
+          deploys.unshift({ id: `dep-${deploys.length}`, status: "live", commit: { id: foreignDeployAfterSnapshot } });
+          foreignDeployAfterSnapshot = undefined;
+        }
         return response(deploys.map((deploy) => ({ deploy })));
+      }
+      if (path.endsWith("/cancel") && method === "POST") {
+        const deploy = deploys.find((item) => path.includes(`/${item.id}/`))!;
+        deploy.status = rejectCancel ? "live" : "canceled";
+        return rejectCancel ? response({ message: "deploy is not in progress" }, 400) : response(deploy);
+      }
       if (path.startsWith("/services/srv-app/deploys/"))
         return response(deploys.find((deploy) => path.endsWith(deploy.id)));
       if (path === "/services/srv-app/deploys" && method === "POST") {
@@ -209,6 +222,15 @@ function fixture(appRegion?: string) {
     set foreignDeployOnEnvWrite(value: string | undefined) {
       foreignDeployOnEnvWrite = value;
     },
+    set foreignDeployAfterSnapshot(value: string | undefined) {
+      foreignDeployAfterSnapshot = value;
+    },
+    set rejectCancel(value: boolean) {
+      rejectCancel = value;
+    },
+    startDeploy(status: string, commit: string) {
+      deploys.unshift({ id: `dep-${deploys.length}`, status, commit: { id: commit } });
+    },
     set loseCreate(value: boolean) {
       loseCreate = value;
     },
@@ -258,6 +280,9 @@ test("Render retains the app region through pending recovery and update after a 
   d.status = "running";
   d.appliedVersion = 1;
   assert.deepEqual(await restarted.apply(d, { ...v1, version: 2 }), endpoint);
+  d.appliedVersion = 2;
+  await restarted.destroy(d);
+  assert.deepEqual(await restarted.apply(d, v1), endpoint);
   assert.equal((await f.store.get(d.id))!.appRegion, "virginia");
   assert.equal(f.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
   assert.ok(f.calls.some((call) => call.method === "PATCH" && call.path === "/postgres/dpg-test"));
@@ -341,6 +366,36 @@ for (const commit of ["f".repeat(40), sha])
     assert.equal(record.liveVersion, 2);
     assert.equal(record.pending, undefined);
   });
+
+test("Render submits its own deploy when another commit goes live after its submission is recorded", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  await f.provider.apply(d, v1);
+  f.foreignDeployAfterSnapshot = "f".repeat(40);
+  await f.provider.apply(d, { ...v1, version: 2 });
+  const record = (await f.store.get(d.id))!;
+  assert.equal(record.liveVersion, 2);
+  assert.equal(record.pending, undefined);
+  assert.equal(f.calls.filter((c) => c.method === "POST" && c.path === "/services/srv-app/deploys").length, 2);
+});
+
+test("Render continues when a deploy finishes before its cancellation is accepted", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  await f.provider.apply(d, v1);
+  f.startDeploy("build_in_progress", "f".repeat(40));
+  f.rejectCancel = true;
+  await f.provider.apply(d, { ...v1, version: 2 });
+  assert.equal((await f.store.get(d.id))!.liveVersion, 2);
+  assert.equal(f.calls.filter((c) => c.method === "POST" && c.path.endsWith("/cancel")).length, 1);
+  f.startDeploy("build_in_progress", "f".repeat(40));
+  f.rejectCancel = false;
+  await f.provider.apply(d, v1);
+  assert.equal((await f.store.get(d.id))!.liveVersion, 1);
+  assert.equal(f.calls.filter((c) => c.method === "POST" && c.path.endsWith("/cancel")).length, 2);
+});
 
 test("Render clears a pending deploy built from another commit so a retry deploys again", async () => {
   const f = fixture();

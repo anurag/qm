@@ -280,7 +280,9 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
         sandboxId: info.id,
         expiresAtMs: info.expiresAtMs,
         lastActivityMs: Date.now(),
-        ...(snapshotId ? {} : { checkpoint: undefined }),
+        ...(snapshotId || !stored?.checkpoint
+          ? {}
+          : { checkpoint: undefined, retiredResources: retire(stored, { checkpoint: stored.checkpoint }) }),
       });
     } catch (error) {
       await client.terminate(info.id).catch(swallowAs("render-sandbox: discard untracked sandbox", undefined));
@@ -427,17 +429,17 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           resources.checkpoint = await client.createSnapshot(info.id);
           await retainStaging();
           resources.checkpoint = await waitCheckpoint(resources.checkpoint);
-          await homeSnapshots.snapshotHome(scope, info.id);
           const imported: StoredRenderSandbox = {
             ...resources,
             sandboxId: info.id,
             expiresAtMs: info.expiresAtMs,
             lastActivityMs: Date.now(),
-            homeCheckpointAtMs: Date.now(),
             ...(previous ? { retiredResources: [...(previous.retiredResources ?? []), resourcesFor(previous)] } : {}),
           };
           await store.put(scope, imported);
           published = true;
+          await homeSnapshots.snapshotHome(scope, info.id);
+          await store.merge(scope, { homeCheckpointAtMs: Date.now(), homeDirty: false });
           await cleanupRetired(scope, imported);
         } catch (error) {
           if (!published) {

@@ -23,22 +23,24 @@ export function createNoopAdvisoryLock(): AdvisoryLock {
 
 export function createMemoryAdvisoryLock(): AdvisoryLock {
   const queue = createKeyedQueue<string>();
-  const held = new Set<string>();
-  const withLock = <T>(key: string, fn: () => Promise<T>): Promise<T> =>
-    queue(key, async () => {
-      held.add(key);
+  const busy = new Set<string>();
+  const context = new AsyncLocalStorage<ReadonlySet<string>>();
+  async function acquire<T>(key: string, fn: () => Promise<T>, once: boolean): Promise<T | null> {
+    const held = context.getStore() ?? new Set<string>();
+    if (held.has(key)) return fn();
+    if (once && busy.has(key)) return null;
+    return queue(key, async () => {
+      busy.add(key);
       try {
-        return await fn();
+        return await context.run(new Set([...held, key]), fn);
       } finally {
-        held.delete(key);
+        busy.delete(key);
       }
     });
+  }
   return {
-    withLock,
-    async tryWithLock(key, fn) {
-      if (held.has(key)) return null;
-      return withLock(key, fn);
-    },
+    withLock: <T>(key: string, fn: () => Promise<T>) => acquire(key, fn, false) as Promise<T>,
+    tryWithLock: <T>(key: string, fn: () => Promise<T>) => acquire(key, fn, true),
   };
 }
 
@@ -71,14 +73,18 @@ export function createPostgresAdvisoryLock(
     key: string,
     fn: () => Promise<T>,
   ): Promise<T> {
+    let failed = false;
     try {
       return await context.run({ session, held: new Set([...held, key]) }, fn);
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
       await session.client
         .query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key])
         .catch((error: unknown) => {
           session.error = error instanceof Error ? error : new Error(String(error));
-          throw error;
+          if (!failed) throw error;
         });
     }
   }
