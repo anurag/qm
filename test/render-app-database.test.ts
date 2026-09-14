@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { test, type TestContext } from "node:test";
 import pg from "pg";
 import {
@@ -227,8 +228,9 @@ test(
       assert.equal((await f.create().ensure(id)).DATABASE_URL, url);
       for (const client of held) assert.equal((await client.query("SELECT 1 AS value")).rows[0].value, 1);
     } finally {
+      const disconnected = held.map((client) => once(client, "end"));
       for (const client of held) client.release();
-      await Promise.all([oldPool.end(), newPool.end()]);
+      await Promise.all([oldPool.end(), newPool.end(), ...disconnected]);
     }
   },
 );
