@@ -1423,6 +1423,140 @@ test("Render keeps the initial source commit when an interrupted bootstrap resum
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "a".repeat(40));
 });
 
+for (const resource of ["retained", "deleted", "not created"]) {
+  test(`Render ignores a retired plugin bootstrap when its service is ${resource}`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    await d.backend.up({ dryRun: false });
+    const pluginDir = join(d.ctx.configDir, "plugins", "reports");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, "Dockerfile"), "FROM node:24\n");
+    c.intercept = ({ path, method, body }) => {
+      if (resource === "not created")
+        return path === "/services" && method === "POST" && (body as { name: string }).name === "acme-reports"
+          ? new Response(null, { status: 503 })
+          : undefined;
+      return path.startsWith("/services/srv-acme-reports/deploys/") && path.endsWith("/cancel")
+        ? new Response(null, { status: 503 })
+        : undefined;
+    };
+    await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+    const bootstrap = d.saved().bootstrapServices.reports;
+    assert.equal(bootstrap.commit, "a".repeat(40));
+    assert.equal(bootstrap.drained, undefined);
+    delete bootstrap.commit;
+    if (resource === "deleted") {
+      c.services.delete("srv-acme-reports");
+      c.envs.delete("srv-acme-reports");
+      c.deploys.delete("srv-acme-reports");
+    }
+    rmSync(pluginDir, { recursive: true });
+    c.intercept = undefined;
+    for (const commit of ["c".repeat(40), "d".repeat(40)]) {
+      writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${commit}' "$4"\n`);
+      const mark = c.calls.length;
+      await hostingProvider("render").createBackend(d.ctx).up({ dryRun: false });
+      const calls = c.calls.slice(mark);
+      const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
+      assert.deepEqual(
+        deploys.map((call) => (call.body as { commitId: string }).commitId),
+        [commit, commit],
+      );
+      const versions = calls.filter((call) => call.method === "POST" && call.path === "/workflowversions");
+      assert.deepEqual(
+        versions.map((call) => (call.body as { commit: string }).commit),
+        [commit],
+      );
+      assert.equal(d.saved().releaseCommit, commit);
+      assert.equal(d.saved().pendingCreate, undefined);
+      assert.equal(Boolean(d.saved().services.reports), resource === "retained");
+      assert.deepEqual(d.saved().bootstrapServices.reports, resource === "retained" ? bootstrap : undefined);
+      assert.equal(
+        calls.some((call) => call.method !== "GET" && call.path.includes("srv-acme-reports")),
+        false,
+      );
+    }
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, "Dockerfile"), "FROM node:24\n");
+    const commit = "e".repeat(40);
+    writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${commit}' "$4"\n`);
+    const mark = c.calls.length;
+    c.intercept = ({ method }) => {
+      if (method !== "GET" && resource === "retained") assert.equal(d.saved().bootstrapServices.reports.commit, commit);
+      return undefined;
+    };
+    await d.backend.up({ dryRun: false });
+    const calls = c.calls.slice(mark);
+    assert.equal(d.saved().bootstrapServices.reports, undefined);
+    assert.equal(d.saved().releaseCommit, commit);
+    const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
+    assert.deepEqual(
+      deploys.map((call) => (call.body as { commitId: string }).commitId),
+      [commit, commit, commit],
+    );
+    const versions = calls.filter((call) => call.method === "POST" && call.path === "/workflowversions");
+    assert.deepEqual(
+      versions.map((call) => (call.body as { commit: string }).commit),
+      [commit],
+    );
+    assert.equal(
+      calls.filter((call) => call.method === "POST" && call.path === "/services").length,
+      resource === "retained" ? 0 : 1,
+    );
+    assert.equal(c.deploys.get("srv-acme-reports")!.status, "live");
+  });
+}
+
+test("Render joins a re-added plugin to a newer interrupted bootstrap", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const reportsDir = join(d.ctx.configDir, "plugins", "reports");
+  mkdirSync(reportsDir, { recursive: true });
+  writeFileSync(join(reportsDir, "Dockerfile"), "FROM node:24\n");
+  c.intercept = ({ path }) => (path.endsWith("/cancel") ? new Response(null, { status: 503 }) : undefined);
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+  const reportsEnv = d.saved().bootstrapServices.reports.env;
+  rmSync(reportsDir, { recursive: true });
+  const analyticsDir = join(d.ctx.configDir, "plugins", "analytics");
+  mkdirSync(analyticsDir, { recursive: true });
+  writeFileSync(join(analyticsDir, "Dockerfile"), "FROM node:24\n");
+  const commit = "b".repeat(40);
+  writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${commit}' "$4"\n`);
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+  assert.equal(d.saved().bootstrapServices.reports.commit, undefined);
+  assert.equal(d.saved().bootstrapServices.analytics.commit, commit);
+  mkdirSync(reportsDir, { recursive: true });
+  writeFileSync(join(reportsDir, "Dockerfile"), "FROM node:24\n");
+  writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"e".repeat(40)}' "$4"\n`);
+  c.intercept = ({ method }) => {
+    if (method !== "GET" && d.saved().bootstrapServices.reports) {
+      assert.equal(d.saved().bootstrapServices.reports.commit, commit);
+      assert.equal(d.saved().bootstrapServices.reports.env, reportsEnv);
+    }
+    return undefined;
+  };
+  const mark = c.calls.length;
+  await hostingProvider("render").createBackend(d.ctx).up({ dryRun: false });
+  const calls = c.calls.slice(mark);
+  const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
+  assert.deepEqual(
+    deploys.map((call) => (call.body as { commitId: string }).commitId),
+    [commit, commit, commit, commit],
+  );
+  const versions = calls.filter((call) => call.method === "POST" && call.path === "/workflowversions");
+  assert.deepEqual(
+    versions.map((call) => (call.body as { commit: string }).commit),
+    [commit],
+  );
+  assert.equal(
+    calls.some((call) => call.method === "POST" && call.path === "/services"),
+    false,
+  );
+  assert.deepEqual(d.saved().bootstrapServices, {});
+  assert.equal(d.saved().releaseCommit, commit);
+});
+
 test("Render retries a rejected resume without losing retained storage credentials", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);

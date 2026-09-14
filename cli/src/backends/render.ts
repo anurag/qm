@@ -129,7 +129,7 @@ interface State {
     string,
     {
       env: string;
-      commit: string;
+      commit?: string;
       previousDeployIds: string[];
       deployId?: string;
       requested?: boolean;
@@ -1104,9 +1104,11 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         if (!commit || !/^[a-f0-9]{40}$/.test(commit) || ref !== `refs/heads/${source.branch}`)
           throw new CliError("Render Git source did not resolve to one branch commit");
         const pendingCommits = new Set([
-          ...Object.values(state.bootstrapServices ?? {})
-            .filter((bootstrap) => !bootstrap.drained)
-            .map((bootstrap) => bootstrap.commit),
+          ...Object.entries(state.bootstrapServices ?? {}).flatMap(([name, bootstrap]) =>
+            bootstrap.commit && !bootstrap.drained && desired.some((item) => item.name === name)
+              ? [bootstrap.commit]
+              : [],
+          ),
           ...(state.workflowBootstrap && !state.workflowBootstrap.drained ? [state.workflowBootstrap.commit] : []),
         ]);
         if (pendingCommits.size > 1)
@@ -1124,12 +1126,22 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         const request = api(ctx);
         await request(`/owners/${state.workspaceId}`);
         await recoverPendingCreate(ctx, request, state);
-        const retired = Object.keys(state.services).filter((name) => !desired.some((item) => item.name === name));
+        const retired = [
+          ...new Set([...Object.keys(state.services), ...Object.keys(state.bootstrapServices ?? {})]),
+        ].filter((name) => !desired.some((item) => item.name === name));
         const bound = await inventory(ctx, request, state, false, retired);
         for (const name of retired) {
-          if (bound.services.has(name)) continue;
+          if (bound.services.has(name)) {
+            if (state.bootstrapServices?.[name]) delete state.bootstrapServices[name]!.commit;
+            continue;
+          }
           delete state.services[name];
+          if (state.bootstrapServices) delete state.bootstrapServices[name];
           state.dirtyServices = state.dirtyServices?.filter((item) => item !== name);
+        }
+        for (const workload of desired) {
+          const bootstrap = state.bootstrapServices?.[workload.name];
+          if (bootstrap && !bootstrap.drained) bootstrap.commit ??= state.sourceCommit;
         }
         saveState(ctx, state);
         state.updateInProgress = true;
