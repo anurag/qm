@@ -427,7 +427,7 @@ test("Render init ignores the state file and its interrupted-write temporary fil
   try {
     execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
     quiet(() => runInit({ dir, org: "acme", target: "render" }));
-    for (const name of ["render.resources.json", "render.resources.json.tmp", "render.resources.json.123.tmp"]) {
+    for (const name of ["render.resources.json", "render.resources.json.tmp"]) {
       writeFileSync(join(dir, name), "{}");
       assert.equal(execFileSync("git", ["check-ignore", name], { cwd: dir, encoding: "utf8" }).trim(), name);
     }

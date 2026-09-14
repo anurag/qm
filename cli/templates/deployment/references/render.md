@@ -8,9 +8,8 @@ that local Git and Render can read. `--repo <url> --branch <name>` sets both at 
 Run `qm setup`, `qm check`, `qm plan`, then `qm up`. Keep the generated `.env`
 private. Render stores the runtime values. The CLI records resource IDs in
 `render.resources.json`; retain this file so updates act on the same resources.
-After an unknown creation result, a retry searches for the named resource and
-repeats the write if the resource is absent. If the resource exists without a saved
-ID, restore its ID in this record before retrying.
+After an unknown creation result, a retry searches the workspace for the named
+resource, records it when it exists, and repeats the write when it is absent.
 During service creation or resume, this record also stores encrypted credentials
 until the pinned deployment succeeds. Keep the same local `CORE_SIGNING_SECRET`
 until that operation finishes so a retry can restore the credentials.

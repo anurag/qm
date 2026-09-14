@@ -477,14 +477,29 @@ async function recoverPendingCreate(ctx: DeployContext, request: RenderRequest, 
   if (!state.pendingCreate) return;
   const pending = /^\/(projects|postgres|workflows|services): (.+)$/.exec(state.pendingCreate);
   if (!pending) throw new CliError("The saved Render creation request is invalid; restore render.resources.json");
-  const collection = pending[1]!;
-  await assertAvailable(
-    request,
-    `/${collection}`,
-    collection === "postgres" ? collection : collection.slice(0, -1),
-    pending[2]!,
-    state.workspaceId,
-  );
+  const collection = pending[1] as "projects" | "postgres" | "workflows" | "services";
+  const name = pending[2]!;
+  const query = new URLSearchParams({ ownerId: state.workspaceId, name });
+  const found = (
+    await list<{ id: string; name: string; type: ServiceType; slug: string }>(
+      request,
+      `/${collection}?${query}`,
+      collection === "postgres" ? collection : collection.slice(0, -1),
+    )
+  ).filter((item) => item.name === name);
+  if (found.length > 1)
+    throw new CliError(
+      `Render has several resources named ${name}; remove the duplicates and restore render.resources.json`,
+    );
+  const created = found[0];
+  if (created) {
+    if (collection === "projects") state.projectId ??= created.id;
+    else if (collection === "postgres") state.postgresId ??= created.id;
+    else if (collection === "workflows") {
+      state.workflowId ??= created.id;
+      state.workflowSlug ??= created.slug;
+    } else state.services[name.slice(state.appPrefix.length + 1)] ??= { id: created.id, name, type: created.type };
+  }
   delete state.pendingCreate;
   saveState(ctx, state);
 }

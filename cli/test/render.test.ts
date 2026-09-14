@@ -953,7 +953,7 @@ test("Render retains the creation request when its recovery lookup returns an em
   assert.deepEqual(writes(c.calls.slice(mark)), []);
 });
 
-test("Render refuses to adopt a resource after its accepted creation response is lost", async (t) => {
+test("Render records a resource after its accepted creation response is lost", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
   c.intercept = ({ path, method }) => {
@@ -967,13 +967,14 @@ test("Render refuses to adopt a resource after its accepted creation response is
     throw new TypeError("connection closed");
   };
   await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
+  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
   c.intercept = undefined;
   const mark = c.calls.length;
-  await assert.rejects(d.backend.up({ dryRun: false }), /Refusing to adopt/);
-  await assert.rejects(async () => d.backend.down({ purge: true }), /Refusing to adopt/);
-  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  await d.backend.up({ dryRun: false });
+  assert.equal(d.saved().pendingCreate, undefined);
+  assert.equal(d.saved().projectId, "prj-acme");
   assert.equal(c.projects.size, 1);
-  assert.deepEqual(writes(c.calls.slice(mark)), []);
+  assert.equal(c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/projects").length, 0);
 });
 
 test("Render retries a resource creation rejected by rate limiting", async (t) => {

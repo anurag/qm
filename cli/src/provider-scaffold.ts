@@ -334,7 +334,6 @@ export const renderScaffold: ProviderScaffold = {
     ".render.lock-*/",
     "render.resources.json",
     "render.resources.json.tmp",
-    "render.resources.json.*.tmp",
   ],
   agentsAppendix: `
 ## Render deployment
