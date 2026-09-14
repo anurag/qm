@@ -128,7 +128,13 @@ printf '%s\\n%s\\n' "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" | run_mc alias set
 printf '%s' ${shq(policy)} > "$config/policy.json"
 ${
   operation === "disable"
-    ? `if run_mc admin user info qm ${shq(record.accessKey)}; then run_mc admin user disable qm ${shq(record.accessKey)}; fi`
+    ? `if ! run_mc admin user disable qm ${shq(record.accessKey)}; then
+  result=$(timeout -s TERM -k 5 30 mc --config-dir "$config" --no-color --json admin user info qm ${shq(record.accessKey)} 2>/dev/null) && exit 1
+  case "$result" in
+    *'"Code":"XMinioAdminNoSuchUser"'*) ;;
+    *) exit 1 ;;
+  esac
+fi`
     : `printf '%s\\n' ${shq(password)} | run_mc admin user add qm ${shq(record.accessKey)}
 run_mc admin user enable qm ${shq(record.accessKey)}
 run_mc admin policy create qm ${shq(`qm-app-${record.accessKey}`)} "$config/policy.json"

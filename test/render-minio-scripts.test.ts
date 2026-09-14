@@ -130,6 +130,7 @@ test(
           .then((result) => ({ id: job[1], status: result.status === 0 ? "succeeded" : "failed" }));
       throw new Error(`Unexpected ${method} ${path}`);
     });
+    const store = createMemoryMap<StoredRenderAppStorage>();
     const storage = createRenderAppStorage({
       apiKey: "key",
       workspaceId: "tea-test",
@@ -137,7 +138,7 @@ test(
       minioServiceId: "srv-minio",
       endpoint: "http://localhost:9000",
       bucket: "qm-storage",
-      store: createMemoryMap<StoredRenderAppStorage>(),
+      store,
       keyMaterial: "test-key",
       api,
       pollIntervalMs: 50,
@@ -188,5 +189,14 @@ test(
     assert.ok(info.policyName?.split(",").includes(`qm-app-${accessKey}`), info.policyName);
     await put(`${credentials.S3_PREFIX}file.txt`);
     assert.equal(commands.length, 3);
+
+    const removed = await exec(`mc --config-dir /tmp/qm-test-mc admin user rm qm ${accessKey}`);
+    assert.equal(removed.status, 0, removed.stderr);
+    await storage.suspend(deploymentId);
+    assert.equal((await store.get(deploymentId))!.enabled, false);
+    assert.equal((await store.get(deploymentId))!.operation, undefined);
+    await rerunLatestJob();
+    assert.deepEqual(await storage.ensure(deploymentId), credentials);
+    await put(`${credentials.S3_PREFIX}file.txt`);
   },
 );

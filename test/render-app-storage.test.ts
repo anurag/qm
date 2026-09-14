@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -6,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import { S3Client, UploadPartCommand } from "@aws-sdk/client-s3";
 import {
   createRenderAppStorage,
@@ -46,6 +48,68 @@ const scriptOperation = (body: unknown): "enable" | "disable" =>
     .includes("admin user disable")
     ? "disable"
     : "enable";
+
+test("Render storage retries revocation after command failures and accepts only confirmed missing users", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "qm-render-revoke-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(
+    join(directory, "timeout"),
+    `#!/bin/sh
+case "$*" in
+  *"admin user disable"*) [ "$MC_OUTCOME" = disabled ] ;;
+  *"admin user info"*)
+    case "$MC_OUTCOME" in
+      timeout) exit 124 ;;
+      server) printf '%s' '{"status":"error","error":{"cause":{"error":{"Code":"InternalError"}}}}'; exit 1 ;;
+      auth) printf '%s' '{"status":"error","error":{"cause":{"error":{"Code":"AccessDenied"}}}}'; exit 1 ;;
+      missing) printf '%s' '{"status":"error","error":{"cause":{"error":{"Code":"XMinioAdminNoSuchUser"}}}}'; exit 1 ;;
+      exists) printf '%s' '{"status":"success","userStatus":"enabled"}' ;;
+      malformed) printf '%s' 'no user response'; exit 1 ;;
+    esac ;;
+  *) cat >/dev/null ;;
+esac
+`,
+    { mode: 0o700 },
+  );
+  let outcome = "disabled";
+  let status = "succeeded";
+  let jobs = 0;
+  const f = fixture(async ({ method, body }) => {
+    if (method !== "POST") return { status };
+    if (scriptOperation(body) === "disable") {
+      const script = Buffer.from((body as { startCommand: string }).startCommand.split(" ")[4]!, "base64").toString();
+      status = await promisify(execFile)("/bin/sh", ["-c", script], {
+        env: {
+          ...process.env,
+          PATH: `${directory}:${process.env.PATH}`,
+          MINIO_ROOT_USER: "test-root",
+          MINIO_ROOT_PASSWORD: "test-password",
+          MC_OUTCOME: outcome,
+        },
+      }).then(
+        () => "succeeded",
+        () => "failed",
+      );
+    } else status = "succeeded";
+    return { id: `job-${++jobs}` };
+  });
+  const id = randomUUID();
+  const credentials = await f.storage.ensure(id);
+  for (outcome of ["timeout", "server", "auth", "exists", "malformed"]) {
+    await assert.rejects(f.restart().suspend(id), /job.*failed/, outcome);
+    assert.equal((await f.store.get(id))!.enabled, true, outcome);
+    assert.equal((await f.store.get(id))!.operation, "disable", outcome);
+  }
+  outcome = "disabled";
+  await f.restart().suspend(id);
+  assert.equal((await f.store.get(id))!.enabled, false);
+  assert.equal((await f.store.get(id))!.operation, undefined);
+  assert.deepEqual(await f.restart().ensure(id), credentials);
+  outcome = "missing";
+  await f.restart().suspend(id);
+  assert.equal((await f.store.get(id))!.enabled, false);
+  assert.equal((await f.store.get(id))!.operation, undefined);
+});
 
 test("Render storage policies constrain listing and writes to one app prefix", () => {
   const prefix = `app-data/${randomUUID()}/`;
