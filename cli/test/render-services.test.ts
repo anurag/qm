@@ -80,7 +80,10 @@ test("Render uses Git builds for all services and rejects image overrides", (t) 
     source: config.render!.source,
     dockerfile: "deploy/core/Dockerfile",
   });
-  assert.ok(renderWorkloads(config, dir).every((workload) => workload.source));
+  const workloads = renderWorkloads(config, dir);
+  assert.ok(workloads.every((workload) => workload.source));
+  const worker = workloads[workloads.findIndex((workload) => workload.name === "core") + 1]!;
+  assert.deepEqual(worker, { name: "worker", source: config.render!.source, dockerfile: "deploy/core/Dockerfile" });
   const core = renderServiceEnv(config, "core", new Map(), connections);
   assert.equal(core.RENDER_DEPLOY_REPO, config.render!.source.repo);
   assert.equal(core.RENDER_DEPLOY_BRANCH, "main");
@@ -155,6 +158,8 @@ test("Render core receives scoped storage credentials and assigned URLs", (t) =>
   assert.equal(core.PUBLIC_WEB_URL, config.publicUrl);
   assert.equal(core.DATABASE_URL, connections.databaseUrl);
   assert.equal(core.CORE_SIGNING_SECRET, "qm-signing-key");
+  assert.equal(core.WORKERS, "0");
+  assert.deepEqual({ ...renderServiceEnv(config, "worker", values, connections), WORKERS: "0" }, core);
   for (const service of ["core", "web-ui", "portal"]) {
     const env = renderServiceEnv(config, service, values, connections);
     assert.equal(env.CORE_API_URL, connections.coreUrl);

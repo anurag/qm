@@ -16,7 +16,7 @@ import { deploymentLayerRequest, httpDeploymentLayerTransport, syncDeploymentLay
 import { CliError, errMessage, note, ok, step } from "../log.ts";
 import { renderMinioCommand, renderMinioInitCommand } from "../render-minio.ts";
 import type { ResolvedPlugin } from "../plugins.ts";
-import { renderServiceEnv, renderWorkloads, type RenderBuild } from "../render-services.ts";
+import { renderEnvService, renderServiceEnv, renderWorkloads, type RenderBuild } from "../render-services.ts";
 import { computedSecrets, runtimeSecretNames } from "../secrets.ts";
 import { serviceHost } from "../services.ts";
 import { capture, deploymentSecretValue, isInvalidSecret, sleep } from "../util.ts";
@@ -44,7 +44,7 @@ export const renderDeploymentLayerTransport = httpDeploymentLayerTransport({
   },
 });
 
-type ServiceType = "web_service" | "private_service";
+type ServiceType = "web_service" | "private_service" | "background_worker";
 interface SavedService {
   id: string;
   name: string;
@@ -61,7 +61,7 @@ interface RenderService extends SavedService {
   autoDeploy: string;
   suspended: string;
   serviceDetails: {
-    url: string;
+    url?: string;
     region: string;
     plan: string;
     numInstances: number;
@@ -95,14 +95,6 @@ interface RenderDeploy {
 }
 const bootstrapCommand = "/bin/sh -c exit 0";
 const failedDeployStatuses = ["build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"];
-interface RenderWorkflow {
-  id: string;
-  name: string;
-  ownerId: string;
-  region: string;
-  environmentId?: string;
-  slug: string;
-}
 interface Project {
   id: string;
   name: string;
@@ -123,12 +115,6 @@ interface State {
   projectId?: string;
   environmentId?: string;
   postgresId?: string;
-  workflowId?: string;
-  workflowSlug?: string;
-  workflowTaskId?: string;
-  workflowBootstrap?: { commit: string; drained?: boolean };
-  releaseWorkflowTaskId?: string;
-  previousReleaseWorkflowTaskId?: string;
   sourceCommit?: string;
   releaseCommit?: string;
   previousReleaseCommit?: string;
@@ -153,7 +139,6 @@ interface State {
   rollbackProgress?: {
     services: Record<string, string>;
     commit: string;
-    taskId: string;
     interruptedUpdate: boolean;
     restored: Record<string, string>;
   };
@@ -364,12 +349,14 @@ function workloads(ctx: DeployContext): Workload[] {
     });
   for (const item of renderWorkloads(ctx.config, ctx.configDir)) {
     const privateService = !!item.plugin || (item.name === "web-ui" && ctx.config.services.includes("portal"));
-    const type = privateService ? "private_service" : "web_service";
+    let type: ServiceType = privateService ? "private_service" : "web_service";
+    if (item.name === "worker") type = "background_worker";
     out.push({
       ...item,
       type,
-      plan: item.name === "core" ? render.corePlan : render.servicePlan,
+      plan: renderEnvService(item.name) === "core" ? render.corePlan : render.servicePlan,
       ...(item.name === "core" && !item.plugin ? { command: "node src/render/start.ts" } : {}),
+      ...(item.name === "worker" ? { command: "node src/runs/worker-main.ts" } : {}),
       ...(type === "web_service" ? { health: "/healthz" } : {}),
     });
   }
@@ -441,24 +428,7 @@ async function inventory(
     )
       throw new CliError("The saved Render Postgres does not match this deployment");
   }
-  let workflow: RenderWorkflow | undefined;
-  if (state.workflowId) {
-    try {
-      workflow = await request<RenderWorkflow>(`/workflows/${state.workflowId}`);
-    } catch (error) {
-      if (!(missing && error instanceof RenderApiError && error.status === 404)) throw error;
-    }
-    if (
-      workflow &&
-      (workflow.ownerId !== state.workspaceId ||
-        workflow.region !== state.region ||
-        workflow.name !== `${state.appPrefix}-worker` ||
-        workflow.id !== state.workflowId ||
-        (workflow.environmentId && workflow.environmentId !== state.environmentId))
-    )
-      throw new CliError("The saved Render workflow does not match this deployment");
-  }
-  return { services, postgres, workflow, environmentIds: project?.environmentIds ?? [] };
+  return { services, postgres, environmentIds: project?.environmentIds ?? [] };
 }
 async function assertAvailable(
   request: RenderRequest,
@@ -475,9 +445,9 @@ async function assertAvailable(
 }
 async function recoverPendingCreate(ctx: DeployContext, request: RenderRequest, state: State): Promise<void> {
   if (!state.pendingCreate) return;
-  const pending = /^\/(projects|postgres|workflows|services): (.+)$/.exec(state.pendingCreate);
+  const pending = /^\/(projects|postgres|services): (.+)$/.exec(state.pendingCreate);
   if (!pending) throw new CliError("The saved Render creation request is invalid; restore render.resources.json");
-  const collection = pending[1] as "projects" | "postgres" | "workflows" | "services";
+  const collection = pending[1] as "projects" | "postgres" | "services";
   const name = pending[2]!;
   const component = name.slice(state.appPrefix.length + 1);
   const desiredType =
@@ -485,7 +455,7 @@ async function recoverPendingCreate(ctx: DeployContext, request: RenderRequest, 
   const scoped = collection === "postgres" || collection === "services";
   const query = new URLSearchParams({ ownerId: state.workspaceId, name });
   const found = (
-    await list<{ id: string; name: string; type: ServiceType; slug: string; environmentId?: string }>(
+    await list<{ id: string; name: string; type: ServiceType; environmentId?: string }>(
       request,
       `/${collection}?${query}`,
       collection === "postgres" ? collection : collection.slice(0, -1),
@@ -504,10 +474,7 @@ async function recoverPendingCreate(ctx: DeployContext, request: RenderRequest, 
   if (created) {
     if (collection === "projects") state.projectId ??= created.id;
     else if (collection === "postgres") state.postgresId ??= created.id;
-    else if (collection === "workflows") {
-      state.workflowId ??= created.id;
-      state.workflowSlug ??= created.slug;
-    } else state.services[component] ??= { id: created.id, name, type: created.type };
+    else state.services[component] ??= { id: created.id, name, type: created.type };
   }
   delete state.pendingCreate;
   saveState(ctx, state);
@@ -531,8 +498,9 @@ export function renderInternalUrl(service: Pick<RenderService, "name" | "slug">)
   return `http://${service.slug}:8080`;
 }
 function publicUrl(service: RenderService): string {
-  const url = new URL(service.serviceDetails.url);
+  const url = URL.parse(service.serviceDetails.url ?? "");
   if (
+    !url ||
     url.protocol !== "https:" ||
     !url.hostname.endsWith(".onrender.com") ||
     url.username ||
@@ -817,97 +785,6 @@ async function provision(ctx: DeployContext, request: RenderRequest, state: Stat
   });
   return postgres;
 }
-async function reconcileWorkflow(
-  ctx: DeployContext,
-  request: RenderRequest,
-  state: State,
-  env: Record<string, string>,
-): Promise<void> {
-  const render = coordinates(ctx.config);
-  const buildConfig = {
-    ...render.source,
-    rootDir: "",
-    runtime: "node",
-    buildCommand: "npm ci --omit=dev --ignore-scripts",
-  };
-  const runCommand = "node src/render/workflows.ts";
-  const workerEnv = {
-    ...env,
-    DATA_DIR: "/tmp/qm",
-    RENDER_WORKFLOW_SLUG: "",
-    RENDER_WORKFLOW_TASK_ID: "",
-    NODE_VERSION: "24.18.0",
-  };
-  let workflow: RenderWorkflow;
-  if (!state.workflowId) {
-    const name = `${state.appPrefix}-worker`;
-    await assertAvailable(request, "/workflows", "workflow", name, state.workspaceId);
-    state.workflowBootstrap ??= { commit: state.sourceCommit! };
-    saveState(ctx, state);
-    workflow = await createResource<RenderWorkflow>(ctx, request, state, "/workflows", {
-      name,
-      ownerId: state.workspaceId,
-      region: state.region,
-      buildConfig,
-      runCommand: bootstrapCommand,
-      autoDeployTrigger: "off",
-      envVars: pairs({ NODE_VERSION: "24.18.0" }),
-    });
-    state.workflowId = workflow.id;
-    state.workflowSlug = workflow.slug;
-    delete state.pendingCreate;
-    saveState(ctx, state);
-  } else {
-    workflow = (await inventory(ctx, request, state)).workflow!;
-  }
-  if (!workflow.environmentId) {
-    await request(`/environments/${state.environmentId}/resources`, "POST", { resourceIds: [workflow.id] });
-    workflow = (await inventory(ctx, request, state)).workflow!;
-  }
-  if ((workflow.environmentId && workflow.environmentId !== state.environmentId) || !workflow.slug)
-    throw new CliError("Render workflow was not attached to this deployment environment");
-  state.workflowSlug = workflow.slug;
-  saveState(ctx, state);
-  const path = `/workflowversions?${new URLSearchParams({ workflowId: workflow.id, limit: "1" })}`;
-  if (state.workflowBootstrap && !state.workflowBootstrap.drained) {
-    await poll(`${workflow.name} bootstrap`, async () => {
-      const version = (await requestArray<{ workflowVersion: { id: string; status: string } }>(request, path))[0]
-        ?.workflowVersion;
-      return !version || ["ready", "build_failed", "registration_failed"].includes(version.status);
-    });
-    state.workflowBootstrap.drained = true;
-    saveState(ctx, state);
-  }
-  await request(`/workflows/${workflow.id}`, "PATCH", { buildConfig, runCommand, autoDeployTrigger: "off" });
-  await request(`/services/${workflow.id}/env-vars`, "PUT", pairs(workerEnv));
-  const previous = (await requestArray<{ workflowVersion: { id: string; status: string } }>(request, path))[0]
-    ?.workflowVersion;
-  await request("/workflowversions", "POST", { workflowId: workflow.id, commit: state.sourceCommit });
-  let versionId: string | undefined;
-  await poll(`${workflow.name} workflow`, async () => {
-    const version = (await requestArray<{ workflowVersion: { id: string; status: string } }>(request, path))[0]
-      ?.workflowVersion;
-    if (!version || version.id === previous?.id) return false;
-    if (["build_failed", "registration_failed"].includes(version.status))
-      throw new CliError(`Render workflow ${version.id} ended with ${version.status}`);
-    versionId = version.id;
-    return version.status === "ready";
-  });
-  const tasks = await list<{ id: string; name: string; workflowId: string; workflowVersionId: string }>(
-    request,
-    `/tasks?${new URLSearchParams({ workflowVersionId: versionId! })}`,
-    "task",
-  );
-  const selected = tasks.filter(
-    (task) => task.name === "qm_run" && task.workflowId === workflow.id && task.workflowVersionId === versionId,
-  );
-  if (selected.length !== 1) throw new CliError("The Render workflow version must register one qm_run task");
-  state.workflowTaskId = selected[0]!.id;
-  delete state.workflowBootstrap;
-  saveState(ctx, state);
-  ok(`${workflow.name}: ready`);
-}
-
 function serviceEnv(
   ctx: DeployContext,
   workload: Workload,
@@ -960,8 +837,6 @@ function serviceEnv(
       postgresId: state.postgresId,
       appDatabaseEndpoint,
       minioServiceId: state.services.minio?.id,
-      workflowSlug: state.workflowSlug,
-      workflowTaskId: state.workflowTaskId,
       sourceCommit: state.sourceCommit,
     },
     workload.plugin,
@@ -1061,6 +936,7 @@ export function renderConfigErrors(
   for (const plugin of config.plugins) {
     if (config.render?.storage.type === "minio" && plugin.name === "minio")
       add(`Render reserves plugin name ${plugin.name} for bundled storage`);
+    if (plugin.name === "worker") add(`Render reserves plugin name ${plugin.name} for the run worker`);
     if (plugin.coreAccess === false && plugin.secrets?.some((secret) => secret.name === "DATABASE_URL"))
       add(`Render plugin ${plugin.name} cannot use the core DATABASE_URL when coreAccess is false`);
   }
@@ -1097,8 +973,6 @@ export function renderConfigErrors(
     "RENDER_POSTGRES_ID",
     "RENDER_MINIO_SERVICE_ID",
     "RENDER_APP_DATABASE_ENDPOINT",
-    "RENDER_WORKFLOW_SLUG",
-    "RENDER_WORKFLOW_TASK_ID",
   ]) {
     if (config.env.core?.[key] !== undefined || config.secretEnv?.core?.[key] !== undefined)
       add(`Render derives core ${key}; remove its env or secretEnv entry`);
@@ -1155,7 +1029,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           step(
             `${workload.name}: ${workload.type}, ${workload.plan}, ${workload.source.repo} branch ${workload.source.branch}, ${workload.dockerfile}${workload.diskSizeGB ? `, ${workload.diskSizeGB} GB persistent disk` : ""}`,
           );
-        step("create or update the Git-built Render workflow in the same project");
         step("set service connections and secrets, deploy changes, and upload the deployment layer");
         return;
       }
@@ -1179,7 +1052,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
               ? [bootstrap.commit]
               : [],
           ),
-          ...(state.workflowBootstrap && !state.workflowBootstrap.drained ? [state.workflowBootstrap.commit] : []),
         ]);
         if (pendingCommits.size > 1)
           throw new CliError("Render bootstrap has conflicting source commits; restore the resource record");
@@ -1332,11 +1204,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             services,
             existing,
           );
-          if (workload.name === "core" && !workload.plugin) {
-            await reconcileWorkflow(ctx, request, state, env);
-            env.RENDER_WORKFLOW_SLUG = state.workflowSlug!;
-            env.RENDER_WORKFLOW_TASK_ID = state.workflowTaskId!;
-          }
           const pending = state.dirtyServices?.includes(workload.name) ?? false;
           state.dirtyServices = [...new Set([...(state.dirtyServices ?? []), workload.name])];
           saveState(ctx, state);
@@ -1403,8 +1270,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           release[workload.name] = current.id;
         }
         state.previousRelease = state.release;
-        state.previousReleaseWorkflowTaskId = state.releaseWorkflowTaskId;
-        state.releaseWorkflowTaskId = state.workflowTaskId;
         state.previousReleaseCommit = state.releaseCommit;
         state.releaseCommit = state.sourceCommit;
         state.release = release;
@@ -1426,7 +1291,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       note(
         `project: ${state.projectId}, production: ${state.environmentId}${state.pendingPurge ? " (cleanup pending)" : ""}`,
       );
-      if (bound.workflow) note(`workflow: ${bound.workflow.slug} (${bound.workflow.id})`);
       if (bound.postgres) note(`postgres: ${bound.postgres.status} (${bound.postgres.id})`);
       for (const [name, service] of bound.services) {
         const recent = await requestArray<{ deploy: { status: string } }>(
@@ -1434,7 +1298,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           `/services/${service.id}/deploys?limit=1`,
         );
         note(
-          `${name}: ${service.suspended}, ${recent[0]?.deploy.status ?? "no deploy"} (${service.id}) ${service.serviceDetails.url}`,
+          `${name}: ${service.suspended}, ${recent[0]?.deploy.status ?? "no deploy"} (${service.id})${service.serviceDetails.url ? ` ${service.serviceDetails.url}` : ""}`,
         );
       }
     },
@@ -1549,11 +1413,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           }
         }
         if (opts.purge) {
-          if (bound.workflow) await request(`/workflows/${bound.workflow.id}`, "DELETE");
-          delete state.workflowId;
-          delete state.workflowSlug;
-          delete state.workflowTaskId;
-          delete state.workflowBootstrap;
           if (bound.postgres) await request(`/postgres/${bound.postgres.id}`, "DELETE");
           delete state.postgresId;
           delete state.bootstrapServices;
@@ -1574,10 +1433,9 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           const interruptedUpdate = state.updateInProgress === true;
           const services = interruptedUpdate ? state.release : state.previousRelease;
           const commit = interruptedUpdate ? state.releaseCommit : state.previousReleaseCommit;
-          const taskId = interruptedUpdate ? state.releaseWorkflowTaskId : state.previousReleaseWorkflowTaskId;
-          if (!services || !Object.keys(services).length || !commit || !taskId)
+          if (!services || !Object.keys(services).length || !commit)
             throw new CliError("No successful Render deployment is recorded for rollback");
-          state.rollbackProgress = { services, commit, taskId, interruptedUpdate, restored: {} };
+          state.rollbackProgress = { services, commit, interruptedUpdate, restored: {} };
         }
         const target = state.rollbackProgress;
         const bound = await inventory(ctx, request, state);
@@ -1587,13 +1445,11 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             throw new CliError(`The rollback service ${name} is missing or has a disk`);
           await request(`/services/${service.id}/deploys/${deployId}`);
         }
-        const core = bound.services.get("core");
-        if (!core) throw new CliError("The core service is missing");
+        if (!bound.services.has("core")) throw new CliError("The core service is missing");
         saveState(ctx, state);
-        await request(`/services/${core.id}/env-vars/RENDER_WORKFLOW_TASK_ID`, "PUT", { value: target.taskId });
-        for (const serviceId of [core.id, state.workflowId].filter((id): id is string => Boolean(id))) {
+        for (const service of ["core", "worker"].flatMap((name) => bound.services.get(name) ?? [])) {
           for (const key of ["RENDER_DEPLOY_COMMIT", "GIT_SHA"])
-            await request(`/services/${serviceId}/env-vars/${key}`, "PUT", { value: target.commit });
+            await request(`/services/${service.id}/env-vars/${key}`, "PUT", { value: target.commit });
         }
         for (const [name, deployId] of Object.entries(target.services)) {
           if (target.restored[name]) continue;
@@ -1606,13 +1462,10 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         if (!target.interruptedUpdate) {
           state.previousRelease = state.release;
           state.previousReleaseCommit = state.releaseCommit;
-          state.previousReleaseWorkflowTaskId = state.releaseWorkflowTaskId;
         }
         state.release = target.restored;
         state.releaseCommit = target.commit;
         state.sourceCommit = target.commit;
-        state.releaseWorkflowTaskId = target.taskId;
-        state.workflowTaskId = target.taskId;
         state.dirtyServices = state.dirtyServices?.filter((name) => !target.services[name]);
         delete state.updateInProgress;
         delete state.rollbackProgress;
@@ -1646,7 +1499,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             if (secret.managedBy !== "operator") continue;
             const value = values.get(secret.name);
             if (value === undefined) continue;
-            for (const key of runtimeSecretNames(workload.name, secret, plugins)) {
+            for (const key of runtimeSecretNames(renderEnvService(workload.name), secret, plugins)) {
               state.dirtyServices = [...new Set([...(state.dirtyServices ?? []), workload.name])];
               saveState(ctx, state);
               await request(`/services/${service.id}/env-vars/${encodeURIComponent(key)}`, "PUT", { value });

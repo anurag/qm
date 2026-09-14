@@ -20,7 +20,7 @@ Finish any Render operation started by an older CLI version before upgrading.
 Use one CLI version per deployment directory.
 
 The API creates one project and one production environment. The core services,
-Render Postgres, bundled MinIO, and the worker Workflow use that environment.
+the run worker, Render Postgres, and bundled MinIO use that environment.
 Each published app has a network-isolated environment in the same project.
 Native Render Sandboxes are workspace resources because the Sandbox API has no
 project or environment field. Do not create a second project for sandboxes.
@@ -51,7 +51,7 @@ flowchart TB
                 portal["Portal<br/>Authentication"]
                 web["Private web UI<br/>Admin"]
                 core["QM core API"]
-                worker["Render Workflow<br/>qm_run"]
+                worker["Run worker<br/>Background worker service"]
                 postgres[("Render Postgres<br/>Core DB and app DBs")]
                 minio[("Bundled MinIO<br/>Object Storage<br/>QM files and app prefixes")]
                 disk["Persistent MinIO disk"]
@@ -72,9 +72,8 @@ flowchart TB
     portal --> web
     web -->|Signed requests| core
     portal -->|Identity and app requests| core
-    core -->|Dispatch run ID| worker
-    core -->|State and workspace files| postgres
-    worker --> postgres
+    core -->|State, queued runs, and workspace files| postgres
+    worker -->|Claims queued runs| postgres
     core -->|Files and home backups| minio
     worker --> minio
     minio --- disk
@@ -87,12 +86,15 @@ flowchart TB
     app -->|App prefix over HTTPS| minio
 ```
 
-Render builds the QM services, Workflow, and app runner from the configured
-repository. The runner then fetches the published app's source from the core Git
-endpoint. Core proxies app traffic through the runner's authenticated gateway.
-Core and Workflow tasks use the Render API to manage app resources.
+Render builds the QM services, the run worker, and the app runner from the
+configured repository. The worker is a background worker service built from the
+core Dockerfile; core queues runs in Postgres and runs no workers of its own,
+so a core deploy does not interrupt running work. The runner fetches the
+published app's source from the core Git endpoint. Core proxies app traffic
+through the runner's authenticated gateway. Core and the worker use the Render
+API to manage app resources.
 
-Only MinIO has an attached service disk. Core and Workflow tasks share durable
+Only MinIO has an attached service disk. Core and the worker share durable
 Postgres and object storage. An app can use only its own database and object
 prefix, and its environment has no private network access to core or peer apps.
 Archive and restore retain these data stores and credentials.
@@ -106,19 +108,16 @@ portal use their existing Dockerfiles. MinIO uses
 are not supported. Automatic deploys are off so `qm up` controls the update order.
 Render starts an initial build when a service is created or resumed. The CLI
 uses a command that exits and supplies no credentials until this build stops.
-Workflow creation starts no version when automatic deploys are off. The CLI
-completes the safe setup, then registers the selected commit with the runtime
-credentials. If a Workflow version already exists during this setup, the CLI
-waits for its build and registration to finish before it adds credentials.
 
-The CLI initializes MinIO before it deploys the Workflow and core. The CLI resolves the branch once and pins the service builds and Workflow version
-to that commit. Each routine update builds the diskless services. It retains MinIO without a redeploy when the
+The CLI initializes MinIO before it deploys core and the worker. The CLI
+resolves the branch once and pins the service builds to that commit. Each
+routine update builds the diskless services. It retains MinIO without a redeploy when the
 MinIO source and configuration are unchanged. A deliberate MinIO build or disk
 change can interrupt object storage while Render starts its replacement.
 
 `qm rollback` restores the previous successful service builds. It retains the
 current operator environment values and does not reverse database migrations.
-The prior commit and Workflow task are restored with the previous core build. Verify
+The prior commit is restored with the previous core and worker builds. Verify
 compatibility before a rollback that follows a configuration or schema change.
 
 ## Data and credentials
@@ -136,8 +135,8 @@ the apps' outbound IP ranges to this project's Postgres allowlist. It does not
 change network rules outside the project.
 
 MinIO root credentials remain on the MinIO service. Its initialization job
-creates a private bucket and the scoped QM storage identity. Core and the worker
-Workflow receive that identity. Do not rotate or replace the root credentials
+creates a private bucket and the scoped QM storage identity. Core and the run
+worker receive that identity. Do not rotate or replace the root credentials
 unless the stored data and dependent credentials have been checked.
 
 Archive an app with the built-in deployment tools to suspend its Render service
@@ -156,7 +155,7 @@ deployment.
 
 ### Permanent cleanup
 
-`qm down --purge` deletes the recorded QM services, Workflow, Postgres, and MinIO
+`qm down --purge` deletes the recorded QM services, Postgres, and MinIO
 disk. This deletes QM state, app databases, and stored objects. Archive cannot
 restore an app after its data has been purged. Use this procedure only with
 explicit authorization to delete the deployment and its stored data.

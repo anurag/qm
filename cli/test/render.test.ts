@@ -76,7 +76,7 @@ interface Service {
   autoDeploy: string;
   suspended: string;
   serviceDetails: {
-    url: string;
+    url?: string;
     region: string;
     plan: string;
     runtime: string;
@@ -123,10 +123,6 @@ function cloud(t: TestContext, d: Deployment) {
     automaticDeployStatus: "build_in_progress",
     nextJobStatus: "succeeded",
     next: 0,
-    workflow: undefined as
-      { id: string; name: string; ownerId: string; region: string; environmentId?: string; slug: string } | undefined,
-    workflowEnv: {} as Record<string, string>,
-    workflowVersion: undefined as { id: string; status: string } | undefined,
   };
   const empty = () => new Response(null, { status: 204 });
   const missing = () => new Response(null, { status: 404 });
@@ -149,61 +145,6 @@ function cloud(t: TestContext, d: Deployment) {
     }
     assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${"e".repeat(64)}`);
     if (path === "/owners/tea-acme") return Response.json({ id: "tea-acme" });
-    if (path === "/workflows") {
-      if (method === "GET")
-        return Response.json(state.workflow ? [{ workflow: state.workflow, cursor: state.workflow.id }] : []);
-      assert.equal(body.buildConfig.runtime, "node");
-      assert.equal(body.autoDeployTrigger, "off");
-      state.workflow = { ...body, id: "wfl-acme", slug: "acme-worker" };
-      state.workflowEnv = Object.fromEntries(
-        body.envVars.map((pair: { key: string; value: string }) => [pair.key, pair.value]),
-      );
-      state.workflowVersion = undefined;
-      return Response.json(state.workflow);
-    }
-    if (path === "/workflows/wfl-acme") {
-      if (!state.workflow) return missing();
-      if (method === "DELETE") {
-        state.workflow = undefined;
-        return empty();
-      }
-      return Response.json(state.workflow);
-    }
-    if (path === "/services/wfl-acme/env-vars") {
-      state.workflowEnv = Object.fromEntries(
-        body.map((pair: { key: string; value: string }) => [pair.key, pair.value]),
-      );
-      return empty();
-    }
-    if (path.startsWith("/services/wfl-acme/env-vars/")) {
-      state.workflowEnv[path.split("/").at(-1)!] = body.value;
-      return empty();
-    }
-    if (path === "/environments/evm-acme/resources") {
-      assert.deepEqual(body.resourceIds, ["wfl-acme"]);
-      state.workflow!.environmentId = "evm-acme";
-      return empty();
-    }
-    if (path === "/tasks")
-      return Response.json([
-        {
-          task: {
-            id: `tsk-${state.workflowVersion!.id}`,
-            name: "qm_run",
-            workflowId: "wfl-acme",
-            workflowVersionId: state.workflowVersion!.id,
-          },
-          cursor: "task",
-        },
-      ]);
-    if (path === "/workflowversions") {
-      if (method === "POST") {
-        state.workflowVersion = { id: `wfv-${++state.next}`, status: "ready" };
-        return empty();
-      }
-      return Response.json(state.workflowVersion ? [{ workflowVersion: state.workflowVersion }] : null);
-    }
-
     if (path === "/projects") {
       if (method === "GET")
         return Response.json(
@@ -286,10 +227,14 @@ function cloud(t: TestContext, d: Deployment) {
         suspended: "not_suspended",
         serviceDetails: {
           ...body.serviceDetails,
-          url:
-            body.type === "private_service"
-              ? `${body.name}-assigned:10000`
-              : `https://${body.name}-assigned.onrender.com`,
+          ...(body.type === "background_worker"
+            ? {}
+            : {
+                url:
+                  body.type === "private_service"
+                    ? `${body.name}-assigned:10000`
+                    : `https://${body.name}-assigned.onrender.com`,
+              }),
           ...(body.serviceDetails.disk ? { disk: { ...body.serviceDetails.disk, id: "dsk-minio" } } : {}),
         },
       };
@@ -397,10 +342,10 @@ function cloud(t: TestContext, d: Deployment) {
   return state;
 }
 
-test("Render accepts null empty lists for projects, Postgres, services, and workflows", async (t) => {
+test("Render accepts null empty lists for projects, Postgres, and services", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
-  const resources = new Set(["/projects", "/postgres", "/services", "/workflows"]);
+  const resources = new Set(["/projects", "/postgres", "/services"]);
   const received = new Set<string>();
   c.intercept = ({ path, method }) => {
     if (method !== "GET" || !resources.has(path)) return undefined;
@@ -411,8 +356,7 @@ test("Render accepts null empty lists for projects, Postgres, services, and work
   assert.deepEqual(received, resources);
   assert.equal(c.projects.size, 1);
   assert.ok(c.database);
-  assert.equal(c.services.size, 3);
-  assert.ok(c.workflow);
+  assert.equal(c.services.size, 4);
 });
 
 test("Render appRegion changes the app creation default without moving deployment resources", async (t) => {
@@ -425,8 +369,7 @@ test("Render appRegion changes the app creation default without moving deploymen
   assert.deepEqual(d.saved().services, resources);
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_APP_REGION, "virginia");
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_REGION, "oregon");
-  assert.equal(c.workflowEnv.RENDER_APP_REGION, "virginia");
-  assert.equal(c.workflow?.region, "oregon");
+  assert.equal(c.envs.get("srv-acme-worker")!.RENDER_APP_REGION, "virginia");
   assert.equal(c.database?.region, "oregon");
   for (const service of c.services.values()) assert.equal(service.serviceDetails.region, "oregon");
   d.ctx.config.env.core = { ...d.ctx.config.env.core, RENDER_APP_REGION: "ohio" };
@@ -436,7 +379,7 @@ test("Render appRegion changes the app creation default without moving deploymen
   assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /RENDER_APP_REGION.*secretEnv/.test(error.message)));
 });
 
-for (const path of ["/projects", "/postgres", "/services", "/workflows"]) {
+for (const path of ["/projects", "/postgres", "/services"]) {
   test(`Render rejects a non-array ${path} list with a clear error`, async (t) => {
     const d = deployment(t);
     const c = cloud(t, d);
@@ -448,55 +391,6 @@ for (const path of ["/projects", "/postgres", "/services", "/workflows"]) {
   });
 }
 
-test("Render creates the first pinned workflow version when automatic deployment is off", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  let emptyReads = 0;
-  c.intercept = ({ path, method, body }) => {
-    if (path === "/workflowversions" && method === "GET" && !c.workflowVersion) emptyReads++;
-    if (path === "/workflowversions" && method === "POST") {
-      assert.equal(c.workflowVersion, undefined);
-      assert.deepEqual(body, { workflowId: "wfl-acme", commit: "a".repeat(40) });
-    }
-    return undefined;
-  };
-  await d.backend.up({ dryRun: false });
-  assert.equal(emptyReads, 2);
-  assert.equal(c.calls.filter((call) => call.path === "/workflowversions" && call.method === "POST").length, 1);
-  assert.ok(d.saved().releaseWorkflowTaskId);
-  assert.equal(d.saved().workflowBootstrap, undefined);
-});
-
-test("Render accepts a successful workflow attachment when GET omits its environment", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  c.intercept = ({ path, method }) => {
-    if (path !== "/workflows/wfl-acme" || method !== "GET") return undefined;
-    const workflow = { ...c.workflow };
-    delete workflow.environmentId;
-    return Response.json(workflow);
-  };
-  await d.backend.up({ dryRun: false });
-  await d.backend.up({ dryRun: false });
-  assert.equal(c.workflow?.environmentId, "evm-acme");
-  assert.equal(d.saved().workflowSlug, "acme-worker");
-  assert.equal(
-    c.calls.filter((call) => call.path === "/environments/evm-acme/resources" && call.method === "POST").length,
-    2,
-  );
-  assert.equal(c.calls.filter((call) => call.path === "/workflows" && call.method === "POST").length, 1);
-});
-
-test("Render rejects a conflicting workflow environment after attachment", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  c.intercept = ({ path, method }) =>
-    path === "/workflows/wfl-acme" && method === "GET"
-      ? Response.json({ ...c.workflow, environmentId: "evm-other" })
-      : undefined;
-  await assert.rejects(d.backend.up({ dryRun: false }), /The saved Render workflow does not match this deployment/);
-  assert.equal(d.saved().release, undefined);
-});
 const writes = (calls: Call[]) =>
   calls.filter((call) => call.url.origin === "https://api.render.com" && call.method !== "GET");
 
@@ -505,7 +399,7 @@ test("Render creates one project and wires MinIO credentials, URLs, Postgres, an
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
   assert.equal(c.projects.size, 1);
-  assert.equal(c.services.size, 3);
+  assert.equal(c.services.size, 4);
   assert.equal(c.services.get("srv-acme-core")!.serviceDetails.healthCheckPath, "/healthz");
   assert.equal(d.saved().environmentId, "evm-acme");
   const minio = c.envs.get("srv-acme-minio")!;
@@ -542,9 +436,15 @@ test("Render creates one project and wires MinIO credentials, URLs, Postgres, an
   await d.backend.up({ dryRun: false });
   assert.ok(writes(c.calls.slice(first)).some((call) => call.path === "/services/srv-acme-core/deploys"));
   assert.ok(!writes(c.calls.slice(first)).some((call) => call.path === "/services/srv-acme-minio/deploys"));
-  assert.equal(c.workflow?.environmentId, "evm-acme");
-  assert.equal(core.RENDER_WORKFLOW_SLUG, "acme-worker");
-  assert.equal(c.workflowEnv.AWS_SECRET_ACCESS_KEY, core.AWS_SECRET_ACCESS_KEY);
+  const worker = c.services.get("srv-acme-worker")!;
+  assert.equal(worker.type, "background_worker");
+  assert.equal(worker.serviceDetails.plan, c.services.get("srv-acme-core")!.serviceDetails.plan);
+  assert.equal(worker.serviceDetails.healthCheckPath, undefined);
+  assert.equal(worker.serviceDetails.url, undefined);
+  assert.equal(worker.serviceDetails.envSpecificDetails.dockerfilePath, "deploy/core/Dockerfile");
+  assert.equal(worker.serviceDetails.envSpecificDetails.dockerCommand, "node src/runs/worker-main.ts");
+  assert.equal(core.WORKERS, "0");
+  assert.deepEqual({ ...c.envs.get("srv-acme-worker")!, WORKERS: "0" }, core);
   assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, minio.MINIO_ROOT_PASSWORD);
 });
 
@@ -691,7 +591,7 @@ test("Render builds QM services and MinIO from Git", async (t) => {
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
   const saved = d.saved();
-  assert.equal(c.services.size, 4);
+  assert.equal(c.services.size, 5);
   for (const service of c.services.values()) {
     if (service.id === "srv-acme-minio") continue;
     assert.equal(service.repo, "https://github.com/acme/qm");
@@ -717,7 +617,7 @@ test("Render builds QM services and MinIO from Git", async (t) => {
   await d.backend.up({ dryRun: false });
   assert.deepEqual(d.saved().services, saved.services);
   const changes = writes(c.calls.slice(mark));
-  assert.ok(changes.some((call) => call.path === "/workflowversions" && call.method === "POST"));
+  assert.ok(changes.some((call) => call.path === "/services/srv-acme-worker/deploys" && call.method === "POST"));
   assert.ok(!changes.some((call) => call.path === "/services/srv-acme-minio/deploys"));
 });
 
@@ -731,8 +631,8 @@ test("Render retries a failed Git build using the same services", async (t) => {
   c.nextDeployStatus = "live";
   await d.backend.up({ dryRun: false });
   assert.deepEqual(d.saved().dirtyServices, []);
-  assert.equal(c.services.size, 3);
-  assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 3);
+  assert.equal(c.services.size, 4);
+  assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 4);
 });
 
 test("Render updates a changed plan and recovers a failed deployment without new resources", async (t) => {
@@ -751,7 +651,7 @@ test("Render updates a changed plan and recovers a failed deployment without new
   assert.ok(
     c.calls.slice(mark).some((call) => call.path === "/services/srv-acme-core/deploys" && call.method === "POST"),
   );
-  assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 3);
+  assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 4);
 });
 
 test("Render retries after env write failure after a preceding service update succeeds", async (t) => {
@@ -785,7 +685,7 @@ test("Render retains completed resource IDs after a later create fails", async (
   c.intercept = undefined;
   await d.backend.up({ dryRun: false });
   assert.equal(c.projects.size, 1);
-  assert.equal(c.services.size, 3);
+  assert.equal(c.services.size, 4);
 });
 
 for (const status of ["live", "update_failed"]) {
@@ -867,7 +767,7 @@ for (const [initial, terminal] of [
 }
 
 for (const failure of ["connection closed", "HTTP 503"]) {
-  for (const path of ["/projects", "/postgres", "/services", "/workflows"]) {
+  for (const path of ["/projects", "/postgres", "/services"]) {
     test(`Render retries ${path} after ${failure} before creation`, async (t) => {
       const d = deployment(t);
       const c = cloud(t, d);
@@ -878,21 +778,16 @@ for (const failure of ["connection closed", "HTTP 503"]) {
       };
       await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
       assert.ok(d.saved().pendingCreate.startsWith(`${path}: `));
-      c.intercept =
-        path === "/workflows"
-          ? (call) => (call.path === path && call.method === "GET" ? Response.json(null) : undefined)
-          : undefined;
+      c.intercept = undefined;
       const backend = hostingProvider("render").createBackend(d.ctx);
       await backend.up({ dryRun: false });
       assert.equal(d.saved().pendingCreate, undefined);
       assert.equal(c.projects.size, 1);
-      assert.equal(c.services.size, 3);
+      assert.equal(c.services.size, 4);
       assert.ok(c.database);
-      assert.ok(c.workflow);
       await backend.down({ purge: true });
       assert.equal(c.services.size, 0);
       assert.equal(c.database, undefined);
-      assert.equal(c.workflow, undefined);
     });
   }
 
@@ -987,7 +882,7 @@ test("Render retries a resource creation rejected by rate limiting", async (t) =
   c.intercept = undefined;
   await d.backend.up({ dryRun: false });
   assert.equal(c.projects.size, 1);
-  assert.equal(c.services.size, 3);
+  assert.equal(c.services.size, 4);
 });
 
 test("Render rejects unrecorded same-name resources and changed ownership before mutations", async (t) => {
@@ -1008,7 +903,7 @@ test("Render rejects unrecorded same-name resources and changed ownership before
   await assert.rejects(d.backend.up({ dryRun: false }), /does not match/);
   assert.deepEqual(writes(c.calls.slice(mark)), []);
   await assert.rejects(async () => d.backend.down({ purge: true }), /does not match/);
-  assert.equal(c.services.size, 3);
+  assert.equal(c.services.size, 4);
 });
 
 test("Render stops services and resumes them while retaining database and disk", async (t) => {
@@ -1018,7 +913,7 @@ test("Render stops services and resumes them while retaining database and disk",
   await d.backend.down({});
   assert.equal(c.services.get("srv-acme-minio")!.suspended, "suspended");
   assert.ok(c.database);
-  assert.equal(c.services.size, 3);
+  assert.equal(c.services.size, 4);
   const mark = c.calls.length;
   await d.backend.up({ dryRun: false });
   assert.ok([...c.services.values()].every((service) => service.suspended === "not_suspended"));
@@ -1124,7 +1019,7 @@ test("Render purge resumes partial deletion and retains the project", async (t) 
   assert.deepEqual(d.saved().services, {});
   await d.backend.up({ dryRun: false });
   assert.equal(c.projects.size, 1);
-  assert.equal(c.services.size, 3);
+  assert.equal(c.services.size, 4);
 });
 
 test("Render secret push targets consumers and keeps managed MinIO credentials", async (t) => {
@@ -1345,7 +1240,6 @@ test("Render rollback restores the previous service builds without changing stor
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
   const release = d.saved().release;
-  const workflowTaskId = d.saved().releaseWorkflowTaskId;
   await d.backend.up({ dryRun: false });
   const mark = c.calls.length;
   const secret = c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY;
@@ -1356,14 +1250,16 @@ test("Render rollback restores the previous service builds without changing stor
       .map((call) => [call.path, call.body]),
     [
       ["/services/srv-acme-core/rollback", { deployId: release.core }],
+      ["/services/srv-acme-worker/rollback", { deployId: release.worker }],
       ["/services/srv-acme-web-ui/rollback", { deployId: release["web-ui"] }],
     ],
   );
   assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, secret);
   assert.equal(c.database?.id, "dpg-acme");
-  assert.equal(c.envs.get("srv-acme-core")!.RENDER_WORKFLOW_TASK_ID, workflowTaskId);
-  assert.equal(c.workflowEnv.RENDER_DEPLOY_COMMIT, d.saved().releaseCommit);
-  assert.equal(c.workflowEnv.GIT_SHA, d.saved().releaseCommit);
+  for (const id of ["srv-acme-core", "srv-acme-worker"]) {
+    assert.equal(c.envs.get(id)!.RENDER_DEPLOY_COMMIT, d.saved().releaseCommit);
+    assert.equal(c.envs.get(id)!.GIT_SHA, d.saved().releaseCommit);
+  }
 });
 
 test("Render rejects a live service built from a different source commit", async (t) => {
@@ -1378,22 +1274,6 @@ test("Render rejects a live service built from a different source commit", async
   await assert.rejects(d.backend.up({ dryRun: false }), /deployed commit b+.*expected a+/);
   assert.equal(d.saved().release, undefined);
   assert.equal(d.saved().updateInProgress, true);
-});
-
-test("Render rejects a workflow task from a different version", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  c.intercept = ({ path }) =>
-    path === "/tasks"
-      ? Response.json([
-          {
-            task: { id: "tsk-foreign", name: "qm_run", workflowId: "wfl-acme", workflowVersionId: "wfv-other" },
-            cursor: "task",
-          },
-        ])
-      : undefined;
-  await assert.rejects(d.backend.up({ dryRun: false }), /must register one qm_run task/);
-  assert.equal(d.saved().release, undefined);
 });
 
 test("Render resumes rollback to the last good release after a partial update", async (t) => {
@@ -1412,7 +1292,6 @@ test("Render resumes rollback to the last good release after a partial update", 
       : undefined;
   await assert.rejects(async () => d.backend.rollback(), /HTTP 500/);
   assert.ok(d.saved().rollbackProgress.restored.core);
-  assert.equal(c.envs.get("srv-acme-core")!.RENDER_WORKFLOW_TASK_ID, successful.releaseWorkflowTaskId);
   const mark = c.calls.length;
   c.intercept = undefined;
   await d.backend.rollback();
@@ -1424,10 +1303,9 @@ test("Render resumes rollback to the last good release after a partial update", 
   );
   assert.equal(d.saved().rollbackProgress, undefined);
   assert.equal(d.saved().updateInProgress, undefined);
-  assert.equal(d.saved().releaseWorkflowTaskId, successful.releaseWorkflowTaskId);
 });
 
-test("Render creates services and the workflow without credentials and drains automatic builds before pinning", async (t) => {
+test("Render creates services without credentials and drains automatic builds before pinning", async (t) => {
   const d = deployment(t);
   mkdirSync(join(d.ctx.configDir, "plugins", "reports"), { recursive: true });
   writeFileSync(join(d.ctx.configDir, "plugins", "reports", "Dockerfile"), "FROM node:24\n");
@@ -1444,17 +1322,13 @@ test("Render creates services and the workflow without credentials and drains au
       assert.deepEqual(create.secretFiles, []);
       assert.equal(create.serviceDetails.envSpecificDetails.dockerCommand, "/bin/sh -c exit 0");
     }
-    if (method === "POST" && path === "/workflows") {
-      assert.deepEqual((body as { envVars: unknown[] }).envVars, [{ key: "NODE_VERSION", value: "24.18.0" }]);
-      assert.equal((body as { runCommand: string }).runCommand, "/bin/sh -c exit 0");
-    }
     const serviceId = path.split("/")[2]!;
     if (path.includes("/deploys/") && path.endsWith("/cancel")) {
       canceled.add(serviceId);
       assert.deepEqual(c.envs.get(serviceId), {});
       assert.equal(c.deploys.get(serviceId)!.commit?.id, "b".repeat(40));
     }
-    if (method === "PUT" && path.endsWith("/env-vars") && serviceId !== "wfl-acme") assert.ok(canceled.has(serviceId));
+    if (method === "PUT" && path.endsWith("/env-vars")) assert.ok(canceled.has(serviceId));
     if (method === "POST" && path.endsWith("/deploys")) {
       assert.ok(canceled.has(serviceId));
       assert.equal((body as { commitId: string }).commitId, "a".repeat(40));
@@ -1463,10 +1337,9 @@ test("Render creates services and the workflow without credentials and drains au
     return undefined;
   };
   await d.backend.up({ dryRun: false });
-  assert.equal(c.services.size, 4);
-  assert.equal(canceled.size, 4);
+  assert.equal(c.services.size, 5);
+  assert.equal(canceled.size, 5);
   assert.deepEqual(d.saved().bootstrapServices, {});
-  assert.equal(d.saved().workflowBootstrap, undefined);
 });
 
 test("Render resumes safely and preserves encrypted credentials across an interrupted bootstrap", async (t) => {
@@ -1531,7 +1404,7 @@ test("Render keeps the initial source commit when an interrupted bootstrap resum
   const mark = c.calls.length;
   await d.backend.up({ dryRun: false });
   const pinned = c.calls.slice(mark).filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
-  assert.equal(pinned.length, 3);
+  assert.equal(pinned.length, 4);
   for (const call of pinned) assert.equal((call.body as { commitId: string }).commitId, "a".repeat(40));
   assert.equal(d.saved().releaseCommit, "a".repeat(40));
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "a".repeat(40));
@@ -1574,12 +1447,7 @@ for (const resource of ["retained", "deleted", "not created"]) {
       const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
       assert.deepEqual(
         deploys.map((call) => (call.body as { commitId: string }).commitId),
-        [commit, commit],
-      );
-      const versions = calls.filter((call) => call.method === "POST" && call.path === "/workflowversions");
-      assert.deepEqual(
-        versions.map((call) => (call.body as { commit: string }).commit),
-        [commit],
+        [commit, commit, commit],
       );
       assert.equal(d.saved().releaseCommit, commit);
       assert.equal(d.saved().pendingCreate, undefined);
@@ -1606,12 +1474,7 @@ for (const resource of ["retained", "deleted", "not created"]) {
     const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
     assert.deepEqual(
       deploys.map((call) => (call.body as { commitId: string }).commitId),
-      [commit, commit, commit],
-    );
-    const versions = calls.filter((call) => call.method === "POST" && call.path === "/workflowversions");
-    assert.deepEqual(
-      versions.map((call) => (call.body as { commit: string }).commit),
-      [commit],
+      [commit, commit, commit, commit],
     );
     assert.equal(
       calls.filter((call) => call.method === "POST" && call.path === "/services").length,
@@ -1656,12 +1519,7 @@ test("Render joins a re-added plugin to a newer interrupted bootstrap", async (t
   const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
   assert.deepEqual(
     deploys.map((call) => (call.body as { commitId: string }).commitId),
-    [commit, commit, commit, commit],
-  );
-  const versions = calls.filter((call) => call.method === "POST" && call.path === "/workflowversions");
-  assert.deepEqual(
-    versions.map((call) => (call.body as { commit: string }).commit),
-    [commit],
+    [commit, commit, commit, commit, commit],
   );
   assert.equal(
     calls.some((call) => call.method === "POST" && call.path === "/services"),
@@ -1714,25 +1572,6 @@ for (const failure of ["connection closed", "HTTP 503"]) {
     assert.equal(c.database, undefined);
   });
 }
-
-test("Render waits for the initial workflow registration to fail before adding credentials", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  let reads = 0;
-  c.intercept = ({ path, method }) => {
-    if (path === "/workflowversions" && method === "GET" && reads < 2) {
-      assert.deepEqual(c.workflowEnv, { NODE_VERSION: "24.18.0" });
-      const status = ++reads === 1 ? "registration_in_progress" : "registration_failed";
-      return Response.json([{ workflowVersion: { id: "wfv-bootstrap", status } }]);
-    }
-    if (path === "/services/wfl-acme/env-vars") assert.equal(reads, 2);
-    return undefined;
-  };
-  await d.backend.up({ dryRun: false });
-  assert.equal(reads, 2);
-  assert.equal(c.workflowEnv.CORE_SIGNING_SECRET, "e".repeat(64));
-  assert.equal(d.saved().workflowBootstrap, undefined);
-});
 
 test("Render records a service after its creation reply is lost and ignores same-named services elsewhere", async (t) => {
   const d = deployment(t);

@@ -365,9 +365,10 @@ bucket and a scoped identity. Core gets this identity through its environment.
 MinIO root credentials stay on MinIO. Its HTTPS endpoint lets isolated app
 environments reach scoped object storage.
 
-Render Workflows execute queued runs. The workflow is in the same project and
-uses the same Postgres and object store as core. Native Render Sandboxes are
-workspace resources; the Render API does not attach them to project environments.
+A background worker service built from the core Dockerfile executes queued runs.
+It is in the same project and uses the same Postgres and object store as core;
+core itself runs no workers. Native Render Sandboxes are workspace resources; the
+Render API does not attach them to project environments.
 
 Core uses temporary files at /data. Postgres stores sessions, runs, and file
 metadata. MinIO stores workspace bytes, portable sandbox backups, and file
@@ -406,7 +407,7 @@ its own database and object prefix. Archive retains data. Restore reuses that da
 
 The agent executes in native Render Sandboxes. Save useful workspace changes
 before an operation that replaces a sandbox. Sandboxes are workspace resources;
-app services, Workflows, Postgres, and MinIO belong to this deployment's project.
+app services, the run worker, Postgres, and MinIO belong to this deployment's project.
 Do not create infrastructure outside that project or change DNS or Cloudflare rules.
 `,
     },

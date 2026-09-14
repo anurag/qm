@@ -8,12 +8,6 @@ import {
 import { createRenderAppDatabase, type StoredRenderAppDatabase } from "./deploy/render-app-database.ts";
 import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/render-app-storage.ts";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import {
-  createRenderWorkflowWorker,
-  renderWorkflowRunReady,
-  type RenderWorkflowDispatch,
-} from "./render/workflow-worker.ts";
-import { processRun } from "./runs/worker.ts";
 import { S3Client } from "@aws-sdk/client-s3";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
 import { createRenderAdvisoryLock } from "./persistence/render-advisory-lock.ts";
@@ -417,7 +411,6 @@ export function stopWithBackstop(
 }
 
 export interface BuiltApp {
-  processRenderRun(runId: string): Promise<void>;
   app: App;
   screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
@@ -720,12 +713,6 @@ export function buildApp(
   const resolution = createResolutionService(config.orgId, configStore, acl);
 
   if (renderSelected && !config.databaseUrl) throw new Error("Render requires DATABASE_URL");
-  if (
-    config.deployProvider === "render" &&
-    (config.renderDeploy.workflowTaskId || config.renderDeploy.workflowSlug) &&
-    config.runStore !== "postgres"
-  )
-    throw new Error("Render Workflows require RUN_STORE=postgres");
   const renderLock = advisoryLock;
   const s3 = new S3Client({
     ...(config.s3Region ? { region: config.s3Region } : {}),
@@ -2121,39 +2108,19 @@ export function buildApp(
     protection: taskProtection,
     busy: () => workers.some((w) => w.busy()),
   });
-  const workers: Worker[] =
-    config.deployProvider === "render" && (config.renderDeploy.workflowTaskId || config.renderDeploy.workflowSlug)
-      ? [
-          createRenderWorkflowWorker({
-            apiKey: config.renderDeploy.apiKey,
-            task: config.renderDeploy.workflowTaskId || `${config.renderDeploy.workflowSlug}/qm_run`,
-            runs,
-            store: artifactMap<RenderWorkflowDispatch>("render_workflow_dispatches"),
-            lock: renderLock,
-            canClaim: () => drain.canClaim(),
-            isReady: (runId) => renderWorkflowRunReady(pgArtifactMap!.pool, runId),
-            onError: (error) =>
-              errors.record({
-                category: "render",
-                code: "workflow_dispatch_failed",
-                message: errMessage(error),
-                scopeLabel: scopeId("org", config.orgId),
-              }),
-          }),
-        ]
-      : Array.from({ length: Math.max(1, config.workers) }, () =>
-          createWorker({
-            runs,
-            sessions,
-            orchestrator,
-            leaseTtlMs,
-            heartbeatIntervalMs: config.heartbeatIntervalMs,
-            errors,
-            pollMs: 250,
-            canClaim: () => drain.canClaim(),
-            onClaimed: () => drain.noteBusy(),
-          }),
-        );
+  const workers: Worker[] = Array.from({ length: Math.max(0, config.workers) }, () =>
+    createWorker({
+      runs,
+      sessions,
+      orchestrator,
+      leaseTtlMs,
+      heartbeatIntervalMs: config.heartbeatIntervalMs,
+      errors,
+      pollMs: 250,
+      canClaim: () => drain.canClaim(),
+      onClaimed: () => drain.noteBusy(),
+    }),
+  );
   const processReaper: ProcessReaper | null = processes
     ? createProcessReaper(processes, {
         intervalMs: config.processReaperIntervalMs,
@@ -2248,16 +2215,6 @@ export function buildApp(
   };
 
   return {
-    async processRenderRun(runId) {
-      if (!renderSelected) throw new Error("Render Workflow runs require a Render deployment");
-      const run = await runs.claimById(runId, `render-workflow:${randomUUID()}`, leaseTtlMs);
-      if (run)
-        await processRun(
-          { runs, orchestrator, leaseTtlMs, heartbeatIntervalMs: config.heartbeatIntervalMs, errors },
-          run,
-          { background: true },
-        );
-    },
     app,
     ...(screenSecurity ? { screenSecurity } : {}),
     deploymentLayer,

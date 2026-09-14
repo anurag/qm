@@ -25,10 +25,10 @@ export function renderWorkloads(
     if (plugin.image) throw new CliError(`Render plugin ${plugin.name} must use a Dockerfile in the Git repository`);
   }
   return [
-    ...ordered(runnableServices(config.services)).map((service) => ({
-      name: service.name,
-      ...renderBuild(config, `deploy/${service.name}/Dockerfile`),
-    })),
+    ...ordered(runnableServices(config.services)).flatMap((service) => {
+      const build = renderBuild(config, `deploy/${service.name}/Dockerfile`);
+      return [service.name, ...(service.name === "core" ? ["worker"] : [])].map((name) => ({ name, ...build }));
+    }),
     ...discovered.plugins.map((plugin) => ({
       name: plugin.name,
       ...renderBuild(config, `plugins/${plugin.name}/Dockerfile`),
@@ -47,9 +47,13 @@ export function renderBuild(config: QmConfig, dockerfile: string): RenderBuild {
   return { source: config.render.source, dockerfile };
 }
 
+export function renderEnvService(workload: string): string {
+  return workload === "worker" ? "core" : workload;
+}
+
 export function renderServiceEnv(
   config: QmConfig,
-  service: string,
+  workload: string,
   values: ReadonlyMap<string, string>,
   connections: {
     databaseUrl: string;
@@ -60,14 +64,13 @@ export function renderServiceEnv(
     postgresId?: string;
     appDatabaseEndpoint?: string;
     minioServiceId?: string;
-    workflowSlug?: string;
-    workflowTaskId?: string;
     sourceCommit?: string;
   },
   plugin?: ResolvedPlugin,
 ): Record<string, string> {
   const render = config.render;
   if (!render) throw new CliError("Render requires a render config block");
+  const service = renderEnvService(workload);
   const coreAccess = (plugin ?? config.plugins.find((item) => item.name === service))?.coreAccess !== false;
   const out: Record<string, string> = {
     ...hostedServiceEnv(config.services, config.env, service),
@@ -125,8 +128,6 @@ export function renderServiceEnv(
       RENDER_REGION: render.region,
       RENDER_APP_REGION: render.appRegion ?? render.region,
       ...(connections.projectId ? { RENDER_PROJECT_ID: connections.projectId } : {}),
-      ...(connections.workflowTaskId ? { RENDER_WORKFLOW_TASK_ID: connections.workflowTaskId } : {}),
-      ...(connections.workflowSlug ? { RENDER_WORKFLOW_SLUG: connections.workflowSlug } : {}),
       ...(connections.minioServiceId ? { RENDER_MINIO_SERVICE_ID: connections.minioServiceId } : {}),
       ...(connections.postgresId ? { RENDER_POSTGRES_ID: connections.postgresId } : {}),
       ...(connections.appDatabaseEndpoint ? { RENDER_APP_DATABASE_ENDPOINT: connections.appDatabaseEndpoint } : {}),
@@ -138,6 +139,7 @@ export function renderServiceEnv(
         : {}),
       ...(config.model ? { PI_MODEL: config.model } : {}),
       ...(config.modelProvider ? { MODEL_PROVIDER: config.modelProvider } : {}),
+      ...(workload === "core" ? { WORKERS: "0" } : {}),
     });
   if (service === "core") {
     out.AUTH_ALLOWED_EMAIL_DOMAIN =

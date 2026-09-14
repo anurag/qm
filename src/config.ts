@@ -423,8 +423,6 @@ interface RenderDeployEnv {
   apiKey: string;
   workspaceId: string;
   minioServiceId: string;
-  workflowSlug: string;
-  workflowTaskId: string;
   source?: { repo: string; branch: string; commit: string };
   region: string;
   appRegion: string;
@@ -439,8 +437,6 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
   const branch = env.RENDER_DEPLOY_BRANCH?.trim();
   const commit = env.RENDER_DEPLOY_COMMIT?.trim();
   const minioServiceId = env.RENDER_MINIO_SERVICE_ID?.trim() || "";
-  const workflowSlug = env.RENDER_WORKFLOW_SLUG?.trim() || "";
-  const workflowTaskId = env.RENDER_WORKFLOW_TASK_ID?.trim() || "";
   if (Boolean(repo) !== Boolean(branch))
     throw new Error("RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH must be set together");
   if (
@@ -492,8 +488,6 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
     apiKey: env.RENDER_API_KEY?.trim() || "",
     workspaceId: env.RENDER_WORKSPACE_ID?.trim() || "",
     minioServiceId,
-    workflowSlug,
-    workflowTaskId,
     ...(repo && branch && commit ? { source: { repo, branch, commit } } : {}),
     region,
     appRegion: env.RENDER_APP_REGION?.trim() || region,
