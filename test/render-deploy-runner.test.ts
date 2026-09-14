@@ -572,7 +572,7 @@ test("Render gateway forwards WebSocket upgrades, both head buffers, and HTTP re
   assert.match(await upgrade(t, gatewayPort, "a".repeat(43)), /^HTTP\/1.1 502 /);
 });
 
-test("Render gateway keeps healthy apps ready after clients disconnect", { timeout: 15_000 }, async (t) => {
+test("Render gateway keeps proxying after clients disconnect mid-request", { timeout: 15_000 }, async (t) => {
   for (const kind of ["request body", "response", "WebSocket"] as const) {
     await t.test(kind, async (t) => {
       const started = Promise.withResolvers<void>();

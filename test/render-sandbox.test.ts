@@ -477,7 +477,7 @@ test("Render saves portable files before it replaces a pending native snapshot",
 
 test("Render checkpoints background changes before TTL even when idle reaping is disabled", async (t) => {
   const { make, fake, layers, store, scope } = setup(t);
-  const sandbox = make();
+  const sandbox = make(undefined, 5 * 60_000);
   const handle = await sandbox.provision(layers);
   const stored = (await store.get(scope))!;
   const processPath = "/root/.agent-proc/11111111-1111-1111-1111-111111111111";
@@ -677,4 +677,24 @@ test("Render leaves scopes whose sandbox already expired alone until they are pr
   const get = t.mock.method(fake.client, "get");
   assert.deepEqual(await sandbox.reapDeepIdle!(3600_000), { reaped: 0 });
   assert.equal(get.mock.callCount(), 0);
+});
+
+test("Render reaper checkpoints changes a throttled teardown left behind", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  const sandbox = make(undefined, 5 * 60_000);
+  const handle = await sandbox.provision(layers);
+  const initial = (await store.get(scope))!;
+  await sandbox.writeFile(handle, "late", "written after the checkpoint");
+  await sandbox.teardown(handle, { keepWarm: true });
+  assert.equal((await store.get(scope))!.homeSnapshotKey, initial.homeSnapshotKey);
+  assert.equal((await store.get(scope))!.homeDirty, true);
+  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 6 * 60_000 });
+  assert.deepEqual(await sandbox.reapDeepIdle!(3600_000), { reaped: 0 });
+  const saved = (await store.get(scope))!;
+  assert.notEqual(saved.homeSnapshotKey, initial.homeSnapshotKey);
+  assert.equal(saved.homeDirty, false);
+  assert.equal(fake.sandboxes.get(initial.sandboxId)?.status, "running");
+  await store.merge(scope, { homeCheckpointAtMs: Date.now() - 6 * 60_000 });
+  assert.deepEqual(await sandbox.reapDeepIdle!(3600_000), { reaped: 0 });
+  assert.equal((await store.get(scope))!.homeSnapshotKey, saved.homeSnapshotKey);
 });

@@ -99,9 +99,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     const scope = scopeFor(name);
     const stored = await store.get(scope);
     if (!stored || stored.discarded) throw new Error(`Render sandbox is not provisioned: ${name}`);
-    const touch = Date.now() - stored.lastActivityMs >= 60_000;
-    if (touch || stored.homeDirty === false)
-      await store.merge(scope, { homeDirty: true, ...(touch ? { lastActivityMs: Date.now() } : {}) });
+    if (Date.now() - stored.lastActivityMs >= 60_000) await store.merge(scope, { lastActivityMs: Date.now() });
     return stored.sandboxId;
   };
   const exec = async (name: string, script: string, timeoutSec: number): Promise<ExecResult> => {
@@ -521,8 +519,10 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       const scope = scopeFor(handle.id);
       if (options?.destroy) return destroyScope(scope);
       await withLock(handle.id, async () => {
-        const stored = await store.get(scope);
+        let stored = await store.get(scope);
         if (!stored) return;
+        if (!options?.homeUnchanged && stored.homeDirty !== true)
+          stored = (await store.merge(scope, { homeDirty: true })) ?? stored;
         const bookkeeping = { lastSnapshotMs: stored.homeCheckpointAtMs, homeDirty: stored.homeDirty };
         if (snapshotDue(bookkeeping, options, checkpointIntervalMs)) await checkpoint(scope, stored);
         await store.merge(scope, { lastActivityMs: Date.now() });
@@ -542,9 +542,13 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     async reapDeepIdle(idleMs) {
       let reaped = 0;
       const cutoff = idleMs > 0 ? Date.now() - idleMs : -Infinity;
+      const stale = (stored: StoredRenderSandbox): boolean =>
+        stored.homeDirty !== false && Date.now() - (stored.homeCheckpointAtMs ?? 0) >= checkpointIntervalMs;
       const due = (stored: StoredRenderSandbox): boolean =>
         stored.expiresAtMs > Date.now() &&
-        (stored.lastActivityMs <= cutoff || stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs);
+        (stored.lastActivityMs <= cutoff ||
+          stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs ||
+          stale(stored));
       for (const [scope, candidate] of await store.entries()) {
         if (!due(candidate) && !candidate.discarded && !candidate.retiredResources?.length) continue;
         await withLock(nameFor(scope), async () => {
@@ -556,10 +560,13 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           const expiresSoon = info.expiresAtMs <= Date.now() + expiryCheckpointWindowMs;
           const rotate = info.expiresAtMs <= Date.now() + (defaultTimeoutSec + 60) * 1000;
           const idle = stored.lastActivityMs <= cutoff;
-          if (!expiresSoon && !idle) return;
+          if (!expiresSoon && !idle && !stale(stored)) return;
           const active = await hasLiveProcesses(info.id);
           if (active && !expiresSoon) return;
-          if ((!active && (idle || rotate)) || Date.now() - (stored.homeCheckpointAtMs ?? 0) >= 5 * 60_000)
+          if (
+            (!active && (idle || rotate || stale(stored))) ||
+            Date.now() - (stored.homeCheckpointAtMs ?? 0) >= checkpointIntervalMs
+          )
             await checkpoint(scope, stored);
           if (active || (!idle && !rotate)) return;
           await client.terminate(info.id);
