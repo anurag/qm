@@ -107,7 +107,7 @@ export function createRenderAppNetwork(opts: {
               protectedStatus: "protected",
             })) ?? undefined;
         } catch (error) {
-          if (error instanceof RenderApiError && error.status < 500 && error.status !== 408)
+          if (error instanceof RenderApiError && error.rejected)
             await opts.store.put(record.deploymentId, { ...record, environmentCreatePending: undefined });
           throw error;
         }

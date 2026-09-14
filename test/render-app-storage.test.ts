@@ -264,41 +264,42 @@ test("Uncertain Render storage submissions reconcile across restarts before the 
   assert.notEqual(jobs[0]!.startCommand, jobs[2]!.startCommand);
 });
 
-test("Rejected Render storage submissions retain repair intent and allow a new job", async () => {
-  const store = createMemoryMap<StoredRenderAppStorage>();
-  let rejected = true;
-  let jobs = 0;
-  const api: RenderApi = {
-    async request<T>(method: string, path: string): Promise<T> {
-      if (path === "/services/srv-minio")
-        return { ownerId: "tea-test", environmentId: "env-test", type: "web_service" } as T;
-      if (method === "POST") {
-        if (rejected) throw new RenderApiError(method, path, 429);
-        return { id: `job-${++jobs}` } as T;
-      }
-      return { status: "succeeded" } as T;
-    },
-  };
-  const storage = createRenderAppStorage({
-    apiKey: "key",
-    workspaceId: "tea-test",
-    environmentId: "env-test",
-    minioServiceId: "srv-minio",
-    endpoint: "http://localhost:9000",
-    bucket: "qm-storage",
-    store,
-    keyMaterial: "test-key",
-    api,
+for (const status of [400, 401, 403, 404, 409, 410, 412, 422, 429])
+  test(`Rejected Render storage submissions (${status}) retain repair intent and allow a new job`, async () => {
+    const store = createMemoryMap<StoredRenderAppStorage>();
+    let rejected = true;
+    let jobs = 0;
+    const api: RenderApi = {
+      async request<T>(method: string, path: string): Promise<T> {
+        if (path === "/services/srv-minio")
+          return { ownerId: "tea-test", environmentId: "env-test", type: "web_service" } as T;
+        if (method === "POST") {
+          if (rejected) throw new RenderApiError(method, path, status);
+          return { id: `job-${++jobs}` } as T;
+        }
+        return { status: "succeeded" } as T;
+      },
+    };
+    const storage = createRenderAppStorage({
+      apiKey: "key",
+      workspaceId: "tea-test",
+      environmentId: "env-test",
+      minioServiceId: "srv-minio",
+      endpoint: "http://localhost:9000",
+      bucket: "qm-storage",
+      store,
+      keyMaterial: "test-key",
+      api,
+    });
+    const id = randomUUID();
+    await assert.rejects(storage.ensure(id), new RegExp(`HTTP ${status}`));
+    assert.equal((await store.get(id))!.operation, "enable");
+    assert.equal((await store.get(id))!.jobRequest, undefined);
+    rejected = false;
+    await storage.ensure(id);
+    assert.equal(jobs, 1);
+    assert.equal((await store.get(id))!.enabled, true);
   });
-  const id = randomUUID();
-  await assert.rejects(storage.ensure(id), /HTTP 429/);
-  assert.equal((await store.get(id))!.operation, "enable");
-  assert.equal((await store.get(id))!.jobRequest, undefined);
-  rejected = false;
-  await storage.ensure(id);
-  assert.equal(jobs, 1);
-  assert.equal((await store.get(id))!.enabled, true);
-});
 
 for (const failure of ["503", "connection"])
   for (const failedOperation of ["enable", "disable"] as const)

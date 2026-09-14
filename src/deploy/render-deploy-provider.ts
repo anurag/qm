@@ -37,7 +37,6 @@ export interface StoredRenderDeploy {
   environmentCreatePending?: boolean;
   token: string;
   liveVersion?: number;
-  liveDeployId?: string;
   suspended: boolean;
   bootstrap?: { previousDeployIds: string[]; deployId?: string; requested?: boolean };
   pending?: {
@@ -247,7 +246,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
                   commitId: record.pending.runnerCommit,
                 })) ?? undefined;
             } catch (error) {
-              if (error instanceof RenderApiError && error.status < 500 && error.status !== 408) {
+              if (error instanceof RenderApiError && error.rejected) {
                 await save({ ...record, pending: undefined });
                 throw error;
               }
@@ -274,7 +273,6 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
             record = {
               ...record,
               liveVersion: record.pending.version,
-              liveDeployId: deploy.id,
               suspended: false,
               pending: undefined,
             };
@@ -317,6 +315,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     let service = await find(deployment, record);
     if (
       service &&
+      service.suspended !== "suspended" &&
       !record.suspended &&
       record.liveVersion === version.version &&
       deployment.appliedVersion !== version.version
@@ -374,7 +373,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
             };
           }
         } catch (error) {
-          if (error instanceof RenderApiError && error.status < 500 && error.status !== 408) {
+          if (error instanceof RenderApiError && error.rejected) {
             await save({ ...record, bootstrap: undefined });
             throw error;
           }

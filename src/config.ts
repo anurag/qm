@@ -430,7 +430,6 @@ interface RenderDeployEnv {
   appRegion: string;
   plan?: string;
   appPrefix?: string;
-  registryCredentialId?: string;
 }
 
 function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
@@ -500,9 +499,6 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
     appRegion: env.RENDER_APP_REGION?.trim() || region,
     ...(env.RENDER_DEPLOY_PLAN?.trim() ? { plan: env.RENDER_DEPLOY_PLAN.trim() } : {}),
     ...(env.RENDER_DEPLOY_APP_PREFIX?.trim() ? { appPrefix: env.RENDER_DEPLOY_APP_PREFIX.trim() } : {}),
-    ...(env.RENDER_REGISTRY_CREDENTIAL_ID?.trim()
-      ? { registryCredentialId: env.RENDER_REGISTRY_CREDENTIAL_ID.trim() }
-      : {}),
   };
 }
 

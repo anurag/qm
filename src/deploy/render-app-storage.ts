@@ -152,7 +152,7 @@ run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(
     try {
       job = await api.request<Job>("POST", `${path}/jobs`, { startCommand });
     } catch (error) {
-      if (error instanceof RenderApiError && [400, 401, 403, 404, 422, 429].includes(error.status))
+      if (error instanceof RenderApiError && error.rejected)
         await opts.store.put(record.deploymentId, { ...record, jobRequest: undefined });
       throw error;
     }

@@ -10,7 +10,6 @@ interface RenderDeployArtifactAccess {
   token: string;
   commit: string;
   entrypoint: string;
-  runtimeEnv?: Record<string, string>;
 }
 
 export interface StoredRenderDeployCredential {

@@ -573,3 +573,16 @@ test("Render service resets a confirmed failed version while retaining its histo
   assert.equal(after!.versions.length, 2);
   assert.equal((await deploy.reachDeployment(d.id, "U1")).status, "ok");
 });
+
+test("Render resumes a dashboard-suspended service before reusing its live version", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const version = d.versions[0]!;
+  const endpoint = await f.provider.apply(d, version);
+  f.service.suspended = "suspended";
+  const before = f.calls.length;
+  assert.deepEqual(await f.restart(sha).apply(d, version), endpoint);
+  assert.equal(f.service.suspended, "not_suspended");
+  assert.equal(f.calls.slice(before).filter((call) => call.path.endsWith("/resume")).length, 1);
+  assert.equal(f.calls.filter((call) => call.method === "POST" && call.path === "/services").length, 1);
+});

@@ -7,6 +7,10 @@ export class RenderApiError extends Error {
     super(`Render ${method} ${path.split("?")[0]}: HTTP ${status}`);
     this.status = status;
   }
+
+  get rejected(): boolean {
+    return this.status >= 400 && this.status < 500 && this.status !== 408;
+  }
 }
 
 export interface RenderApi {
