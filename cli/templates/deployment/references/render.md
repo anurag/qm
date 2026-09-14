@@ -10,11 +10,9 @@ private. Render stores the runtime values. The CLI records resource IDs in
 `render.resources.json`; retain this file so updates act on the same resources.
 After an unknown creation result, a retry searches the workspace for the named
 resource, records it when it exists, and repeats the write when it is absent.
-The CLI removes a lock left by a process that has exited. A live process keeps
-its lock. A lock without a valid PID has a five-second recovery delay; retry
-after that delay if the process stopped before it recorded its PID.
-Finish any Render operation started by an older CLI version before upgrading.
-Use one CLI version per deployment directory.
+Commands in one deployment directory take `.render.lock`. A second command
+waits up to 30 seconds for the holder, reclaims a lock whose process has
+exited, and otherwise stops with an error.
 
 The API creates one project and one production environment. The core services,
 the run worker, Render Postgres, and bundled MinIO use that environment.

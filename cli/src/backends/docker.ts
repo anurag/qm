@@ -36,7 +36,13 @@ import {
 import { dockerBasePort, localSandboxActive, sandboxCoreEnv, securityScreenEnv, type QmConfig } from "../config.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
 import { computedSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
-import { readDeploymentState, withDeploymentLock, writeDeploymentState, type DeploymentState } from "../state.ts";
+import {
+  deploymentDir,
+  readDeploymentState,
+  withDeploymentLock,
+  writeDeploymentState,
+  type DeploymentState,
+} from "../state.ts";
 
 /** Deployment-layer transport for docker: signed HTTP to the locally published core port. */
 export const dockerDeploymentLayerTransport: DeploymentLayerTransport = httpDeploymentLayerTransport({
@@ -248,7 +254,7 @@ function externalDatabaseUrl(ctx: DockerCtx): string | undefined {
   return process.env.DATABASE_URL ?? readEnvValue(ctx.envFile, "DATABASE_URL");
 }
 
-function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
+async function ensurePostgres(ctx: DockerCtx, dryRun: boolean): Promise<string> {
   const fromEnv = externalDatabaseUrl(ctx);
   if (fromEnv) {
     step("Postgres: using DATABASE_URL from the environment");
@@ -262,7 +268,7 @@ function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
     step(`Postgres: would run ${pgName} (image postgres:16, volume ${pgVolume(ctx)})`);
     return url(readDeploymentState(ctx.config.orgId)?.pgPassword ?? "<generated>");
   }
-  return withDeploymentLock(ctx.config.orgId, () => {
+  return withDeploymentLock(join(deploymentDir(ctx.config.orgId), "up.lock"), async () => {
     const state = readDeploymentState(ctx.config.orgId);
     let password: string;
     const existing = pgContainerPassword(ctx);
@@ -640,7 +646,7 @@ export async function dockerUp(
   }
 
   if (opts.dryRun) {
-    ctx.databaseUrl = ensurePostgres(ctx, true);
+    ctx.databaseUrl = await ensurePostgres(ctx, true);
     step(`network: ${ctx.network}`);
     if (resolvedLocalImage) step(`sandbox: local image ${resolvedLocalImage}`);
     for (const def of ordered(runnableServices(config.services))) {
@@ -677,7 +683,7 @@ export async function dockerUp(
 
   if (localSandboxActive(config)) ensureLocalSandboxImage(config);
   ensureNetwork(ctx);
-  ctx.databaseUrl = ensurePostgres(ctx, false);
+  ctx.databaseUrl = await ensurePostgres(ctx, false);
   if (!externalDatabaseUrl(ctx)) await waitPostgres(ctx);
 
   for (const def of ordered(runnableServices(config.services))) {

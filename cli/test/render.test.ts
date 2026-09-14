@@ -469,12 +469,18 @@ for (const pid of [undefined, "invalid", "0"]) {
   });
 }
 
-test("Render leaves a new lock without a PID intact", async (t) => {
+function hurryLockClock(t: TestContext): void {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => (now += 1_000));
+}
+
+test("Render waits for a lock without a PID and reclaims it once it is stale", async (t) => {
   const d = deployment(t);
   const path = join(d.ctx.configDir, ".render.lock");
   mkdirSync(path);
-  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
-  assert.equal(existsSync(path), true);
+  hurryLockClock(t);
+  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+  assert.equal(existsSync(path), false);
 });
 
 test("Render keeps a lock when its owner cannot be probed", async (t) => {
@@ -485,7 +491,8 @@ test("Render keeps a lock when its owner cannot be probed", async (t) => {
   t.mock.method(process, "kill", () => {
     throw Object.assign(new Error("Operation not permitted"), { code: "EPERM" });
   });
-  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
+  hurryLockClock(t);
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
   assert.equal(readFileSync(join(path, "pid"), "utf8"), String(process.pid));
 });
 
@@ -493,6 +500,7 @@ test("Render stale recovery preserves a replacement lock owner", async (t) => {
   const d = deployment(t);
   const path = join(d.ctx.configDir, ".render.lock");
   mkdirSync(path);
+  hurryLockClock(t);
   const stalePid = process.pid + 1;
   writeFileSync(join(path, "pid"), String(stalePid));
   const replacement = `owner-${randomUUID()}`;
@@ -504,7 +512,7 @@ test("Render stale recovery preserves a replacement lock owner", async (t) => {
     writeFileSync(join(path, replacement), String(process.pid));
     throw Object.assign(new Error("No such process"), { code: "ESRCH" });
   });
-  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
   assert.deepEqual(readdirSync(path), [replacement]);
   assert.equal(readFileSync(join(path, replacement), "utf8"), String(process.pid));
 });
@@ -548,7 +556,8 @@ await createRenderBackend(${JSON.stringify(d.ctx)}).up({ dryRun: false });`,
   assert.equal(readFileSync(join(path, owner), "utf8"), String(child.pid));
   const expired = new Date(Date.now() - 10_000);
   utimesSync(path, expired, expired);
-  await assert.rejects(async () => d.backend.down({}), /Another Render operation holds/);
+  hurryLockClock(t);
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
   assert.equal(readFileSync(join(path, owner), "utf8"), String(child.pid));
   child.kill("SIGKILL");
   await exited;
