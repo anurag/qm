@@ -53,8 +53,9 @@ function renderConfig(orgId: string, values: ConfigValues): string {
   // "botName": "straylight",
   // "orgName": "Acme Corp",
 
-  // Where to deploy: "docker" runs local containers, "fly" deploys Fly apps,
-  // and "aws" runs the control plane on ECS and agent computers on Lambda MicroVMs.
+  // Where to deploy: "docker" runs local containers, "fly" deploys Fly apps, "aws" runs
+  // the control plane on ECS and agent computers on Lambda MicroVMs, and "render" builds
+  // Render services from Git with native Render Sandboxes as agent computers.
   "target": ${JSON.stringify(values.target)},
 
   // The vendor supplying the base model: "anthropic", "openai", or "openrouter"

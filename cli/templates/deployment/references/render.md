@@ -11,15 +11,21 @@ private. Render stores the runtime values. The CLI records resource IDs in
 `render.resources.json`; retain this file so updates act on the same resources.
 After an unknown creation result, a retry searches the workspace for the named
 resource, records it when it exists, and repeats the write when it is absent.
-Commands in one deployment directory take `.render.lock`. A second command
-waits up to 30 seconds for the holder, reclaims a lock whose process has
-exited, and otherwise stops with an error.
+`qm up`, `qm down`, `qm rollback`, and `qm secrets push` take `.render.lock` in
+the deployment directory. A second such command waits up to 30 seconds for the
+holder, reclaims a lock whose process has exited, and otherwise stops with an
+error.
 
 The API creates one project and one production environment. The core services,
 the run worker, Render Postgres, and bundled MinIO use that environment.
 Each published app has a network-isolated environment in the same project.
 Native Render Sandboxes are workspace resources because the Sandbox API has no
 project or environment field. Do not create a second project for sandboxes.
+
+`render.corePlan`, `render.servicePlan`, and `render.storage.plan` take Render compute
+plan IDs such as `1c-2g`. Legacy names such as `standard` are accepted and
+normalized to their plan IDs, so the name Render echoes never causes a redeploy.
+`render.postgresPlan` is passed through unchanged.
 
 `render.appRegion` optionally selects the region for new published apps. It
 defaults to `render.region`. Each app retains the region selected at creation.
@@ -103,20 +109,26 @@ portal use their existing Dockerfiles. MinIO uses
 `plugins/<name>/Dockerfile` in the same Git repository. Prebuilt image overrides
 are not supported. Automatic deploys are off so `qm up` controls the update order.
 Render starts an initial build when a service is created or resumed. The CLI
-creates and resumes services with a command that exits, cancels that build,
-then sets the real command and deploys the pinned commit. A retry after an
-interruption cancels any build still running and deploys the current commit.
+creates and resumes services with a command that exits, sets the real command,
+cancels the automatic build and waits for it to settle, then deploys the pinned
+commit. A retry after an interruption cancels any build still running and
+deploys the current commit.
 
 The CLI initializes MinIO before it deploys core and the worker. The CLI
 resolves the branch once and pins the service builds to that commit. Each
 routine update builds the diskless services. It retains MinIO without a redeploy when the
-MinIO source and configuration are unchanged. A deliberate MinIO build or disk
-change can interrupt object storage while Render starts its replacement.
+MinIO repository, branch, Dockerfile path, plan, and disk are unchanged. A new
+pinned digest in `deploy/render-minio/Dockerfile` alone does not rebuild MinIO;
+trigger a manual deploy of the MinIO service in the Render dashboard for that.
+A MinIO build or disk change interrupts object storage while Render starts its
+replacement.
 
 `qm rollback` restores the previous successful service builds. It retains the
 current operator environment values and does not reverse database migrations.
 The prior commit is restored with the previous core and worker builds. Verify
 compatibility before a rollback that follows a configuration or schema change.
+`qm rollback` takes no `--to`; it targets the release before the current one,
+or the last successful release after an interrupted `qm up`.
 
 ## Data and credentials
 
@@ -144,12 +156,30 @@ service, database, and objects. Restore the app with the same tools. Verify
 retained records and file contents after restore. Direct Render service deletion
 is part of permanent cleanup below; it does not run the QM archive flow.
 
+## Agent-computer proof
+
+Native Render Sandboxes have no operator shell, so read the proof file from the
+durable home archive that core writes to MinIO at each checkpoint. The archive
+of a scope is the object `render-home/<url-encoded scope id>.tar` in the
+`qm-storage` bucket. A checkpoint runs at turn end when the home changed, at
+most once per five minutes, and the reaper covers a throttled one within about
+ten minutes, so wait for one before you read. Use the MinIO service's
+onrender.com URL, the `qm-storage` access key, and the `QM_STORAGE_SECRET_KEY`
+value from the MinIO service's environment in the Render dashboard:
+
+```bash
+scope_id='personal:<exact-admin-principal>'
+key="render-home/$(node -p 'encodeURIComponent(process.argv[1])' "$scope_id").tar"
+mc alias set qm https://<prefix>-minio.onrender.com qm-storage "$QM_STORAGE_SECRET_KEY"
+mc cat "qm/qm-storage/$key" | tar -xOf - workspace/qm-computer-proof.txt
+```
+
 ## Operations
 
 `qm status`, `qm logs`, and `qm check --live` inspect the recorded resources.
 `qm secrets push` stores changed operator secrets. Run `qm up` to use them.
-`qm down` stops services and retains Postgres and the MinIO disk. Stored data
-continues to incur charges. Archive published apps before stopping their parent
+`qm down` suspends the services. Postgres keeps running, and it and the MinIO
+disk continue to incur charges. Archive published apps before stopping their parent
 deployment.
 
 ### Permanent cleanup

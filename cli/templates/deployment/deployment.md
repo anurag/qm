@@ -15,7 +15,7 @@ Before cloud mutation, read `qm.config.jsonc` when it exists. Its `target` is
 the selected provider; confirm it with the operator and do not offer to change
 it in place. If the repository has not been initialized, collect:
 
-- hosting target: a cloud provider — Fly.io, AWS, or Porter. Recommend Fly.io
+- hosting target: a cloud provider — Fly.io, AWS, Render, or Porter. Recommend Fly.io
   when the operator has no preference. Porter deploys onto a Kubernetes
   cluster in the operator's own cloud account and has no `qm` CLI target:
   choosing it switches this workflow to `references/porter.md`, which drives
@@ -229,7 +229,8 @@ agent turn plus auxiliary title generation, verifies the exact reply and
 persisted transcript, requires a generated title, checks the session-scoped
 error log, and archives itself. It does not recall or capture administrator
 memory. Fly runs it inside the core machine; AWS runs it as a one-off task on
-the core service's private network. It does not add a public session endpoint.
+the core service's private network; Render runs it as a one-off job on the core
+service. It does not add a public session endpoint.
 
 Open `adminOnboardingUrl` from the JSON output and confirm Model provider
 reports the chosen vendor as configured, sourced from the environment. It does

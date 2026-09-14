@@ -108,7 +108,7 @@ Auto uses its built-in model classifier unless `qm.config.jsonc` declares one
 ## Commands
 
 ```text
-init [dir] [--org id] [--target docker|fly|aws]
+init [dir] [--org id] [--target docker|fly|aws|render] [--model-provider anthropic|openai|openrouter] [--repo url --branch name]
 check [--json] [--live]
 doctor
 infra render|build-image|delete-image|delete-task-definitions
