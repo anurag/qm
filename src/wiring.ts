@@ -8,7 +8,11 @@ import {
 import { createRenderAppDatabase, type StoredRenderAppDatabase } from "./deploy/render-app-database.ts";
 import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/render-app-storage.ts";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { createRenderWorkflowWorker, type RenderWorkflowDispatch } from "./render/workflow-worker.ts";
+import {
+  createRenderWorkflowWorker,
+  renderWorkflowRunReady,
+  type RenderWorkflowDispatch,
+} from "./render/workflow-worker.ts";
 import { processRun } from "./runs/worker.ts";
 import { S3Client } from "@aws-sdk/client-s3";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
@@ -716,6 +720,12 @@ export function buildApp(
   const resolution = createResolutionService(config.orgId, configStore, acl);
 
   if (renderSelected && !config.databaseUrl) throw new Error("Render requires DATABASE_URL");
+  if (
+    config.deployProvider === "render" &&
+    (config.renderDeploy.workflowTaskId || config.renderDeploy.workflowSlug) &&
+    config.runStore !== "postgres"
+  )
+    throw new Error("Render Workflows require RUN_STORE=postgres");
   const renderLock = advisoryLock;
   const s3 = new S3Client({
     ...(config.s3Region ? { region: config.s3Region } : {}),
@@ -2121,6 +2131,7 @@ export function buildApp(
             store: artifactMap<RenderWorkflowDispatch>("render_workflow_dispatches"),
             lock: renderLock,
             canClaim: () => drain.canClaim(),
+            isReady: (runId) => renderWorkflowRunReady(pgArtifactMap!.pool, runId),
             onError: (error) =>
               errors.record({
                 category: "render",
