@@ -10,9 +10,6 @@ private. Render stores the runtime values. The CLI records resource IDs in
 `render.resources.json`; retain this file so updates act on the same resources.
 After an unknown creation result, a retry searches the workspace for the named
 resource, records it when it exists, and repeats the write when it is absent.
-During service creation or resume, this record also stores encrypted credentials
-until the pinned deployment succeeds. Keep the same local `CORE_SIGNING_SECRET`
-until that operation finishes so a retry can restore the credentials.
 The CLI removes a lock left by a process that has exited. A live process keeps
 its lock. A lock without a valid PID has a five-second recovery delay; retry
 after that delay if the process stopped before it recorded its PID.
@@ -107,7 +104,9 @@ portal use their existing Dockerfiles. MinIO uses
 `plugins/<name>/Dockerfile` in the same Git repository. Prebuilt image overrides
 are not supported. Automatic deploys are off so `qm up` controls the update order.
 Render starts an initial build when a service is created or resumed. The CLI
-uses a command that exits and supplies no credentials until this build stops.
+creates and resumes services with a command that exits, cancels that build,
+then sets the real command and deploys the pinned commit. A retry after an
+interruption cancels any build still running and deploys the current commit.
 
 The CLI initializes MinIO before it deploys core and the worker. The CLI
 resolves the branch once and pins the service builds to that commit. Each

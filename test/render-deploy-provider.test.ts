@@ -409,7 +409,6 @@ for (const status of [undefined, 503]) {
       const record = (await f.store.get(d.id))!;
       assert.equal(record.suspended, true);
       assert.equal(record.pending, undefined);
-      assert.equal(record.bootstrap, undefined);
       assert.equal(f.data.get("retained"), "value");
     });
   }
@@ -547,19 +546,6 @@ test("Render waits for the new instance nonce through old responses, lost deploy
   f.readinessNonce = undefined;
   await f.restart(sha).apply(d, v2);
   assert.equal((await f.store.get(d.id))!.pending, undefined);
-});
-
-test("Render can reconcile a legacy pending deployment without a saved readiness nonce", async () => {
-  const f = fixture();
-  f.outcome = "build_in_progress";
-  await assert.rejects(f.provider.apply(f.deployment, f.deployment.versions[0]!), /unconfirmed deployment/);
-  const record = (await f.store.get(f.deployment.id))!;
-  delete record.pending!.readinessNonce;
-  await f.store.put(f.deployment.id, record);
-  f.finishPending();
-  f.readinessNonce = null;
-  await f.restart(sha).apply(f.deployment, f.deployment.versions[0]!);
-  assert.equal((await f.store.get(f.deployment.id))!.pending, undefined);
 });
 
 test("Render refuses changed service ownership and missing retained infrastructure", async () => {

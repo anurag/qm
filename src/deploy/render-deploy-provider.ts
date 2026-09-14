@@ -37,13 +37,11 @@ export interface StoredRenderDeploy {
   token: string;
   liveVersion?: number;
   suspended: boolean;
-  bootstrap?: { previousDeployIds: string[]; deployId?: string; requested?: boolean };
   pending?: {
     version: number;
     runnerCommit: string;
-    readinessNonce?: string;
-    previousDeployIds: string[];
-    requested?: boolean;
+    readinessNonce: string;
+    previousDeployId?: string;
     deployId?: string;
   };
 }
@@ -202,7 +200,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     };
   }
 
-  async function ready(service: Service, record: StoredRenderDeploy): Promise<boolean> {
+  async function ready(service: Service, record: StoredRenderDeploy, nonce: string): Promise<boolean> {
     const address = endpoint(service, record);
     try {
       const response = await fetchImpl(`https://${address.host}:${address.port}/__qm_ready`, {
@@ -211,14 +209,24 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         signal: AbortSignal.timeout(3_000),
       });
       await response.body?.cancel();
-      return (
-        response.status === 204 &&
-        (!record.pending?.readinessNonce ||
-          response.headers.get("x-qm-render-app-ready") === record.pending.readinessNonce)
-      );
+      return response.status === 204 && response.headers.get("x-qm-render-app-ready") === nonce;
     } catch {
       return false;
     }
+  }
+
+  async function latest(service: Service): Promise<Deploy | undefined> {
+    const page = await api.request<Array<{ deploy: Deploy }>>("GET", `${path(service)}/deploys?limit=1`);
+    if (!Array.isArray(page)) throw new Error("Render returned an invalid app deployment list");
+    return page[0]?.deploy;
+  }
+
+  const active = (deploy: Deploy) => deploy.status !== "live" && !FAILED.has(deploy.status);
+
+  async function settle(service: Service): Promise<void> {
+    for (const deploy of (await deployments(service)).filter(active))
+      await api.request("POST", `${path(service)}/deploys/${encodeURIComponent(deploy.id)}/cancel`);
+    await idle(service);
   }
 
   async function finish(
@@ -234,19 +242,13 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
           record = { ...record, serviceId: service.id };
           await save(record);
         }
-        if (!record.pending) return { service, record };
-        if (!record.pending.deployId) {
-          const pending = record.pending;
-          const submitted = async () =>
-            (await deployments(service)).find(
-              (d) => !pending.previousDeployIds.includes(d.id) && d.commit?.id === pending.runnerCommit,
-            );
-          let found = pending.requested ? await submitted() : undefined;
+        const pending = record.pending;
+        if (!pending) return { service, record };
+        if (!pending.deployId) {
+          const own = (deploy: Deploy | undefined) =>
+            deploy && deploy.id !== pending.previousDeployId ? deploy : undefined;
+          let found = own(await latest(service));
           if (!found) {
-            if (!pending.requested) {
-              record = { ...record, pending: { ...pending, requested: true } };
-              await save(record);
-            }
             try {
               found =
                 (await api.request<Deploy>("POST", `${path(service)}/deploys`, { commitId: pending.runnerCommit })) ??
@@ -256,34 +258,30 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
                 await save({ ...record, pending: undefined });
                 throw error;
               }
-              found = await submitted();
+              found = own(await latest(service));
               if (!found) throw error;
             }
           }
-          if (!found?.id) throw new Error("Render did not return an app deployment ID");
-          record = { ...record, pending: { ...pending, requested: true, deployId: found.id } };
-          await save(record);
+          if (found?.id) {
+            record = { ...record, pending: { ...pending, deployId: found.id } };
+            await save(record);
+          }
         }
-        if (record.pending?.deployId) {
+        if (pending.deployId) {
           const deploy = await api.request<Deploy>(
             "GET",
-            `${path(service)}/deploys/${encodeURIComponent(record.pending.deployId)}`,
+            `${path(service)}/deploys/${encodeURIComponent(pending.deployId)}`,
           );
           if (deploy && FAILED.has(deploy.status)) {
             await save({ ...record, pending: undefined });
             throw new Error(`Render deploy ${deploy.id} ${deploy.status}`);
           }
-          if (deploy?.status === "live" && (await ready(service, record))) {
-            if (deploy.commit?.id !== record.pending.runnerCommit) {
+          if (deploy?.status === "live" && (await ready(service, record, pending.readinessNonce))) {
+            if (deploy.commit?.id !== pending.runnerCommit) {
               await save({ ...record, pending: undefined });
               throw new Error("The Render app runner was built from a different Git commit");
             }
-            record = {
-              ...record,
-              liveVersion: record.pending.version,
-              suspended: false,
-              pending: undefined,
-            };
+            record = { ...record, liveVersion: pending.version, suspended: false, pending: undefined };
             await save(record);
             return { service, record };
           }
@@ -294,11 +292,10 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     throw new Error(`Render app ${deployment.id} has an unconfirmed deployment; retry to reconcile it`);
   }
 
-  async function idle(service: Service): Promise<Deploy[]> {
+  async function idle(service: Service): Promise<void> {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-      const all = await deployments(service);
-      if (all.every((d) => d.status === "live" || FAILED.has(d.status))) return all;
+      if (!(await deployments(service)).some(active)) return;
       await sleep(Math.max(1, poll));
     }
     throw new Error("The previous Render deployment is still pending");
@@ -336,75 +333,47 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       maxShutdownDelaySeconds: 45,
       healthCheckPath: "/__qm_ready",
     };
-    if (!service || service.suspended === "suspended" || record.bootstrap) {
-      if (!record.bootstrap) {
-        const history = service ? await idle(service) : [];
-        record = { ...record, bootstrap: { previousDeployIds: history.map((d) => d.id) } };
-        await save(record);
+    const bootstrap = {
+      ...runtime,
+      envSpecificDetails: { ...runtime.envSpecificDetails, dockerCommand: "/bin/sh -c exit 0" },
+    };
+    if (!service) {
+      let created: { service: Service } | undefined;
+      try {
+        created =
+          (await api.request<{ service: Service }>("POST", "/services", {
+            type: "web_service",
+            name: name(deployment),
+            ownerId: opts.workspaceId,
+            environmentId: record.environmentId,
+            ...source,
+            envVars: [{ key: OWNER_MARKER, value: deployment.id }],
+            secretFiles: [],
+            serviceDetails: {
+              ...bootstrap,
+              plan: opts.plan ?? "0.5c-512mb",
+              region: record.appRegion ?? region,
+              numInstances: 1,
+            },
+          })) ?? undefined;
+      } catch (error) {
+        if (error instanceof RenderApiError && error.rejected) throw error;
       }
-      if (!record.bootstrap?.requested || !service || service.suspended === "suspended") {
-        const envVars = [{ key: OWNER_MARKER, value: deployment.id }];
-        const serviceDetails = {
-          ...runtime,
-          envSpecificDetails: { ...runtime.envSpecificDetails, dockerCommand: "/bin/sh -c exit 0" },
-        };
-        if (service) {
-          await api.request("PUT", `${path(service)}/env-vars`, envVars);
-          await api.request("PUT", `${path(service)}/secret-files`, []);
-          await api.request("PATCH", path(service), { ...source, serviceDetails });
-        }
-        record = { ...record, bootstrap: { ...record.bootstrap!, requested: true } };
-        await save(record);
-        try {
-          if (service) await api.request("POST", `${path(service)}/resume`);
-          else {
-            const created = await api.request<{ service: Service; deployId?: string }>("POST", "/services", {
-              type: "web_service",
-              name: name(deployment),
-              ownerId: opts.workspaceId,
-              environmentId: record.environmentId,
-              ...source,
-              envVars,
-              secretFiles: [],
-              serviceDetails: {
-                ...serviceDetails,
-                plan: opts.plan ?? "0.5c-512mb",
-                region: record.appRegion ?? region,
-                numInstances: 1,
-              },
-            });
-            service = created?.service ?? null;
-            record = {
-              ...record,
-              ...(service ? { serviceId: service.id } : {}),
-              bootstrap: { ...record.bootstrap!, ...(created?.deployId ? { deployId: created.deployId } : {}) },
-            };
-          }
-        } catch (error) {
-          if (error instanceof RenderApiError && error.rejected) {
-            await save({ ...record, bootstrap: undefined });
-            throw error;
-          }
-        }
-        await save(record);
-      }
-      service = await find(deployment, record);
+      service = created?.service ?? (await find(deployment, record));
       if (!service) throw new Error("Render app bootstrap is unconfirmed; retry to reconcile it");
       record = { ...record, serviceId: service.id };
       await save(record);
-      const history = await deployments(service);
-      const bootstrap = record.bootstrap!;
-      const deploy = history.find((d) =>
-        bootstrap.deployId ? d.id === bootstrap.deployId : !bootstrap.previousDeployIds.includes(d.id),
-      );
-      if (!deploy) throw new Error("Render app bootstrap is unconfirmed; retry to reconcile it");
-      if (deploy.status !== "live" && !FAILED.has(deploy.status))
-        await api.request("POST", `${path(service)}/deploys/${encodeURIComponent(deploy.id)}/cancel`);
-      await idle(service);
-      record = { ...record, bootstrap: undefined };
-      await save(record);
+    } else if (service.suspended === "suspended") {
+      const before = (await latest(service))?.id;
+      await api.request("PATCH", path(service), { ...source, serviceDetails: bootstrap });
+      await api.request("POST", `${path(service)}/resume`);
+      const deadline = Date.now() + timeout;
+      while ((await latest(service))?.id === before) {
+        if (Date.now() >= deadline) throw new Error("The resumed Render app has not started its deployment");
+        await sleep(Math.max(1, poll));
+      }
     }
-    const history = await idle(service);
+    await settle(service);
     await network.allowDatabaseAccess(service.id);
     const resources = await opts.resources.ensure(deployment.id);
     const artifact = await opts.artifacts.prepare(deployment, version);
@@ -423,13 +392,14 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     await api.request("PUT", `${path(service)}/env-vars`, envVars);
     await api.request("PUT", `${path(service)}/secret-files`, secretFiles);
     await api.request("PATCH", path(service), { ...source, serviceDetails: runtime });
+    const previousDeployId = (await latest(service))?.id;
     record = {
       ...record,
       pending: {
         version: version.version,
         runnerCommit: opts.source.commit,
         readinessNonce,
-        previousDeployIds: history.map((d) => d.id),
+        ...(previousDeployId ? { previousDeployId } : {}),
       },
     };
     await save(record);
@@ -467,7 +437,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         await opts.resources.suspend(deployment.id);
         await opts.artifacts.revoke(deployment.id);
-        await save({ ...record, suspended: true, pending: undefined, bootstrap: undefined });
+        await save({ ...record, suspended: true, pending: undefined });
       }),
     async logs(deployment, { tailLines }) {
       const record = await opts.store.get(deployment.id);

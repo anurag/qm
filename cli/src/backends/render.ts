@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -121,17 +121,6 @@ interface State {
   services: Record<string, SavedService>;
   pendingPurge?: boolean;
   dirtyServices?: string[];
-  bootstrapServices?: Record<
-    string,
-    {
-      env: string;
-      commit?: string;
-      previousDeployIds: string[];
-      deployId?: string;
-      requested?: boolean;
-      drained?: boolean;
-    }
-  >;
   pendingCreate?: string;
   release?: Record<string, string>;
   previousRelease?: Record<string, string>;
@@ -512,6 +501,9 @@ function publicUrl(service: RenderService): string {
     throw new CliError(`Render returned an invalid public address for ${service.name}`);
   return url.origin;
 }
+async function latestDeploy(request: RenderRequest, service: RenderService): Promise<RenderDeploy | undefined> {
+  return (await requestArray<{ deploy: RenderDeploy }>(request, `/services/${service.id}/deploys?limit=1`))[0]?.deploy;
+}
 async function waitDeploy(
   request: RenderRequest,
   service: RenderService,
@@ -522,7 +514,7 @@ async function waitDeploy(
   await poll(service.name, async () => {
     const deploy = id
       ? await request<RenderDeploy>(`/services/${service.id}/deploys/${id}`)
-      : (await requestArray<{ deploy: RenderDeploy }>(request, `/services/${service.id}/deploys?limit=1`))[0]?.deploy;
+      : await latestDeploy(request, service);
     if (!deploy || deploy.id === previousId) return false;
     id = deploy.id;
     if (failedDeployStatuses.includes(deploy.status))
@@ -545,104 +537,31 @@ async function idleDeploys(request: RenderRequest, service: RenderService): Prom
   });
   return history;
 }
-function bootstrapEnvKey(values: ReadonlyMap<string, string>): Buffer {
-  const secret = values.get("CORE_SIGNING_SECRET");
-  if (!secret) throw new CliError("CORE_SIGNING_SECRET is required to preserve Render bootstrap credentials");
-  return createHash("sha256").update(`qm-render-bootstrap-v1\0${secret}`).digest();
-}
-function sealBootstrapEnv(state: State, name: string, env: Record<string, string>, key: Buffer): string {
-  const nonce = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, nonce);
-  cipher.setAAD(Buffer.from(`${state.workspaceId}/${state.appPrefix}/${name}`));
-  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(env)), cipher.final()]);
-  return Buffer.concat([nonce, cipher.getAuthTag(), ciphertext]).toString("base64");
-}
-function openBootstrapEnv(state: State, name: string, key: Buffer): Record<string, string> | undefined {
-  const bootstrap = state.bootstrapServices?.[name];
-  if (!bootstrap) return undefined;
-  try {
-    const value = Buffer.from(bootstrap.env, "base64");
-    const decipher = createDecipheriv("aes-256-gcm", key, value.subarray(0, 12));
-    decipher.setAAD(Buffer.from(`${state.workspaceId}/${state.appPrefix}/${name}`));
-    decipher.setAuthTag(value.subarray(12, 28));
-    const env: unknown = JSON.parse(Buffer.concat([decipher.update(value.subarray(28)), decipher.final()]).toString());
-    if (
-      !env ||
-      typeof env !== "object" ||
-      Array.isArray(env) ||
-      Object.values(env).some((value) => typeof value !== "string")
-    )
-      throw new Error("Invalid bootstrap environment");
-    return env as Record<string, string>;
-  } catch {
-    throw new CliError(
-      `Cannot decrypt ${name} bootstrap credentials; restore the CORE_SIGNING_SECRET used when bootstrap started`,
-    );
-  }
-}
 async function prepareBootstrap(
-  ctx: DeployContext,
   request: RenderRequest,
-  state: State,
   workload: Workload,
   service: RenderService,
-  env: Record<string, string>,
-  key: Buffer,
 ): Promise<RenderService> {
-  if (!state.bootstrapServices?.[workload.name] && service.suspended !== "suspended") return service;
-  const bootstraps = (state.bootstrapServices ??= {});
-  if (!bootstraps[workload.name]) {
-    const history = await idleDeploys(request, service);
-    bootstraps[workload.name] = {
-      env: sealBootstrapEnv(state, workload.name, env, key),
-      commit: state.sourceCommit!,
-      previousDeployIds: history.map((deploy) => deploy.id),
-    };
-    saveState(ctx, state);
-  }
-  const bootstrap = bootstraps[workload.name]!;
-  if (bootstrap.drained) return service;
-  if (!bootstrap.requested || service.suspended === "suspended") {
-    await request(`/services/${service.id}/env-vars`, "PUT", []);
-    await request(`/services/${service.id}/secret-files`, "PUT", []);
-    await request(`/services/${service.id}`, "PATCH", {
-      autoDeploy: "no",
-      ...buildSource(workload),
-      serviceDetails: {
-        runtime: "docker",
-        envSpecificDetails: { ...dockerSettings(workload), dockerCommand: bootstrapCommand },
-      },
-    });
-    bootstrap.requested = true;
-    saveState(ctx, state);
-    try {
-      await request(`/services/${service.id}/resume`, "POST");
-    } catch (error) {
-      if (error instanceof RenderApiError && error.status >= 400 && error.status < 500 && error.status !== 408) {
-        delete bootstrap.requested;
-        saveState(ctx, state);
-      }
-      throw error;
-    }
-  }
-  await poll(`${service.name} bootstrap`, async () => {
-    const history = await list<RenderDeploy>(request, `/services/${service.id}/deploys`, "deploy");
-    const automatic = history.find((deploy) =>
-      bootstrap.deployId ? deploy.id === bootstrap.deployId : !bootstrap.previousDeployIds.includes(deploy.id),
-    );
-    if (!automatic) return false;
-    if (automatic.status !== "live" && !failedDeployStatuses.includes(automatic.status))
-      await request(`/services/${service.id}/deploys/${automatic.id}/cancel`, "POST");
-    await idleDeploys(request, service);
-    return true;
+  if (service.suspended !== "suspended") return service;
+  const before = (await latestDeploy(request, service))?.id;
+  await request(`/services/${service.id}`, "PATCH", {
+    autoDeploy: "no",
+    ...buildSource(workload),
+    serviceDetails: {
+      runtime: "docker",
+      envSpecificDetails: { ...dockerSettings(workload), dockerCommand: bootstrapCommand },
+    },
   });
-  bootstrap.drained = true;
-  saveState(ctx, state);
+  await request(`/services/${service.id}/resume`, "POST");
+  await poll(`${service.name} resume`, async () => (await latestDeploy(request, service))?.id !== before);
   return request<RenderService>(`/services/${service.id}`);
 }
 async function deploy(request: RenderRequest, service: RenderService, commit: string): Promise<void> {
+  if (service.suspended === "suspended") throw new CliError(`${service.name} must be resumed before deployment`);
+  const history = await list<RenderDeploy>(request, `/services/${service.id}/deploys`, "deploy");
+  for (const active of history.filter((item) => item.status !== "live" && !failedDeployStatuses.includes(item.status)))
+    await request(`/services/${service.id}/deploys/${active.id}/cancel`, "POST");
   const previousId = (await idleDeploys(request, service))[0]?.id;
-  if (service.suspended === "suspended") throw new CliError(`${service.name} must finish bootstrap before deployment`);
   const result = await request<{ id: string } | undefined>(`/services/${service.id}/deploys`, "POST", {
     clearCache: "do_not_clear",
     commitId: commit,
@@ -1046,44 +965,23 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         const [commit, ref] = remote.split(/\s+/);
         if (!commit || !/^[a-f0-9]{40}$/.test(commit) || ref !== `refs/heads/${source.branch}`)
           throw new CliError("Render Git source did not resolve to one branch commit");
-        const pendingCommits = new Set([
-          ...Object.entries(state.bootstrapServices ?? {}).flatMap(([name, bootstrap]) =>
-            bootstrap.commit && !bootstrap.drained && desired.some((item) => item.name === name)
-              ? [bootstrap.commit]
-              : [],
-          ),
-        ]);
-        if (pendingCommits.size > 1)
-          throw new CliError("Render bootstrap has conflicting source commits; restore the resource record");
-        state.sourceCommit = [...pendingCommits][0] ?? commit;
+        state.sourceCommit = commit;
         if (state.pendingPurge)
           throw new CliError("Render cleanup is incomplete; run qm down --purge before deployment");
         if (state.rollbackProgress)
           throw new CliError("Render rollback is incomplete; run qm rollback before deployment");
         const values = credentialValues(ctx);
         requireSecrets(ctx, values);
-        const bootstrapKey = bootstrapEnvKey(values);
-        for (const name of Object.keys(state.bootstrapServices ?? {})) openBootstrapEnv(state, name, bootstrapKey);
         await doctorCommon(ctx.config, values, { requiredSecretValues: true, configDir: ctx.configDir });
         const request = api(ctx);
         await request(`/owners/${state.workspaceId}`);
         await recoverPendingCreate(ctx, request, state);
-        const retired = [
-          ...new Set([...Object.keys(state.services), ...Object.keys(state.bootstrapServices ?? {})]),
-        ].filter((name) => !desired.some((item) => item.name === name));
+        const retired = Object.keys(state.services).filter((name) => !desired.some((item) => item.name === name));
         const bound = await inventory(ctx, request, state, false, retired);
         for (const name of retired) {
-          if (bound.services.has(name)) {
-            if (state.bootstrapServices?.[name]) delete state.bootstrapServices[name]!.commit;
-            continue;
-          }
+          if (bound.services.has(name)) continue;
           delete state.services[name];
-          if (state.bootstrapServices) delete state.bootstrapServices[name];
           state.dirtyServices = state.dirtyServices?.filter((item) => item !== name);
-        }
-        for (const workload of desired) {
-          const bootstrap = state.bootstrapServices?.[workload.name];
-          if (bootstrap && !bootstrap.drained) bootstrap.commit ??= state.sourceCommit;
         }
         saveState(ctx, state);
         state.updateInProgress = true;
@@ -1112,8 +1010,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         const envs = new Map<string, Record<string, string>>();
         for (const workload of desired) {
           let service = services.get(workload.name);
-          let env =
-            openBootstrapEnv(state, workload.name, bootstrapKey) ?? (service ? await envVars(request, service.id) : {});
+          let env = service ? await envVars(request, service.id) : {};
           if (!service) {
             const name = `${state.appPrefix}-${workload.name}`;
             await assertAvailable(request, "/services", "service", name, state.workspaceId);
@@ -1127,45 +1024,30 @@ export function createRenderBackend(ctx: DeployContext): Backend {
               services,
               env,
             );
-            state.bootstrapServices ??= {};
-            state.bootstrapServices[workload.name] ??= {
-              env: sealBootstrapEnv(state, workload.name, env, bootstrapKey),
-              commit: state.sourceCommit!,
-              previousDeployIds: [],
-              requested: true,
-            };
-            saveState(ctx, state);
-            const result = await createResource<{ service: RenderService; deployId: string }>(
-              ctx,
-              request,
-              state,
-              "/services",
-              {
-                type: workload.type,
-                name,
-                ownerId: state.workspaceId,
-                environmentId: state.environmentId,
-                ...buildSource(workload),
-                autoDeploy: "no",
-                envVars: [],
-                secretFiles: [],
-                serviceDetails: {
-                  runtime: "docker",
-                  plan: workload.plan,
-                  region: state.region,
-                  numInstances: 1,
-                  envSpecificDetails: { ...dockerSettings(workload), dockerCommand: bootstrapCommand },
-                  ...(workload.health ? { healthCheckPath: workload.health } : {}),
-                  ...(workload.diskSizeGB
-                    ? { disk: { name: "data", mountPath: "/data", sizeGB: workload.diskSizeGB } }
-                    : {}),
-                  ...(!workload.diskSizeGB ? { maxShutdownDelaySeconds: 300 } : {}),
-                },
+            const result = await createResource<{ service: RenderService }>(ctx, request, state, "/services", {
+              type: workload.type,
+              name,
+              ownerId: state.workspaceId,
+              environmentId: state.environmentId,
+              ...buildSource(workload),
+              autoDeploy: "no",
+              envVars: pairs(env),
+              secretFiles: [],
+              serviceDetails: {
+                runtime: "docker",
+                plan: workload.plan,
+                region: state.region,
+                numInstances: 1,
+                envSpecificDetails: { ...dockerSettings(workload), dockerCommand: bootstrapCommand },
+                ...(workload.health ? { healthCheckPath: workload.health } : {}),
+                ...(workload.diskSizeGB
+                  ? { disk: { name: "data", mountPath: "/data", sizeGB: workload.diskSizeGB } }
+                  : {}),
+                ...(!workload.diskSizeGB ? { maxShutdownDelaySeconds: 300 } : {}),
               },
-            );
+            });
             service = result.service;
             state.services[workload.name] = { id: service.id, name, type: workload.type };
-            state.bootstrapServices[workload.name]!.deployId = result.deployId;
             delete state.pendingCreate;
             state.dirtyServices = [...new Set([...(state.dirtyServices ?? []), workload.name])];
             saveState(ctx, state);
@@ -1192,7 +1074,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         for (const workload of desired) {
           let service = services.get(workload.name)!;
           const existing = envs.get(workload.name)!;
-          service = await prepareBootstrap(ctx, request, state, workload, service, existing, bootstrapKey);
+          service = await prepareBootstrap(request, workload, service);
           services.set(workload.name, service);
           const env = serviceEnv(
             ctx,
@@ -1215,12 +1097,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             env,
             await envVars(request, service.id),
           );
-          const latest = (
-            await requestArray<{ deploy: { id: string; status: string } }>(
-              request,
-              `/services/${service.id}/deploys?limit=1`,
-            )
-          )[0]?.deploy;
+          const latest = await latestDeploy(request, service);
           if (
             changed ||
             (!workload.diskSizeGB && workload.source) ||
@@ -1241,7 +1118,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
               "MinIO initialization",
               true,
             );
-          if (state.bootstrapServices) delete state.bootstrapServices[workload.name];
           state.dirtyServices = state.dirtyServices.filter((name) => name !== workload.name);
           saveState(ctx, state);
         }
@@ -1263,9 +1139,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         const release: Record<string, string> = {};
         for (const workload of desired.filter((item) => !item.diskSizeGB)) {
           const service = services.get(workload.name)!;
-          const current = (
-            await requestArray<{ deploy: RenderDeploy }>(request, `/services/${service.id}/deploys?limit=1`)
-          )[0]?.deploy;
+          const current = await latestDeploy(request, service);
           if (!current || current.status !== "live") throw new CliError(`${workload.name} has no live deployment`);
           release[workload.name] = current.id;
         }
@@ -1293,12 +1167,9 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       );
       if (bound.postgres) note(`postgres: ${bound.postgres.status} (${bound.postgres.id})`);
       for (const [name, service] of bound.services) {
-        const recent = await requestArray<{ deploy: { status: string } }>(
-          request,
-          `/services/${service.id}/deploys?limit=1`,
-        );
+        const recent = await latestDeploy(request, service);
         note(
-          `${name}: ${service.suspended}, ${recent[0]?.deploy.status ?? "no deploy"} (${service.id})${service.serviceDetails.url ? ` ${service.serviceDetails.url}` : ""}`,
+          `${name}: ${service.suspended}, ${recent?.status ?? "no deploy"} (${service.id})${service.serviceDetails.url ? ` ${service.serviceDetails.url}` : ""}`,
         );
       }
     },
@@ -1404,7 +1275,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           if (opts.purge) {
             if (service) await request(`/services/${saved.id}`, "DELETE");
             delete state.services[name];
-            if (state.bootstrapServices) delete state.bootstrapServices[name];
             saveState(ctx, state);
             ok(`${name}: deleted`);
           } else if (service && service.suspended !== "suspended") {
@@ -1415,7 +1285,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         if (opts.purge) {
           if (bound.postgres) await request(`/postgres/${bound.postgres.id}`, "DELETE");
           delete state.postgresId;
-          delete state.bootstrapServices;
           delete state.pendingPurge;
           delete state.dirtyServices;
           saveState(ctx, state);

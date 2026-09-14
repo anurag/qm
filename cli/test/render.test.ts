@@ -734,37 +734,34 @@ for (const status of ["live", "update_failed"]) {
   });
 }
 
-for (const [initial, terminal] of [
-  ["queued", "live"],
-  ["update_in_progress", "update_failed"],
-]) {
-  test(`Render waits for a previous ${initial} deploy before it submits an update`, async (t) => {
-    const d = deployment(t);
-    const c = cloud(t, d);
-    await d.backend.up({ dryRun: false });
-    const previous = c.deploys.get("srv-acme-core")!;
-    let reads = 0;
-    let triggered = false;
-    c.intercept = ({ path, method, url }) => {
-      if (path === "/services/srv-acme-core/deploys" && method === "GET" && !triggered) {
-        if (url.searchParams.get("limit") === "100") reads++;
-        return Response.json([
-          { deploy: previous },
-          { deploy: { id: "dep-active", status: reads < 2 ? initial : terminal } },
-        ]);
-      }
-      if (path === "/services/srv-acme-core/deploys" && method === "POST") {
-        assert.equal(reads, 2);
-        triggered = true;
-      }
-      return undefined;
-    };
-    d.ctx.config.render!.corePlan = "2c-4g";
-    await d.backend.up({ dryRun: false });
-    assert.equal(triggered, true);
-    assert.deepEqual(d.saved().dirtyServices, []);
-  });
-}
+test("Render cancels an active deploy before it submits an update", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const previous = c.deploys.get("srv-acme-core")!;
+  let canceled = false;
+  let triggered = false;
+  c.intercept = ({ path, method }) => {
+    if (path === "/services/srv-acme-core/deploys" && method === "GET" && !triggered)
+      return Response.json([
+        { deploy: previous },
+        { deploy: { id: "dep-active", status: canceled ? "canceled" : "update_in_progress" } },
+      ]);
+    if (path === "/services/srv-acme-core/deploys/dep-active/cancel" && method === "POST") {
+      canceled = true;
+      return new Response(null, { status: 204 });
+    }
+    if (path === "/services/srv-acme-core/deploys" && method === "POST") {
+      assert.equal(canceled, true);
+      triggered = true;
+    }
+    return undefined;
+  };
+  d.ctx.config.render!.corePlan = "2c-4g";
+  await d.backend.up({ dryRun: false });
+  assert.equal(triggered, true);
+  assert.deepEqual(d.saved().dirtyServices, []);
+});
 
 for (const failure of ["connection closed", "HTTP 503"]) {
   for (const path of ["/projects", "/postgres", "/services"]) {
@@ -803,7 +800,6 @@ for (const failure of ["connection closed", "HTTP 503"]) {
     c.intercept = undefined;
     await hostingProvider("render").createBackend(d.ctx).down({ purge: true });
     assert.equal(d.saved().pendingCreate, undefined);
-    assert.equal(d.saved().bootstrapServices, undefined);
     assert.equal(c.services.size, 0);
     assert.equal(c.database, undefined);
     writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"b".repeat(40)}' "$4"\n`);
@@ -1305,7 +1301,7 @@ test("Render resumes rollback to the last good release after a partial update", 
   assert.equal(d.saved().updateInProgress, undefined);
 });
 
-test("Render creates services without credentials and drains automatic builds before pinning", async (t) => {
+test("Render creates services with a no-op command and cancels the automatic build before pinning", async (t) => {
   const d = deployment(t);
   mkdirSync(join(d.ctx.configDir, "plugins", "reports"), { recursive: true });
   writeFileSync(join(d.ctx.configDir, "plugins", "reports", "Dockerfile"), "FROM node:24\n");
@@ -1314,21 +1310,19 @@ test("Render creates services without credentials and drains automatic builds be
   c.intercept = ({ path, method, body }) => {
     if (method === "POST" && path === "/services") {
       const create = body as {
-        envVars: unknown[];
+        envVars: Array<{ key: string }>;
         secretFiles: unknown[];
         serviceDetails: { envSpecificDetails: { dockerCommand: string } };
       };
-      assert.deepEqual(create.envVars, []);
+      assert.ok(create.envVars.some((pair) => pair.key === "PORT"));
       assert.deepEqual(create.secretFiles, []);
       assert.equal(create.serviceDetails.envSpecificDetails.dockerCommand, "/bin/sh -c exit 0");
     }
     const serviceId = path.split("/")[2]!;
     if (path.includes("/deploys/") && path.endsWith("/cancel")) {
       canceled.add(serviceId);
-      assert.deepEqual(c.envs.get(serviceId), {});
       assert.equal(c.deploys.get(serviceId)!.commit?.id, "b".repeat(40));
     }
-    if (method === "PUT" && path.endsWith("/env-vars")) assert.ok(canceled.has(serviceId));
     if (method === "POST" && path.endsWith("/deploys")) {
       assert.ok(canceled.has(serviceId));
       assert.equal((body as { commitId: string }).commitId, "a".repeat(40));
@@ -1339,10 +1333,9 @@ test("Render creates services without credentials and drains automatic builds be
   await d.backend.up({ dryRun: false });
   assert.equal(c.services.size, 5);
   assert.equal(canceled.size, 5);
-  assert.deepEqual(d.saved().bootstrapServices, {});
 });
 
-test("Render resumes safely and preserves encrypted credentials across an interrupted bootstrap", async (t) => {
+test("Render resumes a suspended service with a no-op command and keeps its credentials across an interrupted resume", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
@@ -1351,7 +1344,7 @@ test("Render resumes safely and preserves encrypted credentials across an interr
   let interrupted = false;
   c.intercept = ({ path, method }) => {
     if (path === "/services/srv-acme-minio/resume" && method === "POST") {
-      assert.deepEqual(c.envs.get("srv-acme-minio"), {});
+      assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
       assert.equal(
         c.services.get("srv-acme-minio")!.serviceDetails.envSpecificDetails.dockerCommand,
         "/bin/sh -c exit 0",
@@ -1365,7 +1358,6 @@ test("Render resumes safely and preserves encrypted credentials across an interr
   };
   await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
   const recorded = readFileSync(join(d.ctx.configDir, "render.resources.json"), "utf8");
-  assert.ok(d.saved().bootstrapServices.minio.env);
   for (const value of [storage.MINIO_ROOT_PASSWORD!, storage.QM_STORAGE_SECRET_KEY!, "e".repeat(64)])
     assert.ok(!recorded.includes(value));
   const mark = c.calls.length;
@@ -1374,26 +1366,9 @@ test("Render resumes safely and preserves encrypted credentials across an interr
   assert.equal(c.calls.slice(mark).filter((call) => call.path === "/services/srv-acme-minio/resume").length, 0);
   assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
   assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, storage.QM_STORAGE_SECRET_KEY);
-  assert.deepEqual(d.saved().bootstrapServices, {});
 });
 
-test("Render stops before API calls when the bootstrap encryption key changes", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  c.intercept = ({ path }) =>
-    path.includes("/deploys/") && path.endsWith("/cancel") ? new Response(null, { status: 500 }) : undefined;
-  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
-  const envPath = join(d.ctx.configDir, ".env");
-  writeFileSync(
-    envPath,
-    readFileSync(envPath, "utf8").replace(/^CORE_SIGNING_SECRET=.*$/m, `CORE_SIGNING_SECRET=${"f".repeat(64)}`),
-  );
-  const mark = c.calls.length;
-  await assert.rejects(d.backend.up({ dryRun: false }), /restore the CORE_SIGNING_SECRET used when bootstrap started/);
-  assert.equal(c.calls.length, mark);
-});
-
-test("Render keeps the initial source commit when an interrupted bootstrap resumes after the branch moves", async (t) => {
+test("Render deploys the current branch commit when an interrupted bootstrap retries after the branch moves", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
   c.intercept = ({ path }) =>
@@ -1405,13 +1380,13 @@ test("Render keeps the initial source commit when an interrupted bootstrap resum
   await d.backend.up({ dryRun: false });
   const pinned = c.calls.slice(mark).filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
   assert.equal(pinned.length, 4);
-  for (const call of pinned) assert.equal((call.body as { commitId: string }).commitId, "a".repeat(40));
-  assert.equal(d.saved().releaseCommit, "a".repeat(40));
-  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "a".repeat(40));
+  for (const call of pinned) assert.equal((call.body as { commitId: string }).commitId, "c".repeat(40));
+  assert.equal(d.saved().releaseCommit, "c".repeat(40));
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "c".repeat(40));
 });
 
 for (const resource of ["retained", "deleted", "not created"]) {
-  test(`Render ignores a retired plugin bootstrap when its service is ${resource}`, async (t) => {
+  test(`Render ignores an interrupted plugin bootstrap after the plugin is removed and its service is ${resource}`, async (t) => {
     const d = deployment(t);
     const c = cloud(t, d);
     await d.backend.up({ dryRun: false });
@@ -1428,10 +1403,6 @@ for (const resource of ["retained", "deleted", "not created"]) {
         : undefined;
     };
     await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
-    const bootstrap = d.saved().bootstrapServices.reports;
-    assert.equal(bootstrap.commit, "a".repeat(40));
-    assert.equal(bootstrap.drained, undefined);
-    delete bootstrap.commit;
     if (resource === "deleted") {
       c.services.delete("srv-acme-reports");
       c.envs.delete("srv-acme-reports");
@@ -1452,7 +1423,6 @@ for (const resource of ["retained", "deleted", "not created"]) {
       assert.equal(d.saved().releaseCommit, commit);
       assert.equal(d.saved().pendingCreate, undefined);
       assert.equal(Boolean(d.saved().services.reports), resource === "retained");
-      assert.deepEqual(d.saved().bootstrapServices.reports, resource === "retained" ? bootstrap : undefined);
       assert.equal(
         calls.some((call) => call.method !== "GET" && call.path.includes("srv-acme-reports")),
         false,
@@ -1463,13 +1433,8 @@ for (const resource of ["retained", "deleted", "not created"]) {
     const commit = "e".repeat(40);
     writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${commit}' "$4"\n`);
     const mark = c.calls.length;
-    c.intercept = ({ method }) => {
-      if (method !== "GET" && resource === "retained") assert.equal(d.saved().bootstrapServices.reports.commit, commit);
-      return undefined;
-    };
     await d.backend.up({ dryRun: false });
     const calls = c.calls.slice(mark);
-    assert.equal(d.saved().bootstrapServices.reports, undefined);
     assert.equal(d.saved().releaseCommit, commit);
     const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
     assert.deepEqual(
@@ -1484,51 +1449,6 @@ for (const resource of ["retained", "deleted", "not created"]) {
   });
 }
 
-test("Render joins a re-added plugin to a newer interrupted bootstrap", async (t) => {
-  const d = deployment(t);
-  const c = cloud(t, d);
-  await d.backend.up({ dryRun: false });
-  const reportsDir = join(d.ctx.configDir, "plugins", "reports");
-  mkdirSync(reportsDir, { recursive: true });
-  writeFileSync(join(reportsDir, "Dockerfile"), "FROM node:24\n");
-  c.intercept = ({ path }) => (path.endsWith("/cancel") ? new Response(null, { status: 503 }) : undefined);
-  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
-  const reportsEnv = d.saved().bootstrapServices.reports.env;
-  rmSync(reportsDir, { recursive: true });
-  const analyticsDir = join(d.ctx.configDir, "plugins", "analytics");
-  mkdirSync(analyticsDir, { recursive: true });
-  writeFileSync(join(analyticsDir, "Dockerfile"), "FROM node:24\n");
-  const commit = "b".repeat(40);
-  writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${commit}' "$4"\n`);
-  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
-  assert.equal(d.saved().bootstrapServices.reports.commit, undefined);
-  assert.equal(d.saved().bootstrapServices.analytics.commit, commit);
-  mkdirSync(reportsDir, { recursive: true });
-  writeFileSync(join(reportsDir, "Dockerfile"), "FROM node:24\n");
-  writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"e".repeat(40)}' "$4"\n`);
-  c.intercept = ({ method }) => {
-    if (method !== "GET" && d.saved().bootstrapServices.reports) {
-      assert.equal(d.saved().bootstrapServices.reports.commit, commit);
-      assert.equal(d.saved().bootstrapServices.reports.env, reportsEnv);
-    }
-    return undefined;
-  };
-  const mark = c.calls.length;
-  await hostingProvider("render").createBackend(d.ctx).up({ dryRun: false });
-  const calls = c.calls.slice(mark);
-  const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
-  assert.deepEqual(
-    deploys.map((call) => (call.body as { commitId: string }).commitId),
-    [commit, commit, commit, commit, commit],
-  );
-  assert.equal(
-    calls.some((call) => call.method === "POST" && call.path === "/services"),
-    false,
-  );
-  assert.deepEqual(d.saved().bootstrapServices, {});
-  assert.equal(d.saved().releaseCommit, commit);
-});
-
 test("Render retries a rejected resume without losing retained storage credentials", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
@@ -1538,11 +1458,9 @@ test("Render retries a rejected resume without losing retained storage credentia
   c.intercept = ({ path }) =>
     path === "/services/srv-acme-minio/resume" ? new Response(null, { status: 429 }) : undefined;
   await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 429/);
-  assert.equal(d.saved().bootstrapServices.minio.requested, undefined);
   c.intercept = undefined;
   await d.backend.up({ dryRun: false });
   assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, password);
-  assert.deepEqual(d.saved().bootstrapServices, {});
 });
 
 for (const failure of ["connection closed", "HTTP 503"]) {
@@ -1558,14 +1476,12 @@ for (const failure of ["connection closed", "HTTP 503"]) {
       return new Response(null, { status: 503 });
     };
     await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
-    assert.equal(d.saved().bootstrapServices.minio.requested, true);
     assert.equal(c.services.get("srv-acme-minio")!.suspended, "suspended");
     c.intercept = undefined;
     const backend = hostingProvider("render").createBackend(d.ctx);
     await backend.up({ dryRun: false });
     assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
     assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, storage.QM_STORAGE_SECRET_KEY);
-    assert.deepEqual(d.saved().bootstrapServices, {});
     assert.equal(c.calls.filter((call) => call.path === "/services/srv-acme-minio/resume").length, 2);
     await backend.down({ purge: true });
     assert.equal(c.services.size, 0);
