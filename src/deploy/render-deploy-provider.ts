@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
@@ -12,6 +12,12 @@ import { createRenderAppNetwork } from "./render-app-network.ts";
 const FAILED = new Set(["build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"]);
 const OWNER_MARKER = "QM_DEPLOYMENT_ID";
 const RENDER_APP_AUTH_HEADER = "x-qm-render-app-token";
+const GATEWAY_TOKEN_TTL_MS = 30 * 60_000;
+const GATEWAY_TOKEN_STEP_MS = 10 * 60_000;
+
+export function renderGatewayToken(secret: string, expiresAtMs: number): string {
+  return `${expiresAtMs}.${createHmac("sha256", secret).update(String(expiresAtMs)).digest("base64url")}`;
+}
 
 interface Service {
   id: string;
@@ -163,11 +169,12 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     const url = new URL(value);
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || url.pathname !== "/")
       throw new Error("Render app has an invalid HTTPS address");
+    const expiresAtMs = Math.ceil((Date.now() + GATEWAY_TOKEN_TTL_MS) / GATEWAY_TOKEN_STEP_MS) * GATEWAY_TOKEN_STEP_MS;
     return {
       host: url.hostname,
       port: 443,
       tls: true,
-      proxyHeaders: { [RENDER_APP_AUTH_HEADER]: record.token, connection: "close" },
+      proxyHeaders: { [RENDER_APP_AUTH_HEADER]: renderGatewayToken(record.token, expiresAtMs), connection: "close" },
     };
   }
 

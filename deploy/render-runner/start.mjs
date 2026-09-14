@@ -1,10 +1,10 @@
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { cp, lchown, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { chmod, cp, lchown, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, request, ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 const SHUTDOWN_GRACE_MS = 30_000;
 
@@ -89,6 +89,7 @@ export async function runRenderApp({
   )
     throw new Error("Invalid Render app readiness nonce");
   const entrypoint = await prepareRenderApp(manifestPath, appDir, env);
+  await chmod(manifestPath, 0o600).catch(() => rm(manifestPath, { force: true }).catch(() => undefined));
   const appEnv = { ...env, ...manifest.runtimeEnv, PORT: String(appPort) };
   delete appEnv.QM_RENDER_APP_TOKEN;
   const privileged = process.getuid?.() === 0;
@@ -233,10 +234,13 @@ export function createRenderAppGateway({
 }) {
   const authorized = (req) => {
     const value = req.headers["x-qm-render-app-token"];
+    if (typeof value !== "string") return false;
+    const [expiresAt, signature = ""] = value.split(".");
+    if (!/^[0-9]{1,15}$/.test(expiresAt) || Number(expiresAt) <= Date.now()) return false;
+    const expected = createHmac("sha256", token).update(expiresAt).digest("base64url");
     return (
-      typeof value === "string" &&
-      Buffer.byteLength(value) === Buffer.byteLength(token) &&
-      timingSafeEqual(Buffer.from(value), Buffer.from(token))
+      Buffer.byteLength(signature) === Buffer.byteLength(expected) &&
+      timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
     );
   };
   const options = (req) => {

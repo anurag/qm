@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, type AddressInfo } from "node:net";
@@ -21,6 +21,7 @@ import { createIdentityService } from "../src/identity/identity-service.ts";
 import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import { verifyDeployGitAccess } from "../src/deploy/access-token.ts";
+import { renderGatewayToken } from "../src/deploy/render-deploy-provider.ts";
 import { scopeId } from "../src/types.ts";
 import { createServer as createHttpServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
@@ -134,13 +135,18 @@ async function runUntilReadyThenExit(input: {
     for (;;) {
       signal.throwIfAborted();
       const response = await fetch(`http://127.0.0.1:${input.gatewayPort}/__qm_ready`, {
-        headers: { "x-qm-render-app-token": input.env.QM_RENDER_APP_TOKEN! },
+        headers: { "x-qm-render-app-token": renderGatewayToken(input.env.QM_RENDER_APP_TOKEN!, Date.now() + 60_000) },
         signal: AbortSignal.any([signal, AbortSignal.timeout(1_000)]),
       }).catch(() => null);
       await response?.body?.cancel();
       if (response?.status === 204) {
         assert.equal(response.headers.get("cache-control"), "no-store");
         assert.equal(response.headers.get("x-qm-render-app-ready"), manifest.readinessNonce ?? null);
+        const mode = await stat(input.manifestPath).then(
+          (info) => info.mode & 0o777,
+          () => null,
+        );
+        assert.ok(mode === null || mode === 0o600);
         return;
       }
       await delay(50, undefined, { signal });
@@ -154,7 +160,7 @@ async function runUntilReadyThenExit(input: {
       }),
     ]);
     const response = await fetch(`http://127.0.0.1:${input.gatewayPort}/__qa_exit`, {
-      headers: { "x-qm-render-app-token": input.env.QM_RENDER_APP_TOKEN! },
+      headers: { "x-qm-render-app-token": renderGatewayToken(input.env.QM_RENDER_APP_TOKEN!, Date.now() + 60_000) },
       signal: AbortSignal.timeout(10_000),
     });
     assert.equal(response.status, 200);
@@ -196,7 +202,7 @@ async function startApp(t: TestContext, appSource: string, entrypoint?: string) 
   });
   const request = (path: string) =>
     fetch(`http://127.0.0.1:${gatewayPort}${path}`, {
-      headers: { "x-qm-render-app-token": "a".repeat(43) },
+      headers: { "x-qm-render-app-token": renderGatewayToken("a".repeat(43), Date.now() + 60_000) },
       signal: AbortSignal.timeout(5_000),
     });
   await Promise.race([
@@ -400,21 +406,30 @@ test("Render private gateway rejects peer requests and removes its credential be
     ]);
   });
   const url = `http://127.0.0.1:${(gateway.address() as AddressInfo).port}`;
+  const valid = renderGatewayToken("a".repeat(43), Date.now() + 60_000);
+  const rejected = [
+    "other-app",
+    "a".repeat(43),
+    renderGatewayToken("a".repeat(43), Date.now() - 1),
+    renderGatewayToken("b".repeat(43), Date.now() + 60_000),
+    `${Date.now() + 60_000}.${valid.split(".")[1]!.slice(1)}`,
+  ];
   assert.equal((await fetch(url)).status, 403);
-  assert.equal((await fetch(url, { headers: { "x-qm-render-app-token": "other-app" } })).status, 403);
-  const response = await fetch(url, { headers: { "x-qm-render-app-token": "a".repeat(43) } });
+  for (const token of rejected)
+    assert.equal((await fetch(url, { headers: { "x-qm-render-app-token": token } })).status, 403);
+  const response = await fetch(url, { headers: { "x-qm-render-app-token": valid } });
   assert.equal(await response.text(), "application");
   assert.equal(tokenHeader, undefined);
-  for (const token of [undefined, "other-app", "a".repeat(43)]) {
+  for (const token of [undefined, ...rejected, valid]) {
     const response = await fetch(`${url}/__qm_ready`, {
       headers: token ? { "x-qm-render-app-token": token } : {},
     });
     assert.equal(response.status, 204);
     assert.equal(response.headers.get("cache-control"), "no-store");
-    assert.equal(response.headers.get("x-qm-render-app-ready"), token === "a".repeat(43) ? "n".repeat(43) : null);
+    assert.equal(response.headers.get("x-qm-render-app-ready"), token === valid ? "n".repeat(43) : null);
   }
   ready = false;
-  const unavailable = await fetch(`${url}/__qm_ready`, { headers: { "x-qm-render-app-token": "a".repeat(43) } });
+  const unavailable = await fetch(`${url}/__qm_ready`, { headers: { "x-qm-render-app-token": valid } });
   assert.equal(unavailable.status, 503);
   assert.equal(unavailable.headers.get("cache-control"), "no-store");
   assert.equal(unavailable.headers.get("x-qm-render-app-ready"), null);
@@ -555,21 +570,23 @@ test("Render gateway forwards WebSocket upgrades, both head buffers, and HTTP re
     application.close();
   });
   const gatewayPort = (gateway.address() as AddressInfo).port;
+  const valid = renderGatewayToken("a".repeat(43), Date.now() + 60_000);
   assert.match(await upgrade(t, gatewayPort), /^HTTP\/1.1 403 /);
+  assert.match(await upgrade(t, gatewayPort, "a".repeat(43)), /^HTTP\/1.1 403 /);
   ready = false;
-  assert.match(await upgrade(t, gatewayPort, "a".repeat(43)), /^HTTP\/1.1 503 /);
+  assert.match(await upgrade(t, gatewayPort, valid), /^HTTP\/1.1 503 /);
   ready = true;
-  const switched = await upgrade(t, gatewayPort, "a".repeat(43), "client-head", "echo:client-head");
+  const switched = await upgrade(t, gatewayPort, valid, "client-head", "echo:client-head");
   assert.match(switched, /^HTTP\/1.1 101 /);
   assert.ok(switched.includes("server-head"));
   assert.equal(forwardedToken, undefined);
   reject = true;
-  const denied = await upgrade(t, gatewayPort, "a".repeat(43));
+  const denied = await upgrade(t, gatewayPort, valid);
   assert.match(denied, /^HTTP\/1.1 401 /);
   assert.match(denied, /www-authenticate: Bearer/i);
   assert.ok(denied.endsWith("denied"));
   await new Promise<void>((resolve) => application.close(() => resolve()));
-  assert.match(await upgrade(t, gatewayPort, "a".repeat(43)), /^HTTP\/1.1 502 /);
+  assert.match(await upgrade(t, gatewayPort, valid), /^HTTP\/1.1 502 /);
 });
 
 test("Render gateway keeps proxying after clients disconnect mid-request", { timeout: 15_000 }, async (t) => {
@@ -617,14 +634,14 @@ test("Render gateway keeps proxying after clients disconnect mid-request", { tim
           WebSocket: "Connection: Upgrade\r\nUpgrade: websocket\r\n",
         }[kind];
         client.write(
-          `${body ? "POST" : "GET"} /abort HTTP/1.1\r\nHost: localhost\r\nx-qm-render-app-token: ${"a".repeat(43)}\r\n${headers}\r\n${body ? "x" : ""}`,
+          `${body ? "POST" : "GET"} /abort HTTP/1.1\r\nHost: localhost\r\nx-qm-render-app-token: ${renderGatewayToken("a".repeat(43), Date.now() + 60_000)}\r\n${headers}\r\n${body ? "x" : ""}`,
         );
       });
       await started.promise;
       client.destroy();
       await closed.promise;
       const response = await fetch(`http://127.0.0.1:${gatewayPort}/`, {
-        headers: { "x-qm-render-app-token": "a".repeat(43) },
+        headers: { "x-qm-render-app-token": renderGatewayToken("a".repeat(43), Date.now() + 60_000) },
       });
       assert.equal(response.status, 200);
       assert.equal(await response.text(), "ready");
@@ -676,7 +693,11 @@ test("Render gateway flushes WebSocket close frames to a slow client", { timeout
   gateway.emit(
     "upgrade",
     {
-      headers: { "x-qm-render-app-token": "a".repeat(43), connection: "Upgrade", upgrade: "websocket" },
+      headers: {
+        "x-qm-render-app-token": renderGatewayToken("a".repeat(43), Date.now() + 60_000),
+        connection: "Upgrade",
+        upgrade: "websocket",
+      },
       method: "GET",
       url: "/socket",
     },
