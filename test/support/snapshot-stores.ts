@@ -24,6 +24,7 @@ export function instrumentedSnapshotStore(): InstrumentedSnapshotStore {
         puts++;
         await inner.put(scope, data);
       },
+      delete: (scope) => inner.delete(scope),
       createUpload: async (scope) => {
         if (writesFail) throw outage();
         const upload = await inner.createUpload(scope);

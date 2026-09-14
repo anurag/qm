@@ -76,6 +76,7 @@ function recordingStore(): { store: HomeSnapshotStore; parts: number[]; complete
   rec.store = {
     open: (s) => inner.open(s),
     put: (s, d) => inner.put(s, d),
+    delete: (s) => inner.delete(s),
     createUpload: async (s): Promise<SnapshotUpload> => {
       const upload = await inner.createUpload(s);
       return {

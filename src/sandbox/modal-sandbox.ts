@@ -485,6 +485,7 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
         if (!(error instanceof ModalSandboxGoneError)) throw error;
       }
     }
+    await snapshots.delete(scope);
     await store.delete(scope);
     sessionByName.delete(name);
     scopeByName.delete(name);

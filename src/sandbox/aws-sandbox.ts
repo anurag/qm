@@ -1,4 +1,4 @@
-import { DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { S3Client } from "@aws-sdk/client-s3";
 import { orgId as configOrgId } from "../config.ts";
 import type { WorkspaceLayer } from "../types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
@@ -174,12 +174,13 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
     await client.ensureRunning(id, await resolveEndpoint(id));
   }
 
+  const snapshots = createS3SnapshotStore({ bucket: opts.s3Bucket, prefix: s3Prefix, s3, keyFor: s3KeyFor });
   const homeSnapshots = createHomeSnapshotOps<string>({
     label: "aws",
     homeDir: HOME_DIR,
     homeTarPath: HOME_TAR,
     prunePaths: [...SNAPSHOT_PRUNE, ...ephemeralCredLinkPaths(credentialPaths).map(({ rel }) => `./${rel}`)],
-    store: createS3SnapshotStore({ bucket: opts.s3Bucket, prefix: s3Prefix, s3, keyFor: s3KeyFor }),
+    store: snapshots,
     io: {
       runCommand: async (id, script, timeoutMs) => {
         const r = await execRaw(id, script, Math.ceil(timeoutMs / 1000));
@@ -391,7 +392,7 @@ export function createAwsSandbox(workspace: WorkspaceStore, opts: AwsSandboxOpti
       const id = expectedId ?? stored?.microvmId;
       if (id) await terminateBody(id);
       if (!expectedId || !stored || stored.microvmId === expectedId) {
-        await s3.send(new DeleteObjectCommand({ Bucket: opts.s3Bucket, Key: s3KeyFor(scopeId) }));
+        await snapshots.delete(scopeId);
         await store.delete(scopeId);
       }
       if (id) {

@@ -306,6 +306,7 @@ export function createE2bSandbox(workspace: WorkspaceStore, opts: E2bSandboxOpti
         if (!(error instanceof E2bSandboxGoneError)) throw error;
       }
     }
+    await snapshots.delete(scope);
     await store.delete(scope);
     sessionByName.delete(name);
     scopeByName.delete(name);

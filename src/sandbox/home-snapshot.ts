@@ -4,6 +4,7 @@ import {
   CompleteMultipartUploadCommand,
   CopyObjectCommand,
   CreateMultipartUploadCommand,
+  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -63,6 +64,7 @@ interface StoredSnapshot {
 export interface HomeSnapshotStore {
   open(scope: string): Promise<StoredSnapshot | null>;
   put(scope: string, data: Uint8Array): Promise<void>;
+  delete(scope: string): Promise<void>;
   createUpload(scope: string): Promise<SnapshotUpload>;
   adoptFromS3?(scope: string, ref: { bucket: string; key: string }): Promise<void>;
 }
@@ -87,6 +89,9 @@ export function createMemorySnapshotStore(): HomeSnapshotStore {
     },
     put: async (scope, data) => {
       map.set(scope, data);
+    },
+    delete: async (scope) => {
+      map.delete(scope);
     },
     createUpload: async (scope) => {
       const parts: Uint8Array[] = [];
@@ -129,6 +134,9 @@ export function createS3SnapshotStore(opts: S3SnapshotStoreOptions): HomeSnapsho
     },
     async put(scope, data): Promise<void> {
       await s3.send(new PutObjectCommand({ Bucket, Key: keyFor(scope), Body: data }));
+    },
+    async delete(scope): Promise<void> {
+      await s3.send(new DeleteObjectCommand({ Bucket, Key: keyFor(scope) }));
     },
     async createUpload(scope): Promise<SnapshotUpload> {
       const Key = keyFor(scope);

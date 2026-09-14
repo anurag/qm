@@ -1,4 +1,5 @@
 import { pollProcess } from "../src/sandbox/process-poll.ts";
+import { createMemorySnapshotStore } from "../src/sandbox/home-snapshot.ts";
 import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
@@ -798,10 +799,13 @@ test("destroyScope deletes expired native state without provisioning and retains
     hydrationPending: true,
   };
   await store.put(scope, record);
+  const snapshots = createMemorySnapshotStore();
+  await snapshots.put(scope, new Uint8Array([1]));
   const deleted: string[] = [];
   let fail = true;
   const backend = make({
     store,
+    snapshots,
     client: {
       ...fake.client,
       async create() {
@@ -822,10 +826,12 @@ test("destroyScope deletes expired native state without provisioning and retains
   });
   await assert.rejects(backend.destroyScope!(scope), /temporarily unavailable/);
   assert.deepEqual(await store.get(scope), record);
+  assert.ok(await snapshots.open(scope));
   fail = false;
   await backend.destroyScope!(scope);
   await backend.destroyScope!(scope);
   assert.equal(await store.get(scope), null);
+  assert.equal(await snapshots.open(scope), null);
   assert.deepEqual(deleted, ["expired-machine", "expired-machine"]);
 });
 

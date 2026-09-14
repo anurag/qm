@@ -9,7 +9,6 @@ import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/re
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { S3Client } from "@aws-sdk/client-s3";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
-import { createRenderSnapshotStore } from "./sandbox/render-snapshot-store.ts";
 import { createRenderSandbox, type StoredRenderSandbox } from "./sandbox/render-sandbox.ts";
 import { createSdkRenderClient } from "./sandbox/render-client.ts";
 import { createRuntimeService } from "./harness/runtime-control.ts";
@@ -945,7 +944,7 @@ export function buildApp(
       }),
       ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
       store: renderBodies,
-      snapshots: createRenderSnapshotStore({
+      snapshots: createS3SnapshotStore({
         bucket: config.s3Bucket,
         prefix: `${config.s3Prefix ?? ""}render-home`,
         s3,
