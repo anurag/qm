@@ -72,16 +72,30 @@ export function createRenderAppNetwork(opts: {
       }
       const project = await api.request<{ owner: { id: string } }>("GET", `/projects/${opts.projectId}`);
       if (project?.owner.id !== opts.workspaceId) throw new Error("Render project belongs to another workspace");
-      const query = new URLSearchParams({ projectId: opts.projectId, name: opts.name(deployment), limit: "100" });
-      const found = (await api.request<Array<{ environment: Environment }>>("GET", `/environments?${query}`)) ?? [];
-      const matches = found.filter(({ environment }) => environment.name === opts.name(deployment));
+      const matches: Environment[] = [];
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      do {
+        const query = new URLSearchParams({ projectId: opts.projectId, name: opts.name(deployment), limit: "100" });
+        if (cursor) query.set("cursor", cursor);
+        const found = await api.request<Array<{ environment: Environment; cursor?: string }>>(
+          "GET",
+          `/environments?${query}`,
+        );
+        if (!Array.isArray(found)) throw new Error("Render returned an invalid app environment list");
+        matches.push(
+          ...found.map(({ environment }) => environment).filter((env) => env.name === opts.name(deployment)),
+        );
+        if (found.length < 100) break;
+        cursor = found.at(-1)?.cursor;
+        if (!cursor || cursors.has(cursor)) throw new Error("Render environment pagination did not advance");
+        cursors.add(cursor);
+      } while (cursor);
       if (matches.length > 1) throw new Error("Render app environment identity is ambiguous");
-      let environment = matches[0]?.environment;
+      let environment = matches[0];
       if (environment && !record.environmentCreatePending)
         throw new Error("An untracked Render environment has this app's name");
       if (!environment) {
-        if (record.environmentCreatePending)
-          throw new Error("Render app environment creation is unconfirmed; retry after it appears");
         record = { ...record, environmentCreatePending: true };
         await opts.store.put(record.deploymentId, record);
         try {

@@ -17,6 +17,12 @@ import { scopeId } from "../src/types.ts";
 import { loadConfig } from "../src/config.ts";
 
 const sha = "a".repeat(40);
+const writePaths = {
+  environment: "/environments",
+  create: "/services",
+  resume: "/services/srv-app/resume",
+  deploy: "/services/srv-app/deploys",
+};
 
 function fixture(appRegion?: string) {
   const store = createMemoryMap<StoredRenderDeploy>();
@@ -28,6 +34,7 @@ function fixture(appRegion?: string) {
   let outcome = "live";
   let loseCreate = false;
   let loseUpdate = false;
+  let failure: { method: string; path: string; status?: number } | undefined;
   let activeEnv: any[] = [];
   let manifestNonce: string | undefined;
   let readinessNonce: string | null | undefined;
@@ -73,6 +80,12 @@ function fixture(appRegion?: string) {
       const path = `${url.pathname}${url.search}`.replace(/^\/v1/, "");
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ method, path, body });
+      if (failure?.method === method && path.startsWith(failure.path)) {
+        const status = failure.status;
+        failure = undefined;
+        if (status) return response(undefined, status);
+        throw new TypeError("connection lost before write");
+      }
       if (url.hostname === "qm-private") {
         const nonce = readinessNonce === undefined ? manifestNonce : readinessNonce;
         return new Response(null, { status: 204, headers: nonce ? { "x-qm-render-app-ready": nonce } : {} });
@@ -173,6 +186,9 @@ function fixture(appRegion?: string) {
     provider,
     data,
     deployment,
+    failNextRequest(method: string, path: string, status?: number) {
+      failure = { method, path, status };
+    },
     get resourceSuspended() {
       return resourceSuspended;
     },
@@ -327,6 +343,109 @@ test("Render recovers create and update replies without a duplicate service or d
   assert.equal(f.calls.filter((c) => c.method === "POST" && c.path === "/services/srv-app/deploys").length, 2);
   assert.equal((await f.store.get(f.deployment.id))!.liveVersion, 2);
 });
+
+for (const status of [undefined, 503]) {
+  for (const operation of ["environment", "create", "resume", "deploy"] as const) {
+    test(`Render retries ${operation} after ${status ?? "connection loss"} before the write and can archive`, async () => {
+      const f = fixture();
+      const d = f.deployment;
+      const v1 = d.versions[0]!;
+      const path = writePaths[operation];
+      if (operation === "deploy" || operation === "resume") {
+        d.endpoint = await f.provider.apply(d, v1);
+        d.status = "running";
+        d.appliedVersion = 1;
+        if (operation === "resume") await f.provider.destroy(d);
+      }
+      const version = operation === "deploy" ? { ...v1, version: 2 } : v1;
+      const posts = () => f.calls.filter((call) => call.method === "POST" && call.path === path);
+      const before = posts().length;
+      f.data.set("retained", "value");
+      f.failNextRequest("POST", path, status);
+      await assert.rejects(f.provider.apply(d, version), /503|connection lost|bootstrap is unconfirmed/);
+      assert.equal(posts().length, before + 1);
+      const restarted = f.restart(operation === "deploy" ? "c".repeat(40) : sha);
+      await restarted.apply(d, version);
+      assert.equal(posts().length, before + 2);
+      if (operation === "deploy") assert.equal(posts().at(-1)!.body.commitId, sha);
+      await restarted.destroy(d);
+      assert.equal(posts().length, before + 2);
+      assert.equal(f.resourceSuspended, true);
+      const record = (await f.store.get(d.id))!;
+      assert.equal(record.suspended, true);
+      assert.equal(record.pending, undefined);
+      assert.equal(record.bootstrap, undefined);
+      assert.equal(f.data.get("retained"), "value");
+    });
+  }
+}
+
+for (const outcome of ["not_submitted", "build_in_progress", "old_instance"]) {
+  test(`Render can archive and restore when a deployment is ${outcome}`, async () => {
+    const f = fixture();
+    const d = f.deployment;
+    const v1 = d.versions[0]!;
+    d.endpoint = await f.provider.apply(d, v1);
+    d.status = "running";
+    d.appliedVersion = 1;
+    if (outcome === "not_submitted") f.failNextRequest("POST", "/services/srv-app/deploys");
+    else if (outcome === "build_in_progress") f.outcome = outcome;
+    else f.readinessNonce = f.manifestNonce;
+    await assert.rejects(f.provider.apply(d, { ...v1, version: 2 }), /connection lost|unconfirmed/);
+    const pending = (await f.store.get(d.id))!.pending;
+    assert.ok(pending);
+    const before = f.calls.length;
+    const restarted = f.restart(sha);
+    await restarted.destroy(d);
+    assert.equal(f.resourceSuspended, true);
+    assert.equal((await f.store.get(d.id))!.pending, undefined);
+    assert.equal((await f.store.get(d.id))!.suspended, true);
+    assert.equal(
+      f.calls.slice(before).some((call) => call.path.includes("/deploys")),
+      false,
+    );
+    f.finishPending();
+    f.outcome = "live";
+    f.readinessNonce = undefined;
+    await restarted.apply(d, v1);
+    assert.equal(f.resourceSuspended, false);
+    assert.equal((await f.store.get(d.id))!.suspended, false);
+  });
+}
+
+test("Render retains pending state when archive cannot confirm suspension", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  await f.provider.apply(d, v1);
+  f.failNextRequest("POST", "/services/srv-app/deploys");
+  await assert.rejects(f.provider.apply(d, { ...v1, version: 2 }), /connection lost/);
+  const pending = (await f.store.get(d.id))!.pending;
+  f.failNextRequest("POST", "/services/srv-app/suspend", 503);
+  await assert.rejects(f.provider.destroy(d), /503/);
+  assert.deepEqual((await f.store.get(d.id))!.pending, pending);
+  assert.equal((await f.store.get(d.id))!.suspended, false);
+  assert.equal(f.resourceSuspended, false);
+  await f.restart(sha).destroy(d);
+  assert.equal((await f.store.get(d.id))!.pending, undefined);
+});
+
+for (const status of [undefined, 200])
+  test(`Render does not submit again after a ${status ?? "failed"} reconciliation response`, async () => {
+    for (const operation of ["environment", "create", "deploy"] as const) {
+      const f = fixture();
+      const d = f.deployment;
+      const v1 = d.versions[0]!;
+      if (operation === "deploy") await f.provider.apply(d, v1);
+      const path = writePaths[operation];
+      f.failNextRequest("POST", path);
+      await assert.rejects(f.provider.apply(d, { ...v1, version: 2 }), /connection lost|bootstrap is unconfirmed/);
+      const posts = f.calls.filter((call) => call.method === "POST").length;
+      f.failNextRequest("GET", `${path}?`, status);
+      await assert.rejects(f.restart(sha).apply(d, { ...v1, version: 2 }), /connection lost|invalid app/);
+      assert.equal(f.calls.filter((call) => call.method === "POST").length, posts);
+    }
+  });
 
 test("A failed Render update keeps the live endpoint and does not suspend retained resources", async () => {
   const f = fixture();

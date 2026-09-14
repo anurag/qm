@@ -192,7 +192,6 @@ test("Failed Render storage transitions retain intent so cleanup and retry repai
 test("Uncertain Render storage submissions reconcile across restarts before the opposite operation", async () => {
   const store = createMemoryMap<StoredRenderAppStorage>();
   const jobs: Array<{ id: string; serviceId: string; startCommand: string; status: string }> = [];
-  let visible = false;
   let enabled = false;
   let pages = 0;
   const api: RenderApi = {
@@ -213,7 +212,6 @@ test("Uncertain Render storage submissions reconcile across restarts before the 
         return job as T;
       }
       if (path.startsWith("/services/srv-minio/jobs?")) {
-        if (!visible) return [] as T;
         pages++;
         const query = new URL(`https://render.test${path}`).searchParams;
         if (!query.has("cursor"))
@@ -247,10 +245,6 @@ test("Uncertain Render storage submissions reconcile across restarts before the 
   const submission = (await store.get(id))!.jobRequest;
   assert.match(submission!.commandHash, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(await store.get(id)).includes(jobs[0]!.startCommand), false);
-  await assert.rejects(createRenderAppStorage(opts).suspend(id), /submission is still unconfirmed/);
-  assert.equal(jobs.length, 1);
-  assert.deepEqual((await store.get(id))!.jobRequest, submission);
-  visible = true;
   await assert.rejects(createRenderAppStorage(opts).suspend(id), /job-1 is still pending/);
   assert.equal(pages, 2);
   assert.equal(jobs.length, 1);
@@ -305,3 +299,139 @@ test("Rejected Render storage submissions retain repair intent and allow a new j
   assert.equal(jobs, 1);
   assert.equal((await store.get(id))!.enabled, true);
 });
+
+for (const failure of ["503", "connection"])
+  for (const failedOperation of ["enable", "disable"] as const)
+    for (const nextOperation of ["enable", "disable"] as const)
+      test(`Render storage recovers ${failedOperation} lost before creation (${failure}) with ${nextOperation} after restart`, async () => {
+        const store = createMemoryMap<StoredRenderAppStorage>();
+        const events: string[] = [];
+        let fail = false;
+        let enabled = false;
+        let userExists = false;
+        let jobs = 0;
+        const api: RenderApi = {
+          async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+            if (path === "/services/srv-minio")
+              return { ownerId: "tea-test", environmentId: "env-test", type: "web_service" } as T;
+            if (method === "POST") {
+              const script = Buffer.from(
+                (body as { startCommand: string }).startCommand.split(" ")[4]!,
+                "base64",
+              ).toString();
+              const operation = script.includes("admin user disable") ? "disable" : "enable";
+              events.push(`POST ${operation}`);
+              if (fail) {
+                if (failure === "503") throw new RenderApiError(method, path, 503);
+                throw new Error("Connection closed before job creation");
+              }
+              if (operation === "disable") assert.equal(userExists, true);
+              else userExists = true;
+              enabled = operation === "enable";
+              return { id: `job-${++jobs}` } as T;
+            }
+            if (path.startsWith("/services/srv-minio/jobs?")) {
+              events.push("LIST");
+              return [] as T;
+            }
+            return { status: "succeeded" } as T;
+          },
+        };
+        const opts = {
+          apiKey: "key",
+          workspaceId: "tea-test",
+          environmentId: "env-test",
+          minioServiceId: "srv-minio",
+          endpoint: "http://localhost:9000",
+          bucket: "qm-storage",
+          store,
+          keyMaterial: "test-key",
+          api,
+        };
+        const id = randomUUID();
+        const storage = createRenderAppStorage(opts);
+        const initial = failedOperation === "disable" ? await storage.ensure(id) : undefined;
+        fail = true;
+        await assert.rejects(
+          failedOperation === "enable" ? storage.ensure(id) : storage.suspend(id),
+          /HTTP 503|Connection closed/,
+        );
+        const pending = (await store.get(id))!;
+        assert.ok(pending.jobRequest);
+        assert.equal(pending.operation, failedOperation);
+        const acceptedBeforeRetry = jobs;
+        fail = false;
+        events.length = 0;
+        const restarted = createRenderAppStorage(opts);
+        const result = nextOperation === "enable" ? await restarted.ensure(id) : await restarted.suspend(id);
+        const final = (await store.get(id))!;
+        const replay = failedOperation !== nextOperation ? [`POST ${failedOperation}`] : [];
+        assert.deepEqual(events, ["LIST", ...replay, `POST ${nextOperation}`]);
+        assert.equal(jobs, acceptedBeforeRetry + replay.length + 1);
+        assert.equal(enabled, nextOperation === "enable");
+        assert.equal(final.enabled, enabled);
+        assert.equal(final.operation, undefined);
+        assert.equal(final.jobRequest, undefined);
+        assert.equal(final.jobId, undefined);
+        assert.equal(final.accessKey, pending.accessKey);
+        assert.equal(final.secretKeyEnc, pending.secretKeyEnc);
+        if (initial && result) assert.deepEqual(result, initial);
+      });
+
+for (const failure of ["request", "missing cursor", "repeated cursor", "invalid list"])
+  test(`Render storage keeps unconfirmed writes after a job search ${failure}`, async () => {
+    const store = createMemoryMap<StoredRenderAppStorage>();
+    let posts = 0;
+    let pages = 0;
+    let searchFails = true;
+    const api: RenderApi = {
+      async request<T>(method: string, path: string): Promise<T> {
+        if (path === "/services/srv-minio")
+          return { ownerId: "tea-test", environmentId: "env-test", type: "web_service" } as T;
+        if (method === "POST") {
+          if (++posts === 1) throw new RenderApiError(method, path, 503);
+          return { id: "job-retry" } as T;
+        }
+        if (path.startsWith("/services/srv-minio/jobs?")) {
+          pages++;
+          if (!searchFails) return [] as T;
+          const cursor = new URL(`https://render.test${path}`).searchParams.get("cursor");
+          if (cursor) {
+            if (failure === "request") throw new RenderApiError(method, path, 503);
+            if (failure === "invalid list") return null as T;
+          }
+          return Array.from({ length: 100 }, (_, index) => ({
+            job: { id: `unrelated-${index}`, serviceId: "srv-minio", startCommand: "unrelated" },
+            ...(failure === "missing cursor" ? {} : { cursor: `cursor-${index}` }),
+          })) as T;
+        }
+        return { status: "succeeded" } as T;
+      },
+    };
+    const opts = {
+      apiKey: "key",
+      workspaceId: "tea-test",
+      environmentId: "env-test",
+      minioServiceId: "srv-minio",
+      endpoint: "http://localhost:9000",
+      bucket: "qm-storage",
+      store,
+      keyMaterial: "test-key",
+      api,
+    };
+    const id = randomUUID();
+    await assert.rejects(createRenderAppStorage(opts).ensure(id), /HTTP 503/);
+    const pending = structuredClone(await store.get(id));
+    await assert.rejects(
+      createRenderAppStorage(opts).suspend(id),
+      /HTTP 503|omitted.*cursor|repeated.*cursor|invalid.*list/,
+    );
+    assert.equal(posts, 1);
+    assert.equal(pages, failure === "missing cursor" ? 1 : 2);
+    assert.deepEqual(await store.get(id), pending);
+    searchFails = false;
+    await createRenderAppStorage(opts).suspend(id);
+    assert.equal(posts, 3);
+    assert.equal((await store.get(id))!.enabled, false);
+    assert.equal((await store.get(id))!.jobRequest, undefined);
+  });

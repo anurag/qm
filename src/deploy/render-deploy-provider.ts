@@ -157,7 +157,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         limit: "100",
         ...(cursor ? { cursor } : {}),
       });
-      const page = (await api.request<Array<{ service: Service; cursor?: string }>>("GET", `/services?${query}`)) ?? [];
+      const page = await api.request<Array<{ service: Service; cursor?: string }>>("GET", `/services?${query}`);
+      if (!Array.isArray(page)) throw new Error("Render returned an invalid app service list");
       const service = page.find((row) => row.service.name === name(deployment))?.service;
       if (service) return owned(service, deployment);
       if (page.length < 100) return null;
@@ -174,9 +175,11 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     const cursors = new Set<string>();
     for (;;) {
       const query = new URLSearchParams({ limit: "100", ...(cursor ? { cursor } : {}) });
-      const page =
-        (await api.request<Array<{ deploy: Deploy; cursor?: string }>>("GET", `${path(service)}/deploys?${query}`)) ??
-        [];
+      const page = await api.request<Array<{ deploy: Deploy; cursor?: string }>>(
+        "GET",
+        `${path(service)}/deploys?${query}`,
+      );
+      if (!Array.isArray(page)) throw new Error("Render returned an invalid app deployment list");
       result.push(...page.map((row) => row.deploy));
       if (page.length < 100) return result;
       const next = page.at(-1)?.cursor;
@@ -234,11 +237,27 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         if (!record.pending) return { service, record };
         if (!record.pending.deployId) {
-          const found = (await deployments(service)).find((d) => !record.pending!.previousDeployIds.includes(d.id));
-          if (found) {
-            record = { ...record, pending: { ...record.pending, deployId: found.id } };
-            await save(record);
+          const submitted = async () =>
+            (await deployments(service)).find((d) => !record.pending!.previousDeployIds.includes(d.id));
+          let found = await submitted();
+          if (!found) {
+            try {
+              found =
+                (await api.request<Deploy>("POST", `${path(service)}/deploys`, {
+                  commitId: record.pending.runnerCommit,
+                })) ?? undefined;
+            } catch (error) {
+              if (error instanceof RenderApiError && error.status < 500 && error.status !== 408) {
+                await save({ ...record, pending: undefined });
+                throw error;
+              }
+              found = await submitted();
+              if (!found) throw error;
+            }
           }
+          if (!found?.id) throw new Error("Render did not return an app deployment ID");
+          record = { ...record, pending: { ...record.pending, deployId: found.id } };
+          await save(record);
         }
         if (record.pending?.deployId) {
           const deploy = await api.request<Deploy>(
@@ -316,7 +335,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         record = { ...record, bootstrap: { previousDeployIds: history.map((d) => d.id) } };
         await save(record);
       }
-      if (!record.bootstrap?.requested) {
+      if (!record.bootstrap?.requested || !service || service.suspended === "suspended") {
         const envVars = [{ key: OWNER_MARKER, value: deployment.id }];
         const serviceDetails = {
           ...runtime,
@@ -362,29 +381,19 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         await save(record);
       }
-      const deadline = Date.now() + timeout;
-      let confirmed = false;
-      while (Date.now() < deadline) {
-        service = await find(deployment, record);
-        if (service) {
-          record = { ...record, serviceId: service.id };
-          await save(record);
-          const history = await deployments(service);
-          const bootstrap = record.bootstrap!;
-          const deploy = history.find((d) =>
-            bootstrap.deployId ? d.id === bootstrap.deployId : !bootstrap.previousDeployIds.includes(d.id),
-          );
-          if (deploy) {
-            if (deploy.status !== "live" && !FAILED.has(deploy.status))
-              await api.request("POST", `${path(service)}/deploys/${encodeURIComponent(deploy.id)}/cancel`);
-            await idle(service);
-            confirmed = true;
-            break;
-          }
-        }
-        await sleep(Math.max(1, poll));
-      }
-      if (!service || !confirmed) throw new Error("Render app bootstrap is unconfirmed; retry to reconcile it");
+      service = await find(deployment, record);
+      if (!service) throw new Error("Render app bootstrap is unconfirmed; retry to reconcile it");
+      record = { ...record, serviceId: service.id };
+      await save(record);
+      const history = await deployments(service);
+      const bootstrap = record.bootstrap!;
+      const deploy = history.find((d) =>
+        bootstrap.deployId ? d.id === bootstrap.deployId : !bootstrap.previousDeployIds.includes(d.id),
+      );
+      if (!deploy) throw new Error("Render app bootstrap is unconfirmed; retry to reconcile it");
+      if (deploy.status !== "live" && !FAILED.has(deploy.status))
+        await api.request("POST", `${path(service)}/deploys/${encodeURIComponent(deploy.id)}/cancel`);
+      await idle(service);
       record = { ...record, bootstrap: undefined };
       await save(record);
     }
@@ -417,16 +426,6 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       },
     };
     await save(record);
-    try {
-      const deploy = await api.request<Deploy>("POST", `${path(service)}/deploys`, { commitId: opts.source.commit });
-      record = { ...record, pending: { ...record.pending!, ...(deploy?.id ? { deployId: deploy.id } : {}) } };
-      await save(record);
-    } catch (error) {
-      if (error instanceof RenderApiError && error.status < 500 && error.status !== 408) {
-        await save({ ...record, pending: undefined });
-        throw error;
-      }
-    }
     const live = await finish(deployment, record);
     return endpoint(live.service, live.record);
   }
@@ -449,9 +448,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     destroy: (deployment) =>
       serialized(deployment, async () => {
         await validate();
-        let record = await opts.store.get(deployment.id);
+        const record = await opts.store.get(deployment.id);
         if (!record) return;
-        if (record.pending) record = (await finish(deployment, record)).record;
         let service = await find(deployment, record);
         if (service && service.suspended !== "suspended") await api.request("POST", `${path(service)}/suspend`);
         const deadline = Date.now() + timeout;
@@ -462,7 +460,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         await opts.resources.suspend(deployment.id);
         await opts.artifacts.revoke(deployment.id);
-        await save({ ...record, suspended: true });
+        await save({ ...record, suspended: true, pending: undefined, bootstrap: undefined });
       }),
     async logs(deployment, { tailLines }) {
       const record = await opts.store.get(deployment.id);

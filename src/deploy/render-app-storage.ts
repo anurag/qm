@@ -93,8 +93,13 @@ export function createRenderAppStorage(opts: {
     )
       throw new Error("The MinIO service does not belong to this Render environment");
     if (record.jobRequest && !record.jobId) {
-      record = { ...record, jobId: await findSubmittedJob(record.jobRequest) };
-      await opts.store.put(record.deploymentId, record);
+      const jobId = await findSubmittedJob(record.jobRequest);
+      record = { ...record, jobId, jobRequest: jobId ? record.jobRequest : undefined };
+      if (jobId) await opts.store.put(record.deploymentId, record);
+      if (!jobId && record.operation && record.operation !== operation) {
+        await provision(record, record.operation);
+        record = { ...record, enabled: record.operation === "enable", operation: undefined };
+      }
     }
     if (record.jobId) {
       if (!record.operation) throw new Error("Render app storage job has no saved operation");
@@ -167,38 +172,37 @@ run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(
     });
   }
 
-  async function findSubmittedJob(request: NonNullable<StoredRenderAppStorage["jobRequest"]>): Promise<string> {
+  async function findSubmittedJob(
+    request: NonNullable<StoredRenderAppStorage["jobRequest"]>,
+  ): Promise<string | undefined> {
     const deadline = Date.now() + (opts.timeoutMs ?? 180_000);
-    while (Date.now() < deadline) {
-      let cursor: string | undefined;
-      const cursors = new Set<string>();
-      let match: string | undefined;
-      do {
-        const query = new URLSearchParams({ limit: "100", createdAfter: request.createdAfter });
-        if (cursor) query.set("cursor", cursor);
-        const entries = await api.request<Array<{ job: Job; cursor: string }>>("GET", `${path}/jobs?${query}`);
-        if (!Array.isArray(entries)) throw new Error("Render returned an invalid app storage job list");
-        for (const { job } of entries) {
-          if (
-            job.serviceId === opts.minioServiceId &&
-            job.startCommand &&
-            hashCommand(job.startCommand) === request.commandHash
-          ) {
-            if (match && match !== job.id) throw new Error("Render returned duplicate app storage job submissions");
-            match = job.id;
-          }
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    let match: string | undefined;
+    do {
+      const query = new URLSearchParams({ limit: "100", createdAfter: request.createdAfter });
+      if (cursor) query.set("cursor", cursor);
+      const entries = await api.request<Array<{ job: Job; cursor: string }>>("GET", `${path}/jobs?${query}`);
+      if (!Array.isArray(entries)) throw new Error("Render returned an invalid app storage job list");
+      for (const { job } of entries) {
+        if (
+          job.serviceId === opts.minioServiceId &&
+          job.startCommand &&
+          hashCommand(job.startCommand) === request.commandHash
+        ) {
+          if (match && match !== job.id) throw new Error("Render returned duplicate app storage job submissions");
+          match = job.id;
         }
-        cursor = entries.length === 100 ? entries.at(-1)?.cursor : undefined;
-        if (cursor) {
-          if (cursors.has(cursor)) throw new Error("Render repeated an app storage job list cursor");
-          cursors.add(cursor);
-        }
-        if (Date.now() >= deadline) throw new Error("Render app storage job submission is still unconfirmed");
-      } while (cursor);
-      if (match) return match;
-      await sleep(Math.max(1, poll));
-    }
-    throw new Error("Render app storage job submission is still unconfirmed");
+      }
+      cursor = entries.length === 100 ? entries.at(-1)?.cursor : undefined;
+      if (entries.length === 100 && !cursor) throw new Error("Render omitted an app storage job list cursor");
+      if (cursor) {
+        if (cursors.has(cursor)) throw new Error("Render repeated an app storage job list cursor");
+        cursors.add(cursor);
+      }
+      if (Date.now() >= deadline) throw new Error("Render app storage job submission is still unconfirmed");
+    } while (cursor);
+    return match;
   }
 
   async function wait(jobId: string): Promise<boolean> {
