@@ -107,21 +107,17 @@ interface State {
   environmentId?: string;
   postgresId?: string;
   sourceCommit?: string;
-  releaseCommit?: string;
-  previousReleaseCommit?: string;
   services: Record<string, SavedService>;
   pendingPurge?: boolean;
   dirtyServices?: string[];
   pendingCreate?: string;
-  release?: Record<string, string>;
-  previousRelease?: Record<string, string>;
+  releases?: Release[];
   updateInProgress?: boolean;
-  rollbackProgress?: {
-    services: Record<string, string>;
-    commit: string;
-    interruptedUpdate: boolean;
-    restored: Record<string, string>;
-  };
+  rollbackProgress?: Release & { interruptedUpdate: boolean; restored: Record<string, string> };
+}
+interface Release {
+  services: Record<string, string>;
+  commit: string;
 }
 type Workload = RenderBuild & {
   name: string;
@@ -264,9 +260,8 @@ function same(a: Record<string, string>, b: Record<string, string>): boolean {
 }
 function workloads(ctx: DeployContext): Workload[] {
   const render = coordinates(ctx.config);
-  const out: Workload[] = [];
-  if (render.storage.type === "minio")
-    out.push({
+  const out: Workload[] = [
+    {
       name: "minio",
       source: render.source,
       dockerfile: "deploy/render-minio/Dockerfile",
@@ -275,7 +270,8 @@ function workloads(ctx: DeployContext): Workload[] {
       plan: render.storage.plan,
       health: "/minio/health/live",
       diskSizeGB: render.storage.diskSizeGB,
-    });
+    },
+  ];
   for (const item of renderWorkloads(ctx.config, ctx.configDir)) {
     const privateService = !!item.plugin || (item.name === "web-ui" && ctx.config.services.includes("portal"));
     let type: ServiceType = privateService ? "private_service" : "web_service";
@@ -587,7 +583,12 @@ async function createResource<T>(
     throw error;
   }
 }
-async function provision(ctx: DeployContext, request: RenderRequest, state: State): Promise<RenderPostgres> {
+async function provision(
+  ctx: DeployContext,
+  request: RenderRequest,
+  state: State,
+  existing: RenderPostgres | undefined,
+): Promise<RenderPostgres> {
   const render = coordinates(ctx.config);
   if (!state.projectId) {
     const name = `${state.appPrefix}-qm`;
@@ -628,7 +629,7 @@ async function provision(ctx: DeployContext, request: RenderRequest, state: Stat
     delete state.pendingCreate;
     saveState(ctx, state);
   }
-  let postgres = (await inventory(ctx, request, state)).postgres!;
+  let postgres = existing ?? (await request<RenderPostgres>(`/postgres/${state.postgresId}`));
   if (postgres.diskSizeGB > render.postgresDiskSizeGB)
     throw new CliError("Render Postgres storage cannot shrink; keep postgresDiskSizeGB at its current size or larger");
   if (postgres.suspended === "suspended") await request(`/postgres/${postgres.id}/resume`, "POST");
@@ -778,7 +779,6 @@ export function renderConfigErrors(
   const add = (message: string): void => {
     errors.push({ clause: "config.v1", message });
   };
-  if (!config.render) add("Render requires a render config block");
   if (!config.apiUrl) add("Render requires apiUrl; qm init --target render sets it");
   for (const url of [config.publicUrl, config.apiUrl]) {
     if (url && (new URL(url).protocol !== "https:" || !new URL(url).hostname.endsWith(".onrender.com")))
@@ -790,11 +790,8 @@ export function renderConfigErrors(
   if (plugins.some((plugin) => plugin.kind === "image")) add("Render plugins require Git source Dockerfiles");
   if (Object.keys(config.imageOverrides).length || config.imageFrom)
     add("Render builds from Git; remove imageOverrides and imageFrom");
-  if (config.env.core?.RENDER_DEPLOY_IMAGE !== undefined)
-    add("Render builds apps from Git; remove env.core.RENDER_DEPLOY_IMAGE");
   for (const plugin of config.plugins) {
-    if (config.render?.storage.type === "minio" && plugin.name === "minio")
-      add(`Render reserves plugin name ${plugin.name} for bundled storage`);
+    if (plugin.name === "minio") add(`Render reserves plugin name ${plugin.name} for bundled storage`);
     if (plugin.name === "worker") add(`Render reserves plugin name ${plugin.name} for the run worker`);
     if (plugin.coreAccess === false && plugin.secrets?.some((secret) => secret.name === "DATABASE_URL"))
       add(`Render plugin ${plugin.name} cannot use the core DATABASE_URL when coreAccess is false`);
@@ -836,23 +833,20 @@ export function renderConfigErrors(
     if (config.env.core?.[key] !== undefined || config.secretEnv?.core?.[key] !== undefined)
       add(`Render derives core ${key}; remove its env or secretEnv entry`);
   }
-  if (config.render?.storage.type === "minio") {
-    for (const key of [
-      "S3_BUCKET",
-      "S3_REGION",
-      "S3_FORCE_PATH_STYLE",
-      "AWS_ENDPOINT_URL_S3",
-      "AWS_ACCESS_KEY_ID",
-      "AWS_SECRET_ACCESS_KEY",
-      "AWS_SESSION_TOKEN",
-      "RENDER_QM_MINIO",
-      "MINIO_ROOT_USER",
-      "MINIO_ROOT_PASSWORD",
-      "QM_STORAGE_SECRET_KEY",
-    ]) {
-      if (config.env.core?.[key] !== undefined || config.secretEnv?.core?.[key] !== undefined)
-        add(`Render manages core ${key}; remove its env or secretEnv entry`);
-    }
+  for (const key of [
+    "S3_BUCKET",
+    "S3_REGION",
+    "S3_FORCE_PATH_STYLE",
+    "AWS_ENDPOINT_URL_S3",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "MINIO_ROOT_USER",
+    "MINIO_ROOT_PASSWORD",
+    "QM_STORAGE_SECRET_KEY",
+  ]) {
+    if (config.env.core?.[key] !== undefined || config.secretEnv?.core?.[key] !== undefined)
+      add(`Render manages core ${key}; remove its env or secretEnv entry`);
   }
 
   return errors;
@@ -861,26 +855,7 @@ export function renderConfigErrors(
 export function createRenderBackend(ctx: DeployContext): Backend {
   return {
     up: async (opts) => {
-      if (
-        opts.buildFrom ||
-        opts.buildFromPath ||
-        opts.buildOnly ||
-        opts.candidate ||
-        opts.candidateOut ||
-        opts.inactive ||
-        opts.imageFrom ||
-        opts.imageLabel ||
-        opts.imageRepoPrefix
-      )
-        throw new CliError("Set render.source for Git builds");
-      const errors = renderConfigErrors(ctx.config, []);
-      if (errors.length) throw new CliError(errors.map((error) => error.message).join("\n"));
       const desired = workloads(ctx);
-      if (opts.only?.length)
-        throw new CliError("Render qm up reconciles the complete deployment; --only is not supported");
-      for (const name of opts.restart ?? [])
-        if (!desired.some((item) => item.name === serviceHost(name)))
-          throw new CliError(`No Render workload exists for ${name}`);
       if (opts.dryRun) {
         step(`create or reconcile Render project ${appPrefixOf(ctx.config)}-qm and its production environment`);
         step(`create or reconcile Postgres (${coordinates(ctx.config).postgresPlan})`);
@@ -926,7 +901,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         saveState(ctx, state);
         state.updateInProgress = true;
         saveState(ctx, state);
-        const postgres = await provision(ctx, request, state);
+        const postgres = await provision(ctx, request, state, bound.postgres);
         const info = await request<{ internalConnectionString: string; externalConnectionString: string }>(
           `/postgres/${postgres.id}/connection-info`,
         );
@@ -946,7 +921,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         appDatabaseUrl.search = "?sslmode=verify-full";
         appDatabaseUrl.hash = "";
         const appDatabaseEndpoint = appDatabaseUrl.href;
-        const { services } = await inventory(ctx, request, state);
+        const { services } = bound;
         const envs = new Map<string, Record<string, string>>();
         for (const workload of desired) {
           let service = services.get(workload.name);
@@ -992,7 +967,6 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             state.dirtyServices = [...new Set([...(state.dirtyServices ?? []), workload.name])];
             saveState(ctx, state);
             services.set(workload.name, service);
-            await inventory(ctx, request, state);
           }
           envs.set(workload.name, env);
           if (workload.name === "minio" && !workload.plugin) {
@@ -1040,10 +1014,9 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           const latest = await latestDeploy(request, service);
           if (
             changed ||
-            (!workload.diskSizeGB && workload.source) ||
+            !workload.diskSizeGB ||
             pending ||
             service.suspended === "suspended" ||
-            opts.restart?.some((name) => serviceHost(name) === workload.name) ||
             !latest ||
             failedDeployStatuses.includes(latest.status)
           )
@@ -1083,10 +1056,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           if (!current || current.status !== "live") throw new CliError(`${workload.name} has no live deployment`);
           release[workload.name] = current.id;
         }
-        state.previousRelease = state.release;
-        state.previousReleaseCommit = state.releaseCommit;
-        state.releaseCommit = state.sourceCommit;
-        state.release = release;
+        state.releases = [{ services: release, commit: state.sourceCommit! }, ...(state.releases ?? []).slice(0, 1)];
         delete state.updateInProgress;
         saveState(ctx, state);
         const retained = Object.keys(state.services).filter((name) => !desired.some((item) => item.name === name));
@@ -1240,11 +1210,10 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         const state = readState(ctx);
         if (!state.rollbackProgress) {
           const interruptedUpdate = state.updateInProgress === true;
-          const services = interruptedUpdate ? state.release : state.previousRelease;
-          const commit = interruptedUpdate ? state.releaseCommit : state.previousReleaseCommit;
-          if (!services || !Object.keys(services).length || !commit)
+          const release = state.releases?.[interruptedUpdate ? 0 : 1];
+          if (!release || !Object.keys(release.services).length)
             throw new CliError("No successful Render deployment is recorded for rollback");
-          state.rollbackProgress = { services, commit, interruptedUpdate, restored: {} };
+          state.rollbackProgress = { ...release, interruptedUpdate, restored: {} };
         }
         const target = state.rollbackProgress;
         const bound = await inventory(ctx, request, state);
@@ -1268,12 +1237,8 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           target.restored[name] = deploy.id;
           saveState(ctx, state);
         }
-        if (!target.interruptedUpdate) {
-          state.previousRelease = state.release;
-          state.previousReleaseCommit = state.releaseCommit;
-        }
-        state.release = target.restored;
-        state.releaseCommit = target.commit;
+        const previous = state.releases?.[target.interruptedUpdate ? 1 : 0];
+        state.releases = [{ services: target.restored, commit: target.commit }, ...(previous ? [previous] : [])];
         state.sourceCommit = target.commit;
         state.dirtyServices = state.dirtyServices?.filter((name) => !target.services[name]);
         delete state.updateInProgress;
@@ -1303,19 +1268,19 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         for (const workload of renderWorkloads(ctx.config, ctx.configDir)) {
           const service = bound.services.get(workload.name);
           if (!service) throw new CliError(`No Render service exists for ${workload.name}; run qm up`);
-          let changed = false;
-          for (const secret of computedSecrets(ctx.config)) {
-            if (secret.managedBy !== "operator") continue;
+          const entries = computedSecrets(ctx.config).flatMap((secret) => {
             const value = values.get(secret.name);
-            if (value === undefined) continue;
-            for (const key of runtimeSecretNames(renderEnvService(workload.name), secret, plugins)) {
-              state.dirtyServices = [...new Set([...(state.dirtyServices ?? []), workload.name])];
-              saveState(ctx, state);
-              await request(`/services/${service.id}/env-vars/${encodeURIComponent(key)}`, "PUT", { value });
-              changed = true;
-            }
-          }
-          if (changed) ok(`${workload.name}: secrets saved`);
+            if (secret.managedBy !== "operator" || value === undefined) return [];
+            return runtimeSecretNames(renderEnvService(workload.name), secret, plugins).map(
+              (key) => [key, value] as const,
+            );
+          });
+          if (!entries.length) continue;
+          state.dirtyServices = [...new Set([...(state.dirtyServices ?? []), workload.name])];
+          saveState(ctx, state);
+          for (const [key, value] of entries)
+            await request(`/services/${service.id}/env-vars/${encodeURIComponent(key)}`, "PUT", { value });
+          ok(`${workload.name}: secrets saved`);
         }
         note("Run qm up to deploy the saved secrets");
       }),

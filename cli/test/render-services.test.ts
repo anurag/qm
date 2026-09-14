@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { loadConfigAt, parseConfigJson, renderSource } from "../src/config.ts";
-import { renderMinioImage } from "../src/render-minio.ts";
 import { renderScaffold } from "../src/provider-scaffold.ts";
-import { renderBuild, renderServiceEnv, renderWorkloads } from "../src/render-services.ts";
+import { renderConfigErrors } from "../src/backends/render.ts";
+import { discoverPlugins } from "../src/plugins.ts";
+import { renderServiceEnv, renderWorkloads } from "../src/render-services.ts";
 import { computedSecrets } from "../src/secrets.ts";
 
 interface ScaffoldConfig {
@@ -76,11 +77,11 @@ test("Render Git source accepts GitHub repositories and branch names without cre
 
 test("Render uses Git builds for all services and rejects image overrides", (t) => {
   const { config, dir } = deployment(t);
-  assert.deepEqual(renderBuild(config, "deploy/core/Dockerfile"), {
-    source: config.render!.source,
-    dockerfile: "deploy/core/Dockerfile",
-  });
   const workloads = renderWorkloads(config, dir);
+  assert.deepEqual(
+    workloads.find((workload) => workload.name === "core"),
+    { name: "core", source: config.render!.source, dockerfile: "deploy/core/Dockerfile" },
+  );
   assert.ok(workloads.every((workload) => workload.source));
   const worker = workloads[workloads.findIndex((workload) => workload.name === "core") + 1]!;
   assert.deepEqual(worker, { name: "worker", source: config.render!.source, dockerfile: "deploy/core/Dockerfile" });
@@ -89,9 +90,8 @@ test("Render uses Git builds for all services and rejects image overrides", (t) 
   assert.equal(core.RENDER_DEPLOY_BRANCH, "main");
   assert.equal(config.render!.appRegion, undefined);
   assert.equal(core.RENDER_APP_REGION, config.render!.region);
-  assert.equal(core.RENDER_DEPLOY_IMAGE, undefined);
   config.imageOverrides.core = "example.test/core:custom";
-  assert.throws(() => renderWorkloads(config, dir), /remove imageOverrides/);
+  assert.ok(renderConfigErrors(config, []).some((error) => /remove imageOverrides/.test(error.message)));
 });
 
 test("Render init selects managed MinIO without generated infrastructure files or storage inputs", (t) => {
@@ -108,7 +108,8 @@ test("Render init selects managed MinIO without generated infrastructure files o
     secrets.some((secret) => secret.name === "AWS_SESSION_TOKEN"),
     false,
   );
-  assert.match(renderMinioImage, /@sha256:[a-f0-9]{64}$/);
+  const dockerfile = readFileSync(new URL("../../deploy/render-minio/Dockerfile", import.meta.url), "utf8");
+  assert.match(dockerfile, /^FROM \S+@sha256:[a-f0-9]{64}\n/);
 });
 
 test("Render appRegion accepts supported regions without changing the core region", (t) => {
@@ -149,7 +150,6 @@ test("Render core receives scoped storage credentials and assigned URLs", (t) =>
   assert.equal(core.AWS_SESSION_TOKEN, "");
   assert.equal(core.S3_BUCKET, "qm-storage");
   assert.equal(core.S3_FORCE_PATH_STYLE, "true");
-  assert.equal(core.RENDER_QM_MINIO, "true");
   assert.equal(core.RENDER_PROJECT_ID, connections.projectId);
   assert.equal(core.RENDER_POSTGRES_ID, connections.postgresId);
   assert.equal(core.RENDER_APP_DATABASE_ENDPOINT, connections.appDatabaseEndpoint);
@@ -182,7 +182,8 @@ test("Render rejects prebuilt plugin images", (t) => {
   const { config, dir } = deployment(t, (raw) => {
     raw.plugins = [{ name: "reports", image: "example.test/reports:1" }];
   });
-  assert.throws(() => renderWorkloads(config, dir), /must use a Dockerfile/);
+  const plugins = discoverPlugins(dir, config).plugins;
+  assert.ok(renderConfigErrors(config, plugins).some((error) => /Git source Dockerfiles/.test(error.message)));
 });
 
 test("removing hosted auth, admin, and Slack resets their managed settings", (t) => {

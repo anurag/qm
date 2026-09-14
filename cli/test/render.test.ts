@@ -596,7 +596,6 @@ test("Render waits for MinIO initialization before deploying core and retries a 
 test("Render builds QM services and MinIO from Git", async (t) => {
   const d = deployment(t, false, true);
   d.ctx.config.render!.source = { repo: "https://github.com/acme/qm", branch: "render-test" };
-  delete d.ctx.config.env.core!.RENDER_DEPLOY_IMAGE;
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
   const saved = d.saved();
@@ -619,7 +618,6 @@ test("Render builds QM services and MinIO from Git", async (t) => {
     c.services.get("srv-acme-portal")!.serviceDetails.envSpecificDetails.dockerfilePath,
     "deploy/portal/Dockerfile",
   );
-  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_IMAGE, undefined);
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_REPO, "https://github.com/acme/qm");
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_BRANCH, "render-test");
   const mark = c.calls.length;
@@ -813,7 +811,7 @@ for (const failure of ["connection closed", "HTTP 503"]) {
     assert.equal(c.database, undefined);
     writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"b".repeat(40)}' "$4"\n`);
     await hostingProvider("render").createBackend(d.ctx).up({ dryRun: false });
-    assert.equal(d.saved().releaseCommit, "b".repeat(40));
+    assert.equal(d.saved().releases[0].commit, "b".repeat(40));
   });
 }
 
@@ -1244,7 +1242,7 @@ test("Render rollback restores the previous service builds without changing stor
   const d = deployment(t);
   const c = cloud(t, d);
   await d.backend.up({ dryRun: false });
-  const release = d.saved().release;
+  const release = d.saved().releases[0].services;
   await d.backend.up({ dryRun: false });
   const mark = c.calls.length;
   const secret = c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY;
@@ -1262,8 +1260,8 @@ test("Render rollback restores the previous service builds without changing stor
   assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, secret);
   assert.equal(c.database?.id, "dpg-acme");
   for (const id of ["srv-acme-core", "srv-acme-worker"]) {
-    assert.equal(c.envs.get(id)!.RENDER_DEPLOY_COMMIT, d.saved().releaseCommit);
-    assert.equal(c.envs.get(id)!.GIT_SHA, d.saved().releaseCommit);
+    assert.equal(c.envs.get(id)!.RENDER_DEPLOY_COMMIT, d.saved().releases[0].commit);
+    assert.equal(c.envs.get(id)!.GIT_SHA, d.saved().releases[0].commit);
   }
 });
 
@@ -1277,7 +1275,7 @@ test("Render rejects a live service built from a different source commit", async
     return Response.json(deploy);
   };
   await assert.rejects(d.backend.up({ dryRun: false }), /deployed commit b+.*expected a+/);
-  assert.equal(d.saved().release, undefined);
+  assert.equal(d.saved().releases, undefined);
   assert.equal(d.saved().updateInProgress, true);
 });
 
@@ -1290,7 +1288,7 @@ test("Render resumes rollback to the last good release after a partial update", 
     path === "/services/srv-acme-web-ui/deploys" && method === "POST" ? new Response(null, { status: 500 }) : undefined;
   await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
   assert.equal(d.saved().updateInProgress, true);
-  assert.equal(d.saved().previousRelease, undefined);
+  assert.equal(d.saved().releases.length, 1);
   c.intercept = ({ path, method }) =>
     path === "/services/srv-acme-web-ui/rollback" && method === "POST"
       ? new Response(null, { status: 500 })
@@ -1304,7 +1302,7 @@ test("Render resumes rollback to the last good release after a partial update", 
     writes(c.calls.slice(mark))
       .filter((call) => call.path.endsWith("/rollback"))
       .map((call) => [call.path, call.body]),
-    [["/services/srv-acme-web-ui/rollback", { deployId: successful.release["web-ui"] }]],
+    [["/services/srv-acme-web-ui/rollback", { deployId: successful.releases[0].services["web-ui"] }]],
   );
   assert.equal(d.saved().rollbackProgress, undefined);
   assert.equal(d.saved().updateInProgress, undefined);
@@ -1390,7 +1388,7 @@ test("Render deploys the current branch commit when an interrupted bootstrap ret
   const pinned = c.calls.slice(mark).filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
   assert.equal(pinned.length, 4);
   for (const call of pinned) assert.equal((call.body as { commitId: string }).commitId, "c".repeat(40));
-  assert.equal(d.saved().releaseCommit, "c".repeat(40));
+  assert.equal(d.saved().releases[0].commit, "c".repeat(40));
   assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "c".repeat(40));
 });
 
@@ -1429,7 +1427,7 @@ for (const resource of ["retained", "deleted", "not created"]) {
         deploys.map((call) => (call.body as { commitId: string }).commitId),
         [commit, commit, commit],
       );
-      assert.equal(d.saved().releaseCommit, commit);
+      assert.equal(d.saved().releases[0].commit, commit);
       assert.equal(d.saved().pendingCreate, undefined);
       assert.equal(Boolean(d.saved().services.reports), resource === "retained");
       assert.equal(
@@ -1444,7 +1442,7 @@ for (const resource of ["retained", "deleted", "not created"]) {
     const mark = c.calls.length;
     await d.backend.up({ dryRun: false });
     const calls = c.calls.slice(mark);
-    assert.equal(d.saved().releaseCommit, commit);
+    assert.equal(d.saved().releases[0].commit, commit);
     const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
     assert.deepEqual(
       deploys.map((call) => (call.body as { commitId: string }).commitId),

@@ -216,7 +216,6 @@ test("Render recovers from an expired staged native checkpoint with the durable 
   await snapshots.put(scope, await makeTar([{ path: "workspace/recovered", data: Buffer.from("retained") }]));
   await store.put(scope, {
     sandboxId: "sbx-missing",
-    createdAtMs: Date.now() - 7200_000,
     expiresAtMs: Date.now() - 1,
     lastActivityMs: Date.now() - 7200_000,
     homeCheckpointAtMs: Date.now() - 3600_000,
@@ -388,7 +387,6 @@ test("Render disposes a new native checkpoint when its staging record write fail
   const info = await fake.client.create();
   await store.put(scope, {
     sandboxId: info.id,
-    createdAtMs: Date.now(),
     expiresAtMs: info.expiresAtMs,
     lastActivityMs: Date.now(),
   });

@@ -29,6 +29,14 @@ interface Deploy {
   commit?: { id: string };
 }
 
+interface RenderPending {
+  version: number;
+  runnerCommit: string;
+  readinessNonce: string;
+  previousDeployId?: string;
+  deployId?: string;
+}
+
 export interface StoredRenderDeploy {
   deploymentId: string;
   appRegion?: string;
@@ -37,13 +45,7 @@ export interface StoredRenderDeploy {
   token: string;
   liveVersion?: number;
   suspended: boolean;
-  pending?: {
-    version: number;
-    runnerCommit: string;
-    readinessNonce: string;
-    previousDeployId?: string;
-    deployId?: string;
-  };
+  pending?: RenderPending;
 }
 
 export interface RenderDeployProviderOptions {
@@ -200,7 +202,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
 
   async function finish(
     deployment: Deployment,
-    initial: StoredRenderDeploy,
+    initial: StoredRenderDeploy & { pending: RenderPending },
   ): Promise<{ service: Service; record: StoredRenderDeploy }> {
     let record = initial;
     const deadline = Date.now() + timeout;
@@ -211,17 +213,16 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
           record = { ...record, serviceId: service.id };
           await save(record);
         }
-        const pending = record.pending;
-        if (!pending) return { service, record };
-        if (!pending.deployId) {
+        if (!record.pending.deployId) {
           const own = (deploy: Deploy | undefined) =>
-            deploy && deploy.id !== pending.previousDeployId ? deploy : undefined;
+            deploy && deploy.id !== record.pending.previousDeployId ? deploy : undefined;
           let found = own(await latest(service));
           if (!found) {
             try {
               found =
-                (await api.request<Deploy>("POST", `${path(service)}/deploys`, { commitId: pending.runnerCommit })) ??
-                undefined;
+                (await api.request<Deploy>("POST", `${path(service)}/deploys`, {
+                  commitId: record.pending.runnerCommit,
+                })) ?? undefined;
             } catch (error) {
               if (error instanceof RenderApiError && error.rejected) {
                 await save({ ...record, pending: undefined });
@@ -232,27 +233,25 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
             }
           }
           if (found?.id) {
-            record = { ...record, pending: { ...pending, deployId: found.id } };
+            record = { ...record, pending: { ...record.pending, deployId: found.id } };
             await save(record);
           }
         }
-        if (pending.deployId) {
-          const deploy = await api.request<Deploy>(
-            "GET",
-            `${path(service)}/deploys/${encodeURIComponent(pending.deployId)}`,
-          );
+        const { deployId, readinessNonce, runnerCommit, version } = record.pending;
+        if (deployId) {
+          const deploy = await api.request<Deploy>("GET", `${path(service)}/deploys/${encodeURIComponent(deployId)}`);
           if (deploy && FAILED.has(deploy.status)) {
             await save({ ...record, pending: undefined });
             throw new Error(`Render deploy ${deploy.id} ${deploy.status}`);
           }
-          if (deploy?.status === "live" && (await ready(service, record, pending.readinessNonce))) {
-            if (deploy.commit?.id !== pending.runnerCommit) {
+          if (deploy?.status === "live" && (await ready(service, record, readinessNonce))) {
+            if (deploy.commit?.id !== runnerCommit) {
               await save({ ...record, pending: undefined });
               throw new Error("The Render app runner was built from a different Git commit");
             }
-            record = { ...record, liveVersion: pending.version, suspended: false, pending: undefined };
-            await save(record);
-            return { service, record };
+            const live: StoredRenderDeploy = { ...record, liveVersion: version, suspended: false, pending: undefined };
+            await save(live);
+            return { service, record: live };
           }
         }
       }
@@ -282,7 +281,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
       });
     record = await network.ensure(deployment, record);
     if (record.pending) {
-      const recovered = await finish(deployment, record);
+      const recovered = await finish(deployment, { ...record, pending: record.pending });
       record = recovered.record;
       if (record.liveVersion === version.version) return endpoint(recovered.service, record);
     }
@@ -362,7 +361,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     await api.request("PUT", `${path(service)}/secret-files`, secretFiles);
     await api.request("PATCH", path(service), { ...source, serviceDetails: runtime });
     const previousDeployId = (await latest(service))?.id;
-    record = {
+    const submitted = {
       ...record,
       pending: {
         version: version.version,
@@ -371,8 +370,8 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         ...(previousDeployId ? { previousDeployId } : {}),
       },
     };
-    await save(record);
-    const live = await finish(deployment, record);
+    await save(submitted);
+    const live = await finish(deployment, submitted);
     return endpoint(live.service, live.record);
   }
 

@@ -18,20 +18,19 @@ export function renderWorkloads(
 ): Array<RenderBuild & { name: string; plugin?: ResolvedPlugin }> {
   const discovered = discoverPlugins(configDir, config);
   if (discovered.errors.length) throw new CliError(discovered.errors.join("\n"));
-  if (!config.render?.source) throw new CliError("Render requires render.source for Git builds");
-  if (Object.keys(config.imageOverrides).length || config.imageFrom)
-    throw new CliError("Render builds from Git; remove imageOverrides and imageFrom");
-  for (const plugin of discovered.plugins) {
-    if (plugin.image) throw new CliError(`Render plugin ${plugin.name} must use a Dockerfile in the Git repository`);
-  }
+  const source = config.render?.source;
+  if (!source) throw new CliError("Render requires a render config block");
+  const build = (dockerfile: string): RenderBuild => ({ source, dockerfile });
   return [
-    ...ordered(runnableServices(config.services)).flatMap((service) => {
-      const build = renderBuild(config, `deploy/${service.name}/Dockerfile`);
-      return [service.name, ...(service.name === "core" ? ["worker"] : [])].map((name) => ({ name, ...build }));
-    }),
+    ...ordered(runnableServices(config.services)).flatMap((service) =>
+      [service.name, ...(service.name === "core" ? ["worker"] : [])].map((name) => ({
+        name,
+        ...build(`deploy/${service.name}/Dockerfile`),
+      })),
+    ),
     ...discovered.plugins.map((plugin) => ({
       name: plugin.name,
-      ...renderBuild(config, `plugins/${plugin.name}/Dockerfile`),
+      ...build(`plugins/${plugin.name}/Dockerfile`),
       plugin,
     })),
   ];
@@ -40,11 +39,6 @@ export function renderWorkloads(
 export interface RenderBuild {
   source: NonNullable<QmConfig["render"]>["source"];
   dockerfile: string;
-}
-
-export function renderBuild(config: QmConfig, dockerfile: string): RenderBuild {
-  if (!config.render?.source) throw new CliError("Render requires render.source for Git builds");
-  return { source: config.render.source, dockerfile };
 }
 
 export function renderEnvService(workload: string): string {
@@ -149,16 +143,14 @@ export function renderServiceEnv(
     if (!config.services.includes("slack")) {
       for (const key of ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET"]) out[key] = "";
     }
-    if (render.storage.type === "minio")
-      Object.assign(out, {
-        S3_BUCKET: "qm-storage",
-        S3_REGION: "us-east-1",
-        S3_FORCE_PATH_STYLE: "true",
-        AWS_ENDPOINT_URL_S3: values.get("AWS_ENDPOINT_URL_S3") ?? "",
-        AWS_ACCESS_KEY_ID: "qm-storage",
-        AWS_SESSION_TOKEN: "",
-        RENDER_QM_MINIO: "true",
-      });
+    Object.assign(out, {
+      S3_BUCKET: "qm-storage",
+      S3_REGION: "us-east-1",
+      S3_FORCE_PATH_STYLE: "true",
+      AWS_ENDPOINT_URL_S3: values.get("AWS_ENDPOINT_URL_S3") ?? "",
+      AWS_ACCESS_KEY_ID: "qm-storage",
+      AWS_SESSION_TOKEN: "",
+    });
   }
   if (service === "portal") {
     Object.assign(out, {

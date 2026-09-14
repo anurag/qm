@@ -33,7 +33,6 @@ interface RenderSandboxResources {
 
 export interface StoredRenderSandbox extends RenderSandboxResources {
   sandboxId: string;
-  createdAtMs: number;
   expiresAtMs: number;
   lastActivityMs: number;
   homeCheckpointAtMs?: number;
@@ -279,7 +278,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       await store.put(scope, {
         ...stored,
         sandboxId: info.id,
-        createdAtMs: Date.now(),
         expiresAtMs: info.expiresAtMs,
         lastActivityMs: Date.now(),
         ...(snapshotId ? {} : { checkpoint: undefined }),
@@ -411,7 +409,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           } else {
             await store.put(scope, {
               sandboxId: info.id,
-              createdAtMs: Date.now(),
               expiresAtMs: info.expiresAtMs,
               lastActivityMs: 0,
               retiredResources,
@@ -434,7 +431,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           const imported: StoredRenderSandbox = {
             ...resources,
             sandboxId: info.id,
-            createdAtMs: Date.now(),
             expiresAtMs: info.expiresAtMs,
             lastActivityMs: Date.now(),
             homeCheckpointAtMs: Date.now(),

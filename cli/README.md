@@ -41,7 +41,7 @@ npm install
 npm exec qm -- setup
 npm exec qm -- check
 npm exec qm -- plan
-npm exec qm -- up --yes
+npm exec qm -- up
 npm exec qm -- check --live
 ```
 
