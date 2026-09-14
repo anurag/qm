@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { test, type TestContext } from "node:test";
 import { createApp } from "../src/api/app.ts";
 import { createServer } from "../src/api/server.ts";
@@ -24,12 +24,13 @@ import { verifyDeployGitAccess } from "../src/deploy/access-token.ts";
 import { scopeId } from "../src/types.ts";
 import { createServer as createHttpServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
+import { Duplex } from "node:stream";
 
-const runner = new URL("../deploy/render-runner/start.mjs", import.meta.url);
+const runner = new URL(process.env.QM_RENDER_RUNNER_MODULE ?? "../deploy/render-runner/start.mjs", import.meta.url);
 const { prepareRenderApp, runRenderApp, createRenderAppGateway } = await import(runner.href);
 const signingSecret = "render-runner-secret".repeat(3);
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, appSource?: string, entrypoint = "node app.cjs") {
   const root = await mkdtemp(join(tmpdir(), "qm-render-runner-"));
   await chmod(root, 0o755);
   const deployments = createMemoryMap<Deployment>();
@@ -41,11 +42,13 @@ async function fixture(t: TestContext) {
     ownerScopeId: scopeId("personal", "U1"),
     createdBy: "U1",
     snapshotDir: "/unused",
-    entrypoint: "node app.cjs",
+    entrypoint,
     files: [
       {
         path: "app.cjs",
-        data: `const result = { version: 1, port: process.env.PORT, secret: process.env.APP_SECRET, git: process.env.GIT_CONFIG_VALUE_0, dataDir: process.env.DATA_DIR, gatewayToken: process.env.QM_RENDER_APP_TOKEN };
+        data:
+          appSource ??
+          `const result = { version: 1, port: process.env.PORT, secret: process.env.APP_SECRET, git: process.env.GIT_CONFIG_VALUE_0, dataDir: process.env.DATA_DIR, gatewayToken: process.env.QM_RENDER_APP_TOKEN };
 const write = () => require("node:fs").writeFileSync("result.json", JSON.stringify(result));
 write();
 require("node:http").createServer((req,res)=> {
@@ -54,7 +57,7 @@ require("node:http").createServer((req,res)=> {
 }).listen(Number(process.env.PORT),"127.0.0.1");
 const bypass = require("node:net").createServer();
 bypass.on("error", error => { result.gatewayPortBlocked = error.code === "EADDRINUSE"; write(); });
-bypass.listen(8080, "0.0.0.0");`,
+bypass.listen(Number(process.env.QM_QA_GATEWAY_PORT), "0.0.0.0");`,
       },
       { path: "old.txt", data: "old version" },
     ],
@@ -108,7 +111,21 @@ bypass.listen(8080, "0.0.0.0");`,
   return { root, base, d, deployStore, deploy, artifacts, credentials, gitDir, app };
 }
 
-async function runUntilReadyThenExit(input: { manifestPath: string; appDir: string; env: NodeJS.ProcessEnv }) {
+async function port() {
+  const server = createHttpServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  return port;
+}
+
+async function runUntilReadyThenExit(input: {
+  manifestPath: string;
+  appDir: string;
+  env: NodeJS.ProcessEnv;
+  gatewayPort: number;
+  appPort: number;
+}) {
   const manifest = JSON.parse(await readFile(input.manifestPath, "utf8"));
   const running: Promise<number> = runRenderApp(input);
   const controller = new AbortController();
@@ -116,7 +133,7 @@ async function runUntilReadyThenExit(input: { manifestPath: string; appDir: stri
   const readiness = async () => {
     for (;;) {
       signal.throwIfAborted();
-      const response = await fetch("http://127.0.0.1:8080/__qm_ready", {
+      const response = await fetch(`http://127.0.0.1:${input.gatewayPort}/__qm_ready`, {
         headers: { "x-qm-render-app-token": input.env.QM_RENDER_APP_TOKEN! },
         signal: AbortSignal.any([signal, AbortSignal.timeout(1_000)]),
       }).catch(() => null);
@@ -136,7 +153,7 @@ async function runUntilReadyThenExit(input: { manifestPath: string; appDir: stri
         throw new Error(`Render runner exited before readiness (${code})`);
       }),
     ]);
-    const response = await fetch("http://127.0.0.1:8080/__qa_exit", {
+    const response = await fetch(`http://127.0.0.1:${input.gatewayPort}/__qa_exit`, {
       headers: { "x-qm-render-app-token": input.env.QM_RENDER_APP_TOKEN! },
       signal: AbortSignal.timeout(10_000),
     });
@@ -145,11 +162,59 @@ async function runUntilReadyThenExit(input: { manifestPath: string; appDir: stri
     return await running;
   } finally {
     controller.abort();
-    await fetch("http://127.0.0.1:8081/__qa_exit", { signal: AbortSignal.timeout(1_000) }).then(
+    await fetch(`http://127.0.0.1:${input.appPort}/__qa_exit`, { signal: AbortSignal.timeout(1_000) }).then(
       (response) => response.body?.cancel(),
       () => undefined,
     );
   }
+}
+
+async function startApp(t: TestContext, appSource: string, entrypoint?: string) {
+  const f = await fixture(t, appSource, entrypoint);
+  const manifest = await f.artifacts.prepare(f.d, f.d.versions[0]!);
+  const manifestPath = join(f.root, "artifact.json");
+  await writeFile(manifestPath, JSON.stringify({ ...manifest, readinessNonce: "n".repeat(43) }));
+  const gatewayPort = await port();
+  const appPort = await port();
+  const running: Promise<number> = runRenderApp({
+    manifestPath,
+    appDir: join(f.root, "app"),
+    gatewayPort,
+    appPort,
+    env: { ...process.env, QM_RENDER_APP_TOKEN: "a".repeat(43) },
+  });
+  void running.catch(() => {});
+  let finished = false;
+  void running
+    .finally(() => {
+      finished = true;
+    })
+    .catch(() => {});
+  t.after(async () => {
+    if (!finished) process.emit("SIGTERM", "SIGTERM");
+    await running.catch(() => {});
+  });
+  const request = (path: string) =>
+    fetch(`http://127.0.0.1:${gatewayPort}${path}`, {
+      headers: { "x-qm-render-app-token": "a".repeat(43) },
+      signal: AbortSignal.timeout(5_000),
+    });
+  await Promise.race([
+    running.then((code) => {
+      throw new Error(`Runner exited with ${code}`);
+    }),
+    (async () => {
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        const response = await request("/__qm_ready").catch(() => null);
+        await response?.body?.cancel();
+        if (response?.status === 204) return;
+        await delay(25);
+      }
+      throw new Error("Runner did not become ready");
+    })(),
+  ]);
+  return { request, running, appPort, appDir: join(f.root, "app") };
 }
 
 test(
@@ -161,6 +226,8 @@ test(
     const manifest = { ...(await f.artifacts.prepare(f.d, v1)), readinessNonce: "n".repeat(43) };
     const manifestPath = join(f.root, "artifact.json");
     const appDir = join(f.root, "app");
+    const gatewayPort = await port();
+    const appPort = await port();
     await writeFile(manifestPath, JSON.stringify(manifest));
     await f.deployStore.addVersion(f.d.id, {
       snapshotDir: "/unused",
@@ -172,18 +239,21 @@ test(
       await runUntilReadyThenExit({
         manifestPath,
         appDir,
+        gatewayPort,
+        appPort,
         env: {
           ...process.env,
           QM_RENDER_APP_TOKEN: "a".repeat(43),
           APP_SECRET: "app-secret",
           GIT_CONFIG_VALUE_0: "parent-token",
+          QM_QA_GATEWAY_PORT: String(gatewayPort),
         },
       }),
       23,
     );
     assert.deepEqual(JSON.parse(await readFile(join(appDir, "result.json"), "utf8")), {
       version: 1,
-      port: "8081",
+      port: String(appPort),
       secret: "app-secret",
       gatewayPortBlocked: true,
     });
@@ -193,7 +263,9 @@ test(
       await runUntilReadyThenExit({
         manifestPath,
         appDir,
-        env: { ...process.env, QM_RENDER_APP_TOKEN: "a".repeat(43) },
+        gatewayPort,
+        appPort,
+        env: { ...process.env, QM_RENDER_APP_TOKEN: "a".repeat(43), QM_QA_GATEWAY_PORT: String(gatewayPort) },
       }),
       23,
     );
@@ -346,4 +418,279 @@ test("Render private gateway rejects peer requests and removes its credential be
   assert.equal(unavailable.status, 503);
   assert.equal(unavailable.headers.get("cache-control"), "no-store");
   assert.equal(unavailable.headers.get("x-qm-render-app-ready"), null);
+});
+
+test("Render runner readiness follows app hangs, recovery, and refused connections", { timeout: 45_000 }, async (t) => {
+  const app = await startApp(
+    t,
+    `let hung = false;
+const server = require("node:http").createServer((req, res) => {
+  if (req.url === "/hang") hung = true;
+  if (req.url === "/recover") hung = false;
+  if (req.url === "/refuse") {
+    res.setHeader("Connection", "close");
+    server.close();
+    setTimeout(() => server.listen(Number(process.env.PORT), "127.0.0.1"), 1_500);
+  }
+  if (req.url === "/" && hung) return;
+  res.end("ready");
+});
+server.listen(Number(process.env.PORT), "127.0.0.1");`,
+  );
+  await (await app.request("/hang")).text();
+  const hung = await app.request("/__qm_ready");
+  assert.equal(hung.status, 503);
+  assert.equal(hung.headers.get("x-qm-render-app-ready"), null);
+  assert.equal((await app.request("/")).status, 503);
+  await (await fetch(`http://127.0.0.1:${app.appPort}/recover`)).text();
+  assert.equal((await app.request("/__qm_ready")).status, 204);
+  await (await app.request("/refuse")).text();
+  assert.equal((await app.request("/")).status, 502);
+  assert.equal((await app.request("/")).status, 503);
+  assert.equal((await app.request("/__qm_ready")).status, 503);
+  await delay(1_600);
+  const recovered = await app.request("/__qm_ready");
+  assert.equal(recovered.status, 204);
+  assert.equal(recovered.headers.get("x-qm-render-app-ready"), "n".repeat(43));
+});
+
+test("Render runner drains responses after the entrypoint shell exits on shutdown", { timeout: 45_000 }, async (t) => {
+  const app = await startApp(
+    t,
+    `const server = require("node:http").createServer((req, res) => {
+  if (req.url === "/slow") {
+    res.writeHead(200);
+    res.flushHeaders();
+    setTimeout(() => res.end("complete response"), 500);
+  } else res.end("ready");
+});
+server.listen(Number(process.env.PORT), "127.0.0.1");
+process.on("SIGTERM", () => server.close(() => process.exit(0)));`,
+    "node app.cjs && true",
+  );
+  const response = await app.request("/slow");
+  process.emit("SIGTERM", "SIGTERM");
+  assert.equal(await response.text(), "complete response");
+  assert.equal(await app.running, 143);
+});
+
+test("Render runner waits for descendant cleanup without active requests", { timeout: 45_000 }, async (t) => {
+  const app = await startApp(
+    t,
+    `const server = require("node:http").createServer((_req, res) => res.end("ready"));
+server.listen(Number(process.env.PORT), "127.0.0.1");
+process.on("SIGTERM", () => {
+  server.close();
+  setTimeout(() => {
+    require("node:fs").writeFileSync("cleanup.txt", "complete");
+    process.exit(0);
+  }, 250);
+});`,
+    "node app.cjs && true",
+  );
+  process.emit("SIGTERM", "SIGTERM");
+  assert.equal(await app.running, 143);
+  assert.equal(await readFile(join(app.appDir, "cleanup.txt"), "utf8"), "complete");
+});
+
+async function upgrade(t: TestContext, port: number, token?: string, head = "", until?: string) {
+  const socket = connect(port, "127.0.0.1");
+  t.after(() => {
+    socket.destroy();
+  });
+  return await new Promise<string>((resolve, reject) => {
+    let data = "";
+    socket.setTimeout(5_000, () => {
+      socket.destroy();
+      reject(new Error(`Upgrade timed out: ${data}`));
+    });
+    socket.on("error", reject);
+    socket.on("end", () => resolve(data));
+    socket.on("data", (chunk) => {
+      data += chunk.toString();
+      if (until && data.includes(until)) {
+        socket.destroy();
+        resolve(data);
+      }
+    });
+    socket.on("connect", () =>
+      socket.write(
+        `GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n${token ? `x-qm-render-app-token: ${token}\r\n` : ""}\r\n${head}`,
+      ),
+    );
+  });
+}
+
+test("Render gateway forwards WebSocket upgrades, both head buffers, and HTTP rejections", async (t) => {
+  let reject = false;
+  let forwardedToken: unknown;
+  const application = createHttpServer();
+  application.on("upgrade", (req, socket, head) => {
+    t.after(() => {
+      socket.destroy();
+    });
+    forwardedToken = req.headers["x-qm-render-app-token"];
+    socket.on("error", () => {});
+    socket.on("end", () => socket.end());
+    if (reject) {
+      socket.end(
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 6\r\nWWW-Authenticate: Bearer\r\nConnection: close\r\n\r\ndenied",
+      );
+      return;
+    }
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nserver-head");
+    if (head.length) socket.write(`echo:${head}`);
+    socket.on("data", (chunk) => socket.write(`echo:${chunk}`));
+  });
+  await new Promise<void>((resolve) => application.listen(0, "127.0.0.1", resolve));
+  let ready = true;
+  const gateway = createRenderAppGateway({
+    token: "a".repeat(43),
+    appPort: (application.address() as AddressInfo).port,
+    isReady: () => ready,
+  });
+  await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    gateway.close();
+    application.close();
+  });
+  const gatewayPort = (gateway.address() as AddressInfo).port;
+  assert.match(await upgrade(t, gatewayPort), /^HTTP\/1.1 403 /);
+  ready = false;
+  assert.match(await upgrade(t, gatewayPort, "a".repeat(43)), /^HTTP\/1.1 503 /);
+  ready = true;
+  const switched = await upgrade(t, gatewayPort, "a".repeat(43), "client-head", "echo:client-head");
+  assert.match(switched, /^HTTP\/1.1 101 /);
+  assert.ok(switched.includes("server-head"));
+  assert.equal(forwardedToken, undefined);
+  reject = true;
+  const denied = await upgrade(t, gatewayPort, "a".repeat(43));
+  assert.match(denied, /^HTTP\/1.1 401 /);
+  assert.match(denied, /www-authenticate: Bearer/i);
+  assert.ok(denied.endsWith("denied"));
+  await new Promise<void>((resolve) => application.close(() => resolve()));
+  assert.match(await upgrade(t, gatewayPort, "a".repeat(43)), /^HTTP\/1.1 502 /);
+});
+
+test("Render gateway keeps healthy apps ready after clients disconnect", { timeout: 15_000 }, async (t) => {
+  for (const kind of ["request body", "response", "WebSocket"] as const) {
+    await t.test(kind, async (t) => {
+      const started = Promise.withResolvers<void>();
+      const closed = Promise.withResolvers<void>();
+      const application = createHttpServer((req, res) => {
+        if (req.url === "/abort") {
+          req.socket.on("close", () => closed.resolve());
+          started.resolve();
+        } else res.end("ready");
+      });
+      application.on("upgrade", (_req, socket) => {
+        t.after(() => {
+          socket.destroy();
+        });
+        socket.on("error", () => socket.destroy());
+        socket.on("end", () => socket.destroy());
+        socket.on("close", () => closed.resolve());
+        started.resolve();
+      });
+      await new Promise<void>((resolve) => application.listen(0, "127.0.0.1", resolve));
+      let ready = true;
+      const gateway = createRenderAppGateway({
+        token: "a".repeat(43),
+        appPort: (application.address() as AddressInfo).port,
+        isReady: () => ready,
+        onUnavailable: () => {
+          ready = false;
+        },
+      });
+      await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+      t.after(() => {
+        gateway.closeAllConnections();
+        gateway.close();
+        application.closeAllConnections();
+        application.close();
+      });
+      const gatewayPort = (gateway.address() as AddressInfo).port;
+      const client = connect(gatewayPort, "127.0.0.1");
+      t.after(() => {
+        client.destroy();
+      });
+      client.on("connect", () => {
+        const body = kind === "request body";
+        const headers = {
+          "request body": "Content-Length: 10\r\n",
+          response: "",
+          WebSocket: "Connection: Upgrade\r\nUpgrade: websocket\r\n",
+        }[kind];
+        client.write(
+          `${body ? "POST" : "GET"} /abort HTTP/1.1\r\nHost: localhost\r\nx-qm-render-app-token: ${"a".repeat(43)}\r\n${headers}\r\n${body ? "x" : ""}`,
+        );
+      });
+      await started.promise;
+      client.destroy();
+      await closed.promise;
+      assert.equal(ready, true);
+      const response = await fetch(`http://127.0.0.1:${gatewayPort}/`, {
+        headers: { "x-qm-render-app-token": "a".repeat(43) },
+      });
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), "ready");
+    });
+  }
+});
+
+test("Render gateway flushes WebSocket close frames to a slow client", { timeout: 5_000 }, async (t) => {
+  const closeFrame = Buffer.from([0x88, 0x02, 0x03, 0xe8]);
+  const application = createHttpServer();
+  application.on("upgrade", (_req, socket) => {
+    t.after(() => {
+      socket.destroy();
+    });
+    socket.on("error", () => {});
+    socket.end(
+      Buffer.concat([
+        Buffer.from("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"),
+        closeFrame,
+      ]),
+    );
+  });
+  await new Promise<void>((resolve) => application.listen(0, "127.0.0.1", resolve));
+  const gateway = createRenderAppGateway({
+    token: "a".repeat(43),
+    appPort: (application.address() as AddressInfo).port,
+  });
+  t.after(() => {
+    gateway.close();
+    application.close();
+  });
+  const received: Buffer[] = [];
+  const client = new Duplex({
+    read() {},
+    write(chunk, _encoding, done) {
+      setTimeout(() => {
+        if (!client.destroyed) received.push(Buffer.from(chunk));
+        done();
+      }, 50);
+    },
+  });
+  t.after(() => {
+    client.destroy();
+  });
+  const finished = new Promise<void>((resolve) => {
+    client.once("finish", resolve);
+    client.once("close", resolve);
+  });
+  gateway.emit(
+    "upgrade",
+    {
+      headers: { "x-qm-render-app-token": "a".repeat(43), connection: "Upgrade", upgrade: "websocket" },
+      method: "GET",
+      url: "/socket",
+    },
+    client,
+    Buffer.alloc(0),
+  );
+  await finished;
+  const response = Buffer.concat(received);
+  assert.match(response.toString(), /^HTTP\/1.1 101 /);
+  assert.deepEqual(response.subarray(-closeFrame.length), closeFrame);
 });

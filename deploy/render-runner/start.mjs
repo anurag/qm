@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { cp, lchown, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createServer, request } from "node:http";
+import { createServer, request, ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 
 function git(args, cwd, env) {
@@ -74,6 +74,8 @@ export async function runRenderApp({
   manifestPath = "/etc/secrets/qm-render-artifact.json",
   appDir = "/app",
   env = process.env,
+  gatewayPort = 8080,
+  appPort = 8081,
 } = {}) {
   const gatewayToken = env.QM_RENDER_APP_TOKEN;
   if (typeof gatewayToken !== "string" || !/^[a-zA-Z0-9_-]{43}$/.test(gatewayToken))
@@ -85,7 +87,7 @@ export async function runRenderApp({
   )
     throw new Error("Invalid Render app readiness nonce");
   const entrypoint = await prepareRenderApp(manifestPath, appDir, env);
-  const appEnv = { ...env, ...manifest.runtimeEnv, PORT: "8081" };
+  const appEnv = { ...env, ...manifest.runtimeEnv, PORT: String(appPort) };
   delete appEnv.QM_RENDER_APP_TOKEN;
   const privileged = process.getuid?.() === 0;
   if (privileged) {
@@ -105,14 +107,45 @@ export async function runRenderApp({
   for (const key of Object.keys(appEnv))
     if (key.startsWith("GIT_CONFIG_") || key === "GIT_ASKPASS" || key === "SSH_ASKPASS") delete appEnv[key];
   let appReady = false;
+  let started = false;
+  let stopping = false;
+  const checkReady = async () => {
+    if (stopping) return false;
+    const reachable = await fetch(`http://127.0.0.1:${appPort}/`, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(1_000),
+    }).then(
+      async (response) => {
+        await response.body?.cancel();
+        return response.status < 500;
+      },
+      () => false,
+    );
+    appReady = reachable && !stopping;
+    return appReady;
+  };
   const server = createRenderAppGateway({
     token: gatewayToken,
     readinessNonce: manifest.readinessNonce,
+    appPort,
     isReady: () => appReady,
+    checkReady: () => started && checkReady(),
+    onUnavailable: () => {
+      appReady = false;
+    },
+  });
+  const sockets = new Set();
+  let connectionsClosed;
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => {
+      sockets.delete(socket);
+      if (!sockets.size) connectionsClosed?.();
+    });
   });
   await new Promise((ready, reject) => {
     server.once("error", reject);
-    server.listen(8080, "0.0.0.0", ready);
+    server.listen(gatewayPort, "0.0.0.0", ready);
   });
   const child = spawn("bash", ["-c", entrypoint], {
     cwd: appDir,
@@ -130,15 +163,46 @@ export async function runRenderApp({
     child.on("exit", (code, signal) => resolveExit(code ?? (signal === "SIGTERM" ? 143 : 1)));
   });
   const forward = (signal) => {
-    if (!child.pid) return;
+    if (!child.pid) return false;
     try {
       process.kill(-child.pid, signal);
+      return true;
     } catch (error) {
       if (error.code !== "ESRCH") throw error;
+      return false;
     }
   };
-  const term = () => forward("SIGTERM");
-  const interrupt = () => forward("SIGINT");
+  let shutdown;
+  let shutdownTimer;
+  const stop = (signal) => {
+    if (shutdown) return shutdown;
+    stopping = true;
+    appReady = false;
+    forward(signal);
+    const deadline = Date.now() + 30_000;
+    shutdownTimer = setTimeout(() => {
+      for (const socket of sockets) socket.destroy();
+      forward("SIGKILL");
+    }, 30_000);
+    shutdown = Promise.all([
+      new Promise((done) => {
+        server.close(() => {
+          if (!sockets.size) done();
+          else connectionsClosed = done;
+        });
+      }),
+      (async () => {
+        while (Date.now() < deadline && forward(0)) await new Promise((done) => setTimeout(done, 50));
+      })(),
+    ]);
+    return shutdown;
+  };
+  const term = () => {
+    void stop("SIGTERM");
+  };
+  const interrupt = () => {
+    void stop("SIGINT");
+  };
   process.on("SIGTERM", term);
   process.on("SIGINT", interrupt);
   try {
@@ -146,33 +210,29 @@ export async function runRenderApp({
     while (true) {
       if (spawnError || child.exitCode !== null || child.signalCode !== null)
         throw new Error("Render app exited before it was ready");
-      const reachable = await fetch("http://127.0.0.1:8081/", {
-        redirect: "manual",
-        signal: AbortSignal.timeout(1_000),
-      }).then(
-        async (response) => {
-          await response.body?.cancel();
-          return response.status < 500;
-        },
-        () => false,
-      );
-      if (reachable) break;
+      if (await checkReady()) break;
       if (Date.now() >= deadline) throw new Error("Render app did not become ready");
       await new Promise((done) => setTimeout(done, 200));
     }
-    appReady = true;
+    started = true;
     return await completion;
   } finally {
-    appReady = false;
-    server.closeAllConnections();
-    server.close();
-    forward("SIGTERM");
+    await stop("SIGTERM");
+    forward("SIGKILL");
+    clearTimeout(shutdownTimer);
     process.off("SIGTERM", term);
     process.off("SIGINT", interrupt);
   }
 }
 
-export function createRenderAppGateway({ token, readinessNonce, appPort = 8081, isReady = () => true }) {
+export function createRenderAppGateway({
+  token,
+  readinessNonce,
+  appPort = 8081,
+  isReady = () => true,
+  checkReady = isReady,
+  onUnavailable = () => {},
+}) {
   const authorized = (req) => {
     const value = req.headers["x-qm-render-app-token"];
     return (
@@ -186,9 +246,9 @@ export function createRenderAppGateway({ token, readinessNonce, appPort = 8081, 
     delete headers["x-qm-render-app-token"];
     return { hostname: "127.0.0.1", port: appPort, method: req.method, path: req.url, headers };
   };
-  const server = createServer((req, res) => {
+  const server = createServer(async (req, res) => {
     if (req.url === "/__qm_ready") {
-      const ready = isReady();
+      const ready = await checkReady();
       const headers = { "cache-control": "no-store" };
       if (ready && authorized(req) && readinessNonce) headers["x-qm-render-app-ready"] = readinessNonce;
       res.writeHead(ready ? 204 : 503, headers).end();
@@ -207,6 +267,8 @@ export function createRenderAppGateway({ token, readinessNonce, appPort = 8081, 
       response.pipe(res);
     });
     upstream.on("error", () => {
+      if (req.aborted || res.destroyed) return;
+      onUnavailable();
       if (!res.headersSent) res.writeHead(502);
       res.end();
     });
@@ -215,6 +277,7 @@ export function createRenderAppGateway({ token, readinessNonce, appPort = 8081, 
     req.pipe(upstream);
   });
   server.on("upgrade", (req, socket, head) => {
+    socket.on("error", () => socket.destroy());
     if (!authorized(req)) {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       return;
@@ -223,13 +286,25 @@ export function createRenderAppGateway({ token, readinessNonce, appPort = 8081, 
       socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
       return;
     }
+    let upgraded = false;
+    let clientClosed = false;
     const upstream = request(options(req));
-    upstream.on("error", () => socket.destroy());
-    upstream.on("response", (res) => {
-      res.resume();
+    upstream.on("error", () => {
+      if (clientClosed || socket.destroyed) return;
+      onUnavailable();
       socket.end("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n");
     });
+    upstream.on("response", (res) => {
+      const response = new ServerResponse(req);
+      response.assignSocket(socket);
+      response.on("finish", () => socket.end());
+      response.on("error", () => socket.destroy());
+      res.on("aborted", () => socket.destroy());
+      response.writeHead(res.statusCode ?? 502, { ...res.headers, connection: "close" });
+      res.pipe(response);
+    });
     upstream.on("upgrade", (res, connection, upstreamHead) => {
+      upgraded = true;
       socket.write(
         `HTTP/1.1 ${res.statusCode} ${res.statusMessage}\r\n${Object.entries(res.headers)
           .flatMap(([key, value]) => (Array.isArray(value) ? value : [value]).map((part) => `${key}: ${part}\r\n`))
@@ -238,10 +313,22 @@ export function createRenderAppGateway({ token, readinessNonce, appPort = 8081, 
       if (upstreamHead.length) socket.write(upstreamHead);
       if (head.length) connection.write(head);
       socket.on("error", () => connection.destroy());
+      socket.on("close", () => connection.end());
       connection.on("error", () => socket.destroy());
+      connection.on("close", () => socket.end());
       socket.pipe(connection).pipe(socket);
     });
-    socket.on("close", () => upstream.destroy());
+    socket.on("end", () => {
+      clientClosed = true;
+      if (!upgraded) {
+        upstream.destroy();
+        socket.end();
+      }
+    });
+    socket.on("close", () => {
+      clientClosed = true;
+      upstream.destroy();
+    });
     upstream.end();
   });
   return server;
