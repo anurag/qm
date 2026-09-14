@@ -47,7 +47,7 @@ flowchart TB
                 core["QM core API"]
                 worker["Render Workflow<br/>qm_run"]
                 postgres[("Render Postgres<br/>Core DB and app DBs")]
-                minio[("Bundled MinIO<br/>QM files and app prefixes")]
+                minio[("Bundled MinIO<br/>Object Storage<br/>QM files and app prefixes")]
                 disk["Persistent MinIO disk"]
             end
             subgraph isolated["One isolated environment per published app"]
