@@ -326,9 +326,8 @@ for (const failure of ["503", "connection"])
                 if (failure === "503") throw new RenderApiError(method, path, 503);
                 throw new Error("Connection closed before job creation");
               }
-              if (script.includes("admin user add")) userExists = true;
-              assert.equal(userExists, true);
-              enabled = operation === "enable";
+              if (operation === "enable") userExists = true;
+              if (userExists) enabled = operation === "enable";
               return { id: `job-${++jobs}` } as T;
             }
             if (path.startsWith("/services/srv-minio/jobs?")) {

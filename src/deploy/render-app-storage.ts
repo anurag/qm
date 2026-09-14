@@ -126,11 +126,11 @@ unset MC_HOST_qm MC_CONFIG_ENV_FILE
 run_mc() { timeout -s TERM -k 5 30 mc --config-dir "$config" --no-color "$@" >/dev/null 2>&1; }
 printf '%s\\n%s\\n' "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" | run_mc alias set qm ${shq(endpoint.toString())} --api S3v4 --path on
 printf '%s' ${shq(policy)} > "$config/policy.json"
-printf '%s\\n' ${shq(password)} | run_mc admin user add qm ${shq(record.accessKey)}
 ${
   operation === "disable"
-    ? `run_mc admin user disable qm ${shq(record.accessKey)}`
-    : `run_mc admin user enable qm ${shq(record.accessKey)}
+    ? `if run_mc admin user info qm ${shq(record.accessKey)}; then run_mc admin user disable qm ${shq(record.accessKey)}; fi`
+    : `printf '%s\\n' ${shq(password)} | run_mc admin user add qm ${shq(record.accessKey)}
+run_mc admin user enable qm ${shq(record.accessKey)}
 run_mc admin policy create qm ${shq(`qm-app-${record.accessKey}`)} "$config/policy.json"
 run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(record.accessKey)} || {
   run_mc admin policy detach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(record.accessKey)}

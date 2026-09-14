@@ -99,19 +99,23 @@ export function createRenderAppNetwork(opts: {
       let environment = await named(deployment);
       if (!environment) {
         try {
-          environment =
-            (await api.request<Environment>("POST", "/environments", {
-              name: opts.name(deployment),
-              projectId: opts.projectId,
-              networkIsolationEnabled: true,
-              protectedStatus: "protected",
-            })) ?? undefined;
+          const created = await api.request<Environment>("POST", "/environments", {
+            name: opts.name(deployment),
+            projectId: opts.projectId,
+            networkIsolationEnabled: true,
+            protectedStatus: "protected",
+          });
+          environment = (await named(deployment)) ?? created ?? undefined;
         } catch (error) {
           if (!(error instanceof RenderApiError && error.rejected)) throw error;
           environment = await named(deployment);
           if (!environment) throw error;
         }
       }
+      if (environment && !environment.networkIsolationEnabled)
+        throw new Error(
+          "A Render environment with this app's name is not network-isolated; enable isolation or delete it",
+        );
       const record = { ...initial, environmentId: check(deployment, environment).id };
       await opts.store.put(record.deploymentId, record);
       return record;

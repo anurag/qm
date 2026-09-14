@@ -33,7 +33,7 @@ function fixture(appRegion?: string) {
   const deploys: any[] = [];
   let outcome = "live";
   let builtCommit: string | undefined;
-  let foreignDeployOnEnvWrite = false;
+  let foreignDeployOnEnvWrite: string | undefined;
   let loseCreate = false;
   let loseUpdate = false;
   let failure: { method: string; path: string; status?: number } | undefined;
@@ -138,7 +138,7 @@ function fixture(appRegion?: string) {
       if (path === "/services/srv-app/env-vars" && method === "PUT") {
         activeEnv = body;
         if (foreignDeployOnEnvWrite)
-          deploys.unshift({ id: `dep-${deploys.length}`, status: "live", commit: { id: "f".repeat(40) } });
+          deploys.unshift({ id: `dep-${deploys.length}`, status: "live", commit: { id: foreignDeployOnEnvWrite } });
         return response(body);
       }
       if (path === "/services/srv-app/secret-files" && method === "PUT") {
@@ -211,7 +211,7 @@ function fixture(appRegion?: string) {
     set builtCommit(value: string | undefined) {
       builtCommit = value;
     },
-    set foreignDeployOnEnvWrite(value: boolean) {
+    set foreignDeployOnEnvWrite(value: string | undefined) {
       foreignDeployOnEnvWrite = value;
     },
     set loseCreate(value: boolean) {
@@ -343,20 +343,21 @@ test("Render app create, update, rollback, and archive retain one diskless servi
   );
 });
 
-test("Render submits its own deploy when another commit deploys during an update", async () => {
-  const f = fixture();
-  const d = f.deployment;
-  const v1 = d.versions[0]!;
-  await f.provider.apply(d, v1);
-  f.foreignDeployOnEnvWrite = true;
-  await f.provider.apply(d, { ...v1, version: 2 });
-  const submitted = f.calls.filter((c) => c.method === "POST" && c.path === "/services/srv-app/deploys");
-  assert.equal(submitted.length, 2);
-  assert.ok(submitted.every((c) => c.body.commitId === sha));
-  const record = (await f.store.get(d.id))!;
-  assert.equal(record.liveVersion, 2);
-  assert.equal(record.pending, undefined);
-});
+for (const commit of ["f".repeat(40), sha])
+  test(`Render submits its own deploy when a deploy of ${commit === sha ? "the same" : "another"} commit starts during an update`, async () => {
+    const f = fixture();
+    const d = f.deployment;
+    const v1 = d.versions[0]!;
+    await f.provider.apply(d, v1);
+    f.foreignDeployOnEnvWrite = commit;
+    await f.provider.apply(d, { ...v1, version: 2 });
+    const submitted = f.calls.filter((c) => c.method === "POST" && c.path === "/services/srv-app/deploys");
+    assert.equal(submitted.length, 2);
+    assert.ok(submitted.every((c) => c.body.commitId === sha));
+    const record = (await f.store.get(d.id))!;
+    assert.equal(record.liveVersion, 2);
+    assert.equal(record.pending, undefined);
+  });
 
 test("Render clears a pending deploy built from another commit so a retry deploys again", async () => {
   const f = fixture();

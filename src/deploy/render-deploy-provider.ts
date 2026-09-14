@@ -43,6 +43,7 @@ export interface StoredRenderDeploy {
     runnerCommit: string;
     readinessNonce?: string;
     previousDeployIds: string[];
+    requested?: boolean;
     deployId?: string;
   };
 }
@@ -235,17 +236,21 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         }
         if (!record.pending) return { service, record };
         if (!record.pending.deployId) {
+          const pending = record.pending;
           const submitted = async () =>
             (await deployments(service)).find(
-              (d) => !record.pending!.previousDeployIds.includes(d.id) && d.commit?.id === record.pending!.runnerCommit,
+              (d) => !pending.previousDeployIds.includes(d.id) && d.commit?.id === pending.runnerCommit,
             );
-          let found = await submitted();
+          let found = pending.requested ? await submitted() : undefined;
           if (!found) {
+            if (!pending.requested) {
+              record = { ...record, pending: { ...pending, requested: true } };
+              await save(record);
+            }
             try {
               found =
-                (await api.request<Deploy>("POST", `${path(service)}/deploys`, {
-                  commitId: record.pending.runnerCommit,
-                })) ?? undefined;
+                (await api.request<Deploy>("POST", `${path(service)}/deploys`, { commitId: pending.runnerCommit })) ??
+                undefined;
             } catch (error) {
               if (error instanceof RenderApiError && error.rejected) {
                 await save({ ...record, pending: undefined });
@@ -256,7 +261,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
             }
           }
           if (!found?.id) throw new Error("Render did not return an app deployment ID");
-          record = { ...record, pending: { ...record.pending, deployId: found.id } };
+          record = { ...record, pending: { ...pending, requested: true, deployId: found.id } };
           await save(record);
         }
         if (record.pending?.deployId) {

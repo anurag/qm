@@ -70,7 +70,7 @@ for (const result of ["accepted", "absent", "missing_cursor", "repeated_cursor",
     if (result === "accepted" || result === "absent") {
       const record = await network.ensure(deployment, initial);
       assert.equal(record.environmentId, environment.id);
-      assert.equal(pages, 2);
+      assert.equal(pages, result === "absent" ? 4 : 2);
       assert.equal(posts, result === "absent" ? 1 : 0);
     } else {
       await assert.rejects(
