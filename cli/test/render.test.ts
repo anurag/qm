@@ -1733,3 +1733,20 @@ test("Render waits for the initial workflow registration to fail before adding c
   assert.equal(c.workflowEnv.CORE_SIGNING_SECRET, "e".repeat(64));
   assert.equal(d.saved().workflowBootstrap, undefined);
 });
+
+test("Render records a service after its creation reply is lost and ignores same-named services elsewhere", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const core = c.services.get("srv-acme-core")!;
+  c.services.set("srv-elsewhere", { ...core, id: "srv-elsewhere", environmentId: "evm-other" });
+  const state = d.saved();
+  delete state.services.core;
+  state.pendingCreate = "/services: acme-core";
+  writeFileSync(join(d.ctx.configDir, "render.resources.json"), JSON.stringify(state));
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.equal(d.saved().pendingCreate, undefined);
+  assert.deepEqual(d.saved().services.core, { id: "srv-acme-core", name: "acme-core", type: "web_service" });
+  assert.equal(c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/services").length, 0);
+});
