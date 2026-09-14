@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { createRenderAppNetwork } from "../src/deploy/render-app-network.ts";
-import type { RenderApi } from "../src/deploy/render-api.ts";
+import { RenderApiError, type RenderApi } from "../src/deploy/render-api.ts";
 import type { StoredRenderDeploy } from "../src/deploy/render-deploy-provider.ts";
 import type { Deployment } from "../src/deploy/deploy-store.ts";
 import { createNoopAdvisoryLock } from "../src/persistence/advisory-lock.ts";
@@ -25,7 +25,6 @@ for (const result of ["accepted", "absent", "missing_cursor", "repeated_cursor",
       deploymentId: deployment.id,
       token: "token",
       suspended: false,
-      environmentCreatePending: true,
     };
     await store.put(deployment.id, initial);
     const environment = {
@@ -71,7 +70,6 @@ for (const result of ["accepted", "absent", "missing_cursor", "repeated_cursor",
     if (result === "accepted" || result === "absent") {
       const record = await network.ensure(deployment, initial);
       assert.equal(record.environmentId, environment.id);
-      assert.equal(record.environmentCreatePending, undefined);
       assert.equal(pages, 2);
       assert.equal(posts, result === "absent" ? 1 : 0);
     } else {
@@ -84,3 +82,53 @@ for (const result of ["accepted", "absent", "missing_cursor", "repeated_cursor",
     }
   });
 }
+
+test("Render environment recovery adopts the environment when its create is rejected as a duplicate", async () => {
+  const deployment: Deployment = {
+    id: randomUUID(),
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    currentVersion: 1,
+    status: "stopped",
+    endpoint: null,
+    versions: [],
+  };
+  const store = createMemoryMap<StoredRenderDeploy>();
+  const initial: StoredRenderDeploy = { deploymentId: deployment.id, token: "token", suspended: false };
+  await store.put(deployment.id, initial);
+  const environment = {
+    id: "env-app",
+    name: `qm-app-${deployment.id}`,
+    projectId: "prj-test",
+    networkIsolationEnabled: true,
+  };
+  let lists = 0;
+  let posts = 0;
+  const api: RenderApi = {
+    async request<T>(method: string, path: string): Promise<T | null> {
+      if (path === "/projects/prj-test") return { owner: { id: "tea-test" } } as T;
+      if (method === "POST") {
+        posts++;
+        throw new RenderApiError(method, path, 409);
+      }
+      lists++;
+      return (lists === 1 ? [] : [{ environment }]) as T;
+    },
+  };
+  const network = createRenderAppNetwork({
+    api,
+    workspaceId: "tea-test",
+    projectId: "prj-test",
+    environmentId: "env-core",
+    postgresId: "dpg-test",
+    region: "oregon",
+    store,
+    locks: createNoopAdvisoryLock(),
+    name: (d) => `qm-app-${d.id}`,
+  });
+  const record = await network.ensure(deployment, initial);
+  assert.equal(record.environmentId, environment.id);
+  assert.equal(posts, 1);
+  assert.equal(lists, 2);
+  assert.deepEqual(await store.get(deployment.id), record);
+});

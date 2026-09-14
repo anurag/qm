@@ -96,10 +96,6 @@ export function createRenderAppStorage(opts: {
       const jobId = await findSubmittedJob(record.jobRequest);
       record = { ...record, jobId, jobRequest: jobId ? record.jobRequest : undefined };
       if (jobId) await opts.store.put(record.deploymentId, record);
-      if (!jobId && record.operation && record.operation !== operation) {
-        await provision(record, record.operation);
-        record = { ...record, enabled: record.operation === "enable", operation: undefined };
-      }
     }
     if (record.jobId) {
       if (!record.operation) throw new Error("Render app storage job has no saved operation");
@@ -130,12 +126,16 @@ unset MC_HOST_qm MC_CONFIG_ENV_FILE
 run_mc() { timeout -s TERM -k 5 30 mc --config-dir "$config" --no-color "$@" >/dev/null 2>&1; }
 printf '%s\\n%s\\n' "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" | run_mc alias set qm ${shq(endpoint.toString())} --api S3v4 --path on
 printf '%s' ${shq(policy)} > "$config/policy.json"
+printf '%s\\n' ${shq(password)} | run_mc admin user add qm ${shq(record.accessKey)}
 ${
   operation === "disable"
     ? `run_mc admin user disable qm ${shq(record.accessKey)}`
-    : `run_mc admin policy create qm ${shq(`qm-app-${record.accessKey}`)} "$config/policy.json"
-printf '%s\\n' ${shq(password)} | run_mc admin user add qm ${shq(record.accessKey)}
-run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(record.accessKey)}`
+    : `run_mc admin user enable qm ${shq(record.accessKey)}
+run_mc admin policy create qm ${shq(`qm-app-${record.accessKey}`)} "$config/policy.json"
+run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(record.accessKey)} || {
+  run_mc admin policy detach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(record.accessKey)}
+  run_mc admin policy attach qm ${shq(`qm-app-${record.accessKey}`)} --user ${shq(record.accessKey)}
+}`
 }
 `;
     const startCommand = `/bin/sh -c printf %s ${Buffer.from(script).toString("base64")} | base64 -d | /bin/sh`;

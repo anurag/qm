@@ -32,6 +32,8 @@ function fixture(appRegion?: string) {
   let ipAllowList: any[] = [];
   const deploys: any[] = [];
   let outcome = "live";
+  let builtCommit: string | undefined;
+  let foreignDeployOnEnvWrite = false;
   let loseCreate = false;
   let loseUpdate = false;
   let failure: { method: string; path: string; status?: number } | undefined;
@@ -135,6 +137,8 @@ function fixture(appRegion?: string) {
         return response({ value: activeEnv.find((row) => row.key === "QM_DEPLOYMENT_ID")?.value });
       if (path === "/services/srv-app/env-vars" && method === "PUT") {
         activeEnv = body;
+        if (foreignDeployOnEnvWrite)
+          deploys.unshift({ id: `dep-${deploys.length}`, status: "live", commit: { id: "f".repeat(40) } });
         return response(body);
       }
       if (path === "/services/srv-app/secret-files" && method === "PUT") {
@@ -148,7 +152,7 @@ function fixture(appRegion?: string) {
       if (path === "/services/srv-app/deploys" && method === "POST") {
         const deploymentId = activeEnv.find((row) => row.key === "QM_DEPLOYMENT_ID").value;
         assert.equal((await store.get(deploymentId))?.pending?.readinessNonce, manifestNonce);
-        const deploy = { id: `dep-${deploys.length}`, status: outcome, commit: { id: body.commitId } };
+        const deploy = { id: `dep-${deploys.length}`, status: outcome, commit: { id: builtCommit ?? body.commitId } };
         for (const previous of deploys)
           if (previous.status === "live" && outcome === "live") previous.status = "deactivated";
         deploys.unshift(deploy);
@@ -203,6 +207,12 @@ function fixture(appRegion?: string) {
     },
     set outcome(value: string) {
       outcome = value;
+    },
+    set builtCommit(value: string | undefined) {
+      builtCommit = value;
+    },
+    set foreignDeployOnEnvWrite(value: boolean) {
+      foreignDeployOnEnvWrite = value;
     },
     set loseCreate(value: boolean) {
       loseCreate = value;
@@ -331,6 +341,35 @@ test("Render app create, update, rollback, and archive retain one diskless servi
       .filter((c) => c.method === "POST" && c.path === "/services/srv-app/deploys")
       .every((c) => c.body.commitId === sha),
   );
+});
+
+test("Render submits its own deploy when another commit deploys during an update", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  await f.provider.apply(d, v1);
+  f.foreignDeployOnEnvWrite = true;
+  await f.provider.apply(d, { ...v1, version: 2 });
+  const submitted = f.calls.filter((c) => c.method === "POST" && c.path === "/services/srv-app/deploys");
+  assert.equal(submitted.length, 2);
+  assert.ok(submitted.every((c) => c.body.commitId === sha));
+  const record = (await f.store.get(d.id))!;
+  assert.equal(record.liveVersion, 2);
+  assert.equal(record.pending, undefined);
+});
+
+test("Render clears a pending deploy built from another commit so a retry deploys again", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  await f.provider.apply(d, v1);
+  f.builtCommit = "f".repeat(40);
+  await assert.rejects(f.provider.apply(d, { ...v1, version: 2 }), /different Git commit/);
+  assert.equal((await f.store.get(d.id))!.pending, undefined);
+  f.builtCommit = undefined;
+  await f.provider.apply(d, { ...v1, version: 2 });
+  assert.equal((await f.store.get(d.id))!.liveVersion, 2);
+  assert.equal(f.calls.filter((c) => c.method === "POST" && c.path === "/services/srv-app/deploys").length, 3);
 });
 
 test("Render recovers create and update replies without a duplicate service or deployment", async () => {

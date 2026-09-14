@@ -34,7 +34,6 @@ export interface StoredRenderDeploy {
   appRegion?: string;
   serviceId?: string;
   environmentId?: string;
-  environmentCreatePending?: boolean;
   token: string;
   liveVersion?: number;
   suspended: boolean;
@@ -237,7 +236,9 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         if (!record.pending) return { service, record };
         if (!record.pending.deployId) {
           const submitted = async () =>
-            (await deployments(service)).find((d) => !record.pending!.previousDeployIds.includes(d.id));
+            (await deployments(service)).find(
+              (d) => !record.pending!.previousDeployIds.includes(d.id) && d.commit?.id === record.pending!.runnerCommit,
+            );
           let found = await submitted();
           if (!found) {
             try {
@@ -268,8 +269,10 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
             throw new Error(`Render deploy ${deploy.id} ${deploy.status}`);
           }
           if (deploy?.status === "live" && (await ready(service, record))) {
-            if (deploy.commit?.id !== record.pending.runnerCommit)
+            if (deploy.commit?.id !== record.pending.runnerCommit) {
+              await save({ ...record, pending: undefined });
               throw new Error("The Render app runner was built from a different Git commit");
+            }
             record = {
               ...record,
               liveVersion: record.pending.version,
@@ -325,7 +328,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     const runtime = {
       runtime: "docker",
       envSpecificDetails: { dockerContext: ".", dockerfilePath: "deploy/render-runner/Dockerfile", dockerCommand: "" },
-      maxShutdownDelaySeconds: 300,
+      maxShutdownDelaySeconds: 45,
       healthCheckPath: "/__qm_ready",
     };
     if (!service || service.suspended === "suspended" || record.bootstrap) {

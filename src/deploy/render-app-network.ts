@@ -62,42 +62,42 @@ export function createRenderAppNetwork(opts: {
       await api.request<Environment>("GET", `/environments/${encodeURIComponent(environmentId)}`),
     );
   };
+  async function named(deployment: Deployment): Promise<Environment | undefined> {
+    const name = opts.name(deployment);
+    const matches: Environment[] = [];
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    do {
+      const query = new URLSearchParams({ projectId: opts.projectId, name, limit: "100" });
+      if (cursor) query.set("cursor", cursor);
+      const found = await api.request<Array<{ environment: Environment; cursor?: string }>>(
+        "GET",
+        `/environments?${query}`,
+      );
+      if (!Array.isArray(found)) throw new Error("Render returned an invalid app environment list");
+      matches.push(
+        ...found
+          .map(({ environment }) => environment)
+          .filter((env) => env.name === name && env.projectId === opts.projectId),
+      );
+      if (found.length < 100) break;
+      cursor = found.at(-1)?.cursor;
+      if (!cursor || cursors.has(cursor)) throw new Error("Render environment pagination did not advance");
+      cursors.add(cursor);
+    } while (cursor);
+    return matches.sort((a, b) => a.id.localeCompare(b.id))[0];
+  }
   return {
     assertEnvironment,
     async ensure(deployment: Deployment, initial: StoredRenderDeploy): Promise<StoredRenderDeploy> {
-      let record = initial;
-      if (record.environmentId) {
-        await assertEnvironment(deployment, record.environmentId);
-        return record;
+      if (initial.environmentId) {
+        await assertEnvironment(deployment, initial.environmentId);
+        return initial;
       }
       const project = await api.request<{ owner: { id: string } }>("GET", `/projects/${opts.projectId}`);
       if (project?.owner.id !== opts.workspaceId) throw new Error("Render project belongs to another workspace");
-      const matches: Environment[] = [];
-      let cursor: string | undefined;
-      const cursors = new Set<string>();
-      do {
-        const query = new URLSearchParams({ projectId: opts.projectId, name: opts.name(deployment), limit: "100" });
-        if (cursor) query.set("cursor", cursor);
-        const found = await api.request<Array<{ environment: Environment; cursor?: string }>>(
-          "GET",
-          `/environments?${query}`,
-        );
-        if (!Array.isArray(found)) throw new Error("Render returned an invalid app environment list");
-        matches.push(
-          ...found.map(({ environment }) => environment).filter((env) => env.name === opts.name(deployment)),
-        );
-        if (found.length < 100) break;
-        cursor = found.at(-1)?.cursor;
-        if (!cursor || cursors.has(cursor)) throw new Error("Render environment pagination did not advance");
-        cursors.add(cursor);
-      } while (cursor);
-      if (matches.length > 1) throw new Error("Render app environment identity is ambiguous");
-      let environment = matches[0];
-      if (environment && !record.environmentCreatePending)
-        throw new Error("An untracked Render environment has this app's name");
+      let environment = await named(deployment);
       if (!environment) {
-        record = { ...record, environmentCreatePending: true };
-        await opts.store.put(record.deploymentId, record);
         try {
           environment =
             (await api.request<Environment>("POST", "/environments", {
@@ -107,13 +107,12 @@ export function createRenderAppNetwork(opts: {
               protectedStatus: "protected",
             })) ?? undefined;
         } catch (error) {
-          if (error instanceof RenderApiError && error.rejected)
-            await opts.store.put(record.deploymentId, { ...record, environmentCreatePending: undefined });
-          throw error;
+          if (!(error instanceof RenderApiError && error.rejected)) throw error;
+          environment = await named(deployment);
+          if (!environment) throw error;
         }
       }
-      environment = check(deployment, environment);
-      record = { ...record, environmentId: environment.id, environmentCreatePending: undefined };
+      const record = { ...initial, environmentId: check(deployment, environment).id };
       await opts.store.put(record.deploymentId, record);
       return record;
     },

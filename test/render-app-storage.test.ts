@@ -326,8 +326,8 @@ for (const failure of ["503", "connection"])
                 if (failure === "503") throw new RenderApiError(method, path, 503);
                 throw new Error("Connection closed before job creation");
               }
-              if (operation === "disable") assert.equal(userExists, true);
-              else userExists = true;
+              if (script.includes("admin user add")) userExists = true;
+              assert.equal(userExists, true);
               enabled = operation === "enable";
               return { id: `job-${++jobs}` } as T;
             }
@@ -366,9 +366,8 @@ for (const failure of ["503", "connection"])
         const restarted = createRenderAppStorage(opts);
         const result = nextOperation === "enable" ? await restarted.ensure(id) : await restarted.suspend(id);
         const final = (await store.get(id))!;
-        const replay = failedOperation !== nextOperation ? [`POST ${failedOperation}`] : [];
-        assert.deepEqual(events, ["LIST", ...replay, `POST ${nextOperation}`]);
-        assert.equal(jobs, acceptedBeforeRetry + replay.length + 1);
+        assert.deepEqual(events, ["LIST", `POST ${nextOperation}`]);
+        assert.equal(jobs, acceptedBeforeRetry + 1);
         assert.equal(enabled, nextOperation === "enable");
         assert.equal(final.enabled, enabled);
         assert.equal(final.operation, undefined);
@@ -432,7 +431,7 @@ for (const failure of ["request", "missing cursor", "repeated cursor", "invalid 
     assert.deepEqual(await store.get(id), pending);
     searchFails = false;
     await createRenderAppStorage(opts).suspend(id);
-    assert.equal(posts, 3);
+    assert.equal(posts, 2);
     assert.equal((await store.get(id))!.enabled, false);
     assert.equal((await store.get(id))!.jobRequest, undefined);
   });
