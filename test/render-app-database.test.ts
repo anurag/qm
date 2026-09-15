@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
+import { createPostgresAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { test, type TestContext } from "node:test";
@@ -70,7 +70,7 @@ async function fixture(t: TestContext) {
       store: backing,
       keyMaterial,
       appEndpoint,
-      advisoryLock: createMemoryAdvisoryLock(),
+      advisoryLock: createPostgresAdvisoryLock(maps.pool),
     });
   return { root, store, maps, create, adminUrl: adminUrl.toString(), adminRole, coreDatabase };
 }
@@ -202,6 +202,7 @@ test("Render app databases preserve data and isolate app accounts from core data
       adminUrl: f.adminUrl,
       store: independentMaps.map<StoredRenderAppDatabase>("render_app_database_test"),
       keyMaterial,
+      advisoryLock: createPostgresAdvisoryLock(independentMaps.pool),
     });
     assert.equal((await restored.ensure(firstId)).DATABASE_URL, first);
     assert.deepEqual((await query(first, "SELECT value FROM items")).rows, [{ value: "retained" }]);
