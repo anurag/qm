@@ -66,8 +66,6 @@ export interface Config {
   sharingPosture: SharingPosture;
   sandboxScopeDefaults?: SandboxScopeDefaults;
   sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "render";
-  sandboxSecondaryBackend?:
-    "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "render";
   deployProvider: "docker" | "aws" | "fly" | "porter" | "render";
   egressServiceHosts?: string[];
   brandingDefault?: OrgBranding;
@@ -1277,9 +1275,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
   const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
-  if (sandboxBackend === "render" || env.DEPLOY_PROVIDER === "render") {
-    if (!env.RENDER_WORKSPACE_ID?.trim()) throw new Error("Render providers require RENDER_WORKSPACE_ID");
-  }
   const sandboxScopeDefaults: SandboxScopeDefaults = {};
   if (env.SANDBOX_SCOPE_BACKENDS) {
     const values: unknown = JSON.parse(env.SANDBOX_SCOPE_BACKENDS);
@@ -1291,6 +1286,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         throw new Error("Invalid SANDBOX_SCOPE_BACKENDS entry: " + kind);
       sandboxScopeDefaults[parsed] = sandboxBackendEnvStrict(value, "SANDBOX_SCOPE_BACKENDS." + kind);
     }
+  }
+  if (
+    sandboxBackend === "render" ||
+    Object.values(sandboxScopeDefaults).includes("render") ||
+    env.DEPLOY_PROVIDER === "render"
+  ) {
+    if (!env.RENDER_WORKSPACE_ID?.trim()) throw new Error("Render providers require RENDER_WORKSPACE_ID");
   }
 
   if (env.SANDBOX_SECONDARY_BACKEND?.trim()) {

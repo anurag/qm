@@ -157,7 +157,8 @@ ${bold("DEPLOY (operator)")} ${dim("— runs in the deployment directory")}
   logs [<service>] [-f] [--tail <n>]       tail service logs (omit <service> for all, interleaved)
   down [--purge]                           stop the deployment (--purge deletes Docker or Render data)
   rollback [--to <target>]                 roll back workloads (AWS: prior deployment manifest,
-                                           or manifest id/release label)
+                                           or manifest id/release label; Render: the last
+                                           successful deployment, without --to)
   sandbox build [--from <img>] [--tag <t>] [--dry-run]
                                            build and validate the sandbox image locally
 

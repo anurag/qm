@@ -51,7 +51,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
         kind: "any",
         conditions: [
           { kind: "target", target: "render" },
-          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "render" },
+          { kind: "sandbox-backend", backend: "render" },
           { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "render" },
         ],
       },

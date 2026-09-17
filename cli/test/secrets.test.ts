@@ -401,6 +401,17 @@ test("scope-selected providers require both Modal and Sprites credentials", () =
     assert.ok(required.includes(name), name);
 });
 
+test("a scope routed to Render requires RENDER_API_KEY like the runtime gate", () => {
+  const required = (core: Record<string, string>) =>
+    computedSecrets(makeConfig({ env: { core } }))
+      .filter((secret) => secret.required)
+      .map((secret) => secret.name);
+  assert.ok(!required({ SANDBOX_BACKEND: "e2b" }).includes("RENDER_API_KEY"));
+  assert.ok(
+    required({ SANDBOX_BACKEND: "e2b", SANDBOX_SCOPE_BACKENDS: '{"personal":"render"}' }).includes("RENDER_API_KEY"),
+  );
+});
+
 test("shared Fly publishing requires private peers only when selected", () => {
   for (const provider of ["fly", "aws"]) {
     for (const shared of [false, true]) {

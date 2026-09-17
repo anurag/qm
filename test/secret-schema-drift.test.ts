@@ -142,6 +142,27 @@ test("both porter roles share PORTER_DEPLOY_API_TOKEN", () => {
   );
 });
 
+test("both Render roles and a scope routed to Render share RENDER_API_KEY", () => {
+  assert.deepEqual(validateCoreSecretEnv({ SANDBOX_BACKEND: "render" } as NodeJS.ProcessEnv), ["RENDER_API_KEY"]);
+  assert.deepEqual(validateCoreSecretEnv({ DEPLOY_PROVIDER: "render" } as NodeJS.ProcessEnv), ["RENDER_API_KEY"]);
+  assert.deepEqual(
+    validateCoreSecretEnv({
+      SANDBOX_BACKEND: "e2b",
+      SANDBOX_SCOPE_BACKENDS: '{"personal":"render"}',
+      E2B_API_KEY: "e2b-1",
+    } as NodeJS.ProcessEnv),
+    ["RENDER_API_KEY"],
+  );
+  assert.deepEqual(
+    validateCoreSecretEnv({
+      SANDBOX_BACKEND: "render",
+      DEPLOY_PROVIDER: "render",
+      RENDER_API_KEY: "rnd_1",
+    } as NodeJS.ProcessEnv),
+    [],
+  );
+});
+
 test("shared Fly publishing validates its private peer secret", () => {
   const env = { DEPLOY_PROVIDER: "fly", FLY_DEPLOY_API_TOKEN: "token", FLY_DEPLOY_SHARED_APP_NAME: "acme-apps" };
   assert.deepEqual(validateCoreSecretEnv(env), ["FLY_DEPLOY_WIREGUARD_PEERS"]);

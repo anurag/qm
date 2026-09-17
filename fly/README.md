@@ -16,8 +16,9 @@ Where the image is used:
 - **Deployment layer builds.** A deployment's `sandbox/Dockerfile` may build FROM a
   published base via `qm sandbox build` (a local validation build).
 
-Runtime sandbox backends (sprites, smolmachines, e2b, modal) do **not** boot this
-image. Sprites and smolmachines boot their platform's stock image. E2B boots the
+Runtime sandbox backends (sprites, smolmachines, e2b, modal, render) do **not** boot this
+image. Sprites and smolmachines boot their platform's stock image. Render boots the
+platform's native Render Sandboxes. E2B boots the
 template named by `E2B_TEMPLATE_ID` (build and publish it from
 `deploy/e2b/e2b.Dockerfile`) or, when unset, E2B's stock `base` template. Modal boots
 `MODAL_IMAGE` or, when unset, a default assembled at runtime from a digest-pinned

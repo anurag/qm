@@ -401,6 +401,12 @@ test("SANDBOX_BACKEND: unset defaults to local (dev only); the retired secondary
   assert.ok(!("sandboxSecondaryBackend" in config));
 });
 
+test("Render selected through a scope route still requires RENDER_WORKSPACE_ID", () => {
+  const env = { SANDBOX_SCOPE_BACKENDS: '{"personal":"render"}', RENDER_API_KEY: "rnd_1" };
+  assert.throws(() => loadConfig(env), /RENDER_WORKSPACE_ID/);
+  assert.equal(loadConfig({ ...env, RENDER_WORKSPACE_ID: "tea-1" }).sandboxScopeDefaults?.personal, "render");
+});
+
 test("Fly identity and Slack runtime settings are parsed once into Config", () => {
   const config = loadConfig({
     FLY_APP_NAME: "qm-core",
