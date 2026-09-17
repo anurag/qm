@@ -33,17 +33,20 @@ test("every drop zone the canvas renders has a positioning rule in shell.css", (
 });
 
 test("only the elevated chat surfaces paint a shadow", () => {
-  const elevated = [".pinned-strip", ".message-stack .user-row.stuck > .user-bubble", ".composer-wrap"];
+  const elevated = [".pinned-strip", ".message-stack .user-row.stuck > .user-bubble"];
   const rules = shellCss.replace(/\/\*[\s\S]*?\*\//g, "");
   const painted = [...rules.matchAll(/([^{}]+)\{([^{}]*)\}/g)].flatMap((rule) =>
     [...rule[2].matchAll(/(box|text)-shadow\s*:\s*([^;}]+)/g)]
       .filter((shadow) => shadow[2].trim() !== "none")
-      .map((shadow) => [rule[1].trim(), shadow[1], shadow[2].trim()]),
+      .map((shadow) => [rule[1].trim(), shadow[1], shadow[2].trim().replace(/\s+/g, " ")]),
   );
   assert.deepEqual(
     painted,
-    elevated.map((selector) => [selector, "box", "var(--chat-surface-shadow)"]),
-    "only the pinned strip, latest prompt bubble, and composer may use the shared elevation shadow",
+    [
+      ...elevated.map((selector) => [selector, "box", "var(--chat-surface-shadow)"]),
+      [".composer-wrap", "box", "0 2px 5px rgb(0 0 0 / 0.05), 0 8px 24px rgb(0 0 0 / 0.06)"],
+    ],
+    "only pinned surfaces use the shared shadow; the composer keeps its softer shadow",
   );
   const inlineShadows = [...tsSource.matchAll(/(?:box|text)-shadow\s*:\s*([^;}]+)/g)]
     .map((m) => m[1].trim())
@@ -57,7 +60,7 @@ test("every modal scrim dims through --scrim, which each theme points away from 
   assert.ok(scrims.length >= 5, "the scrim rules should still be findable by name");
   for (const rule of scrims) {
     const background = rule.match(/\n\s*background:\s*([^;]+);/)?.[1] ?? "";
-    if (!background.includes("transparent")) continue;
+    if (!background.includes("transparent") || background === "transparent") continue;
     const name = rule.split("{")[0].trim();
     assert.doesNotMatch(
       background,

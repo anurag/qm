@@ -1,6 +1,6 @@
 # Web UI plugin
 
-An end-user web surface with a custom ChatGPT/Claude-style chat shell, stitched to the
+An end-user web surface with a custom chat shell, connected to the
 platform core. It still uses Pi's `Agent` state machine and selected Pi web utilities
 for markdown, attachment loading, and model metadata, but the visible conversation UI is
 owned by this plugin. Two processes:
@@ -43,6 +43,83 @@ Env (see `.env.example`): `CORE_API_URL` (default `http://localhost:8080`),
 `WEB_UI_PRINCIPALS` (csv allowlist; empty = any id, **dev only**),
 and `CORE_SIGNING_SECRET` (same value as the core when source-auth is enabled).
 
+## Suggested activities
+
+Suggested activity generation is **on by default** when the configured harness supports
+it. Set `SUGGESTED_ACTIVITIES_ENABLED=false` on core to disable generation. Optionally
+set `WEB_UI_SUGGESTED_ACTIVITIES` on web to a JSON array for fixed fallback starters;
+unset it as well to hide suggestions entirely. No deployment-specific activity content
+is bundled into the public application.
+
+```json
+[
+  {
+    "id": "weekly-brief",
+    "title": "Wake up to a fresh briefing",
+    "prompt": "Let's set up a recurring briefing on the topics I follow.",
+    "icon": "schedule"
+  },
+  {
+    "id": "project-app",
+    "title": "Build a home for my projects",
+    "prompt": "Let's build a private app to keep track of my projects.",
+    "icon": "app"
+  }
+]
+```
+
+The first three entries appear above the empty personal-chat composer with colored
+icons, without a heading or expansion link. Selecting an entry fills and focuses
+an editable draft; it never submits a turn. Suggestions fade and collapse while a draft
+or attachment is present and do not appear in existing chats, shared contexts,
+or compact pane views. Collapsed suggestions are inert and hidden from assistive
+technology; reduced-motion preferences disable the transition. Dark mode uses
+subdued blue-gray suggestion text. Drafts use the normal persistence path.
+
+Each entry requires a unique lowercase alphanumeric/hyphen `id` (up to 64
+characters), `title` (up to 65 characters), `prompt` (up to 1,200 characters), and
+`icon` (one emoji or `yc` for the orange YC mark; legacy `schedule`, `app`, `deck`,
+`people`, `calendar`, and `book` values also render as emoji). Configuration
+accepts up to 12 entries and 20,000 characters. Invalid configuration fails startup
+without printing its contents. Restart the web service after changing it.
+
+The authenticated `/me` response supplies the configured fallback and whether generation is enabled.
+Fixed starters are organization-wide; keep them free of personal activity or credentials.
+
+When enabled, opening a new personal chat enrolls the user in an ordinary personal
+cron named **Refresh my suggested activities**. Its first run starts immediately;
+subsequent runs happen around 2am in the browser's timezone, with the minute
+staggered by user. The cron runner uses the normal owner-scoped session, runtime
+selection, memory, history, tools, and authorized data access. It has no delivery
+destination. The standing task in `src/suggestions/activities.ts` asks it to research
+relevant context, avoid mutations or notifications, and return three validated
+activity objects. Draft prompts use a natural, collaborative voice, such as "Let's...",
+with relevant facts and uncertainties as neutral context, without attributing knowledge,
+feelings, or beliefs to the user. They preserve explicit user
+preferences and scope while leaving the approach to the responding agent. It does not
+create a separate reduced-context model call.
+
+The UI reads the latest valid result from the cron's completed personal session,
+including responses larger than the truncated fire-log preview. It displays the
+previous result while a refresh runs and briefly polls for the first/new result;
+opening another chat does not normally invoke a model. Failed initial generations
+can retry after five minutes. Existing cron queueing, run persistence, authorization,
+fire history, and failure handling apply.
+
+Cadence is reevaluated hourly. Ten or more user messages in sampled recent private
+conversations within 24 hours increases refreshes to every four hours; otherwise it
+returns to nightly. Accounts with no observed conversation activity or suggestion
+visits for 30 days are paused until activity returns. The owner can pause, delete,
+or edit the cron; custom task text and schedules are preserved. The global disable
+flag pauses managed jobs. Background work must also be enabled.
+
+Set `SUGGESTED_ACTIVITIES_CONTEXT` on core for rollout guidance (up to 8,000
+characters). For a YC rollout, describe WaaS sourcing, investor CRM, deck review,
+office hours, and Bookface advice there; optionally provide fallback starters on web.
+Guidance updates propagate to unmodified managed tasks. Public QM has no YC context
+by default. Suggestions are private to their owner; generated sessions use the
+same scoped access controls as other personal work.
+
 ## On a phone
 
 Below 860px the same build behaves like an app rather than a shrunken desktop:
@@ -79,8 +156,8 @@ the CSS media queries, the composer, and the split canvas.
   alongside the light/dark choice.
   The UI drives Pi's `Agent` with a custom `streamFn` (`src/core-bridge.ts`) instead of
   mounting Pi's stock `AgentInterface`.
-- **Slash-command skill picker** — type `/` at the start of the composer for a Codex-style
-  autofill of the **skills** available to you (B6): icon · name · description · scope, with the
+- **Slash-command skill picker** — type `/` at the start of the composer to browse the
+  **skills** available to you (B6): icon · name · description · scope, with the
   typed letters emboldened. Arrow/Tab/Enter to choose (it inserts `/<name> `), Esc/click-out to
   dismiss. The list is the signed-in principal's _visible_ skills — the same set the agent gets
   materialized into a DM turn — fetched once per session via the server's `/api/skills` proxy
@@ -178,3 +255,34 @@ the CSS media queries, the composer, and the split canvas.
 
 This is a **surface plugin**: it carries its own front-end deps (Vite, lit, pi-web-ui) and
 runs as a separate process. The zero-runtime-dep core is untouched.
+
+## Chat connection chips
+
+Chat authorization links share the connector service logos. Composio links use recognized
+service names in their Markdown labels; unknown or ambiguous names keep a generic icon.
+The destination URL and authorization behavior do not depend on the inferred logo.
+Gmail, Google Calendar, Google Drive, and Google Sheets artwork comes from
+[Simple Icons v16.0.0](https://github.com/simple-icons/simple-icons/tree/16.0.0)
+(CC0) and is bundled locally with the existing connector SVG artwork.
+
+## Cohort welcome and app picker
+
+Set `WEB_UI_WELCOME_COHORT=F26` on the web surface to show the cohort welcome in a new user's empty chat. It replaces the automatic first agent turn for that deployment; ordinary chat starts when the user sends a message. The greeting uses the signed-in display name. The welcome remains above the messages in the earliest personal web conversation, including when reopened. It is selected from persisted session creation times. The champagne and soft flutter sequence replays on refresh only before the first message and respects reduced motion.
+
+The picker reads Composio's live catalog in usage order, omits apps that need no authorization, and searches the complete paginated catalog. Known services use local logos; remaining catalog logos use Composio's logo host. Selecting an app submits to the authenticated web surface and opens the provider's authorization link directly. Consent remains on the provider page. The Slack action opens the existing administrator setup page.
+
+The core bridge accepts a verified portal identity and uses either that person's own `COMPOSIO_API_KEY` keychain entry or an enabled org service credential granted to them. Secrets never enter the browser. The agent skill reads `/v1/composio/identity` to use the same organization/person identity as the picker. A company project key retains Composio's existing project-wide access boundary; the identity selects accounts and does not isolate them from other holders of that key.
+
+### Local connection-return preview
+
+Open `http://localhost:8138/?connectionDemo=1` on the local dev instance. This loopback-only UI mode replaces app authorization with a provider simulation offering approval, cancellation, and failure. It makes a full navigation round trip with a callback URL, attempt nonce, status, and connected-account ID. The simulated verifier checks its own record rather than trusting `status=success` in the URL.
+
+Session storage retains the account-scoped attempt for twenty minutes, picker query, expanded state, scroll position, and simulated connections. Returning skips the welcome animation, verifies the simulated result, clears callback parameters, and restores the picker. Reset clears the preview's simulated connections. No provider authorization, tokens, or actual connected accounts are changed by this mode.
+
+Real authorization supplies a callback URL on the configured public origin and returns to the same conversation. A twenty-minute, user-bound session-storage attempt retains the account ID, originating widget, search, expanded state, and scroll position. The server lists only the authenticated actor’s active connected accounts; the browser verifies the expected account before showing success and removes callback parameters. Connected apps are refreshed on page load and window focus. Returning skips the welcome animation. Reply widgets become available after the reply is persisted. The loopback preview remains a separate simulation and does not connect real accounts.
+
+The welcome uses the organization's configured branding `orgName`, falling back to “your company” when it is unavailable.
+
+### Setup widgets in agent replies
+
+In web chat, an assistant reply can include `::connect-apps{}` as a standalone paragraph to render the reusable app picker. The separate `::add-to-slack{}` directive renders the Slack setup action for administrators; include both to show both. It omits the welcome and animation and uses the signed-in viewer’s authorization routes. The Composio skill teaches this response for requests to connect apps or reopen setup. Code blocks, quotations, and inline examples remain ordinary text. The directive persists in the transcript and renders again when reopened. Connected-account status retains the same limitations as the onboarding picker and local return-flow preview.

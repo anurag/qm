@@ -189,10 +189,10 @@ test("system prompt is ordered cached-prefix → volatile tail, with memory LAST
     "Skills",
     "Where you are",
     "Where scheduled tasks post",
-    "Your logins",
     "Connected apps",
     "What you remember",
   ];
+  assert.doesNotMatch(prompt, /\n## Your logins\n/);
   const positions = ordered.map((title) => ({ title, at: headingAt(title) }));
   positions.reduce((prev, cur) => {
     assert.ok(cur.at > prev.at, `"## ${cur.title}" must come AFTER "## ${prev.title}" (got ${cur.at} vs ${prev.at})`);
@@ -469,12 +469,11 @@ test("the system prompt is byte-identical across two turns a minute apart; the c
     "Skills",
     "Where you are",
     "Where scheduled tasks post",
-    "Your logins",
     "Connected apps",
   ]) {
     assert.ok(systemOf(first.reply ?? "").includes(`\n## ${title}\n`), `expected "## ${title}" in the system prompt`);
   }
-  for (const title of ["The user's local time", "What you remember"]) {
+  for (const title of ["The user's local time", "What you remember", "Your logins"]) {
     assert.ok(
       !systemOf(first.reply ?? "").includes(`\n## ${title}\n`),
       `"## ${title}" must not be in the system prompt`,
@@ -795,7 +794,24 @@ for (const location of [
     assert.equal(read.status, "ok", read.reason);
     assert.doesNotMatch(read.reply ?? "", /!security-risk|!security-screen-unavailable/);
     assert.equal(disk.has("skills/carried-method/SKILL.md"), false);
+    assert.equal(disk.has("skills/local-method/SKILL.md"), false);
+    const localRead = await orchestrator.handleTurn({
+      surface: "test",
+      actor,
+      origin: { kind: "human" },
+      conversation: {
+        kind: "channel",
+        channelRef: "C1",
+        threadRef: `C1:read-local-${location}`,
+        audience: [actor],
+        publishMembers: [actor],
+      },
+      text: "!read skills/local-method/SKILL.md",
+    });
+    assert.equal(localRead.status, "ok", localRead.reason);
+    assert.match(localRead.reply ?? "", /Do useful work/);
     assert.ok(disk.has("skills/local-method/SKILL.md"));
+    assert.equal(disk.has("skills/carried-method/SKILL.md"), false);
   });
 }
 

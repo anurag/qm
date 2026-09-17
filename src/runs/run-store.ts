@@ -1,3 +1,4 @@
+import type { SubscribeOptions } from "../util/event-bus.ts";
 import type { TurnResult } from "../types.ts";
 import type { OrchestratorInput } from "../core/orchestrator.ts";
 
@@ -41,6 +42,7 @@ export interface EnqueueInput {
   request: OrchestratorInput;
   dedupKey?: string;
   maxAttempts?: number;
+  idleDelivery?: { threadRef: string; target: string };
 }
 
 export interface EnqueueResult {
@@ -51,12 +53,16 @@ export interface EnqueueResult {
 export interface RunStore {
   readonly maxClaims?: number;
 
+  subscribeAvailable?(listener: () => void, options?: SubscribeOptions & { pollMs?: number }): () => void;
+
   enqueue(input: EnqueueInput): Promise<EnqueueResult>;
   getByDedupKey(dedupKey: string): Promise<Run | null>;
 
   claim(workerId: string, ttlMs: number): Promise<Run | null>;
 
   claimById(runId: string, workerId: string, ttlMs: number): Promise<Run | null>;
+
+  claimForSession(sessionId: string, workerId: string, ttlMs: number): Promise<Run | null>;
 
   heartbeat(runId: string, leaseToken: string, ttlMs: number): Promise<boolean>;
 
@@ -75,6 +81,10 @@ export interface RunStore {
 
   noteTurnUserSeq(runId: string, seq: number): Promise<boolean>;
 
+  latestForThread(threadRef: string, opts?: { excludePrivateMessages?: boolean }): Promise<Run | null>;
+  pendingReturns(limit?: number, afterId?: string): Promise<Run[]>;
+  markReturned(runId: string): Promise<void>;
+
   onTerminal(listener: (run: Run) => void): void;
 
   get(runId: string): Promise<Run | null>;
@@ -85,9 +95,11 @@ export interface RunStore {
 
   withdraw(runId: string): Promise<boolean>;
 
+  editPendingText(runId: string, text: string, expectedText: string): Promise<boolean>;
+
   activeSessionIds(): Promise<string[]>;
 
-  list(opts?: { limit?: number }): Promise<Run[]>;
+  list(opts?: { limit?: number; threadRef?: string }): Promise<Run[]>;
 
   reapExpired(
     onRetired?: (sessionIds: string[]) => Promise<void>,

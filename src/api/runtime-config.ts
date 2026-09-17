@@ -1,3 +1,4 @@
+import { gatewayModelCatalog } from "../model/gateway-models.ts";
 import type { ServerDeps } from "./deps.ts";
 import type { ScopeId } from "../types.ts";
 import { orgScope } from "./routes/shared.ts";
@@ -14,6 +15,7 @@ import {
   modelUnavailableReason,
   thinkingLevelsForHarness,
   harnessSupportsFastMode,
+  codexProviderModelId,
   type HarnessId,
 } from "../model/pi-models.ts";
 import { builtInModelCatalog, selectableCatalogForHarness, selectableModelCatalog } from "../model/model-catalog.ts";
@@ -32,16 +34,21 @@ export type RuntimeDeps = Pick<
 
 export function runtimeFallback(ctx: { deps: RuntimeDeps }): { harnessId: HarnessId; modelId: string } {
   const harnessId = isHarnessId(ctx.deps.harnessId) ? ctx.deps.harnessId : "pi";
-  return { harnessId, modelId: ctx.deps.baseModelDefault ?? defaultModelForHarness(harnessId) };
+  const gatewayIds = gatewayModelCatalog(true).map((model) => model.id);
+  const providers =
+    gatewayIds.length && ctx.deps.providerKeys
+      ? { ...ctx.deps.providerKeys, modelIds: new Set(gatewayIds) }
+      : undefined;
+  return { harnessId, modelId: ctx.deps.baseModelDefault ?? defaultModelForHarness(harnessId, undefined, providers) };
 }
 
 export async function runtimeConfigBody(ctx: { deps: RuntimeDeps }, scope: ScopeId) {
   const config = ctx.deps.config!;
+  const configuredKeys = ctx.deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
+  const managedKeys = ctx.deps.modelCredentials ? await ctx.deps.modelCredentials.availability() : configuredKeys;
   const fallback = runtimeFallback(ctx);
   const org = orgScope(ctx.deps);
   const approvedHarnesses = ((await config.getApprovedHarnessesDurable()) ?? [fallback.harnessId]).filter(isHarnessId);
-  const configuredKeys = ctx.deps.providerKeys ?? ALL_PROVIDERS_AVAILABLE;
-  const managedKeys = ctx.deps.modelCredentials ? await ctx.deps.modelCredentials.availability() : configuredKeys;
   const providersFor = (harnessId: string) => modelProviderAvailabilityFor(harnessId, configuredKeys, managedKeys);
   const catalog =
     ctx.deps.modelCredentials && managedKeys.openrouter
@@ -153,7 +160,7 @@ export function validateRuntimeChoice(choice: RuntimeChoice): string | null {
 }
 
 export async function webuiModelEnabled(ctx: { deps: RuntimeDeps }, modelId: string): Promise<boolean> {
-  modelId = modelId.replace(/^codex\//, "");
+  modelId = codexProviderModelId(modelId);
   const config = ctx.deps.config!;
   const picker = await config.getWebuiModelsDurable(orgScope(ctx.deps));
   if (picker == null || picker.includes(modelId)) return true;

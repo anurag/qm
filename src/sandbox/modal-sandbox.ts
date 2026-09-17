@@ -11,6 +11,7 @@ import { shq } from "../util/shell.ts";
 import { nonInteractiveShellPrefix, DROPPED_PROXY_ENV, forceThroughProxyEnv } from "./sandbox-env.ts";
 import { createExecProcessSessions, type ExecProcessIo } from "./exec-process-session.ts";
 import { materializeRoLayers } from "./ro-layers.ts";
+import { withConnectorSdk, type ConnectorSdkBundle } from "./connector-sdk.ts";
 import { createLayerToolInstaller } from "./layer-tool-install.ts";
 import type { LayerInstallFile } from "../deployment/load-layer.ts";
 import {
@@ -84,6 +85,7 @@ export interface ModalSandboxOptions extends BlobStagingOptions {
   egressProxyUrl?: string;
   extraTools?: string[];
   credentialPaths?: CredentialPathSpec[];
+  connectorSdk?: () => Promise<ConnectorSdkBundle>;
   layerToolFiles?: () => readonly LayerInstallFile[];
   fileChunkBytes?: number;
   rotationHoldMs?: number;
@@ -420,8 +422,8 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
     processSessions: true,
     egressEnforcement: "none",
     spec: {
-      os: "Ubuntu — Modal sandbox (24h max lifetime; home checkpoints have limited retention; publish durable work to git or Files)",
-      runtimes: ["Python 3"],
+      os: "Debian 12 — Modal sandbox (24h max lifetime; home checkpoints have limited retention; publish durable work to git or Files)",
+      runtimes: ["Node 24", "Python 3"],
       get tools() {
         return visibleTools(["git", "curl", "jq", "tar", "python3", ...(opts.extraTools ?? [])]);
       },
@@ -455,9 +457,14 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
     withSession(name, (session) => session.writeFileBytes(absPath, data));
   const readAbsBytes = (name: string, absPath: string): Promise<Uint8Array | null> =>
     withSession(name, (session) => session.readFileBytes(absPath));
-  const installLayerTools = opts.layerToolFiles ? createLayerToolInstaller(opts.layerToolFiles) : null;
+  const installLayerTools = withConnectorSdk(
+    HOME_DIR,
+    createLayerToolInstaller(opts.layerToolFiles ?? (() => [])),
+    opts.connectorSdk,
+  );
 
   const execFileOps = createExecFileOps({
+    combineRemoveAndList: true,
     label: "modal",
     exec: (id, script, t) => execRaw(id, script, t),
     writeInline: (id, abs, data) => writeAbsBytes(id, abs, data),
@@ -540,9 +547,13 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
 
       try {
         const credLinks = scratch ? "" : ` && ${ephemeralCredLinkScript(HOME_DIR, opts.credentialPaths ?? [])}`;
-        const prep = await execRaw(name, `mkdir -p ${shq(workspaceDir)}${credLinks}`, 60);
-        if (prep.code !== 0)
-          throw new Error(`modal provision prep failed: ${(prep.stderr || prep.stdout).slice(0, 200)}`);
+        await installLayerTools(
+          {
+            exec: (script, t) => execRaw(name, script, t),
+            writeAbs: (abs, data) => writeAbsBytes(name, abs, data),
+          },
+          `mkdir -p ${shq(workspaceDir)}${credLinks}`,
+        );
 
         await materializeRoLayers(
           workspace,
@@ -555,10 +566,6 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
           },
           { manifest: RO_LAYERS_MANIFEST, tar: RO_LAYERS_TAR, label: "modal" },
         );
-        await installLayerTools?.({
-          exec: (script, t) => execRaw(name, script, t),
-          writeAbs: (abs, data) => writeAbsBytes(name, abs, data),
-        });
 
         return handle;
       } catch (err) {

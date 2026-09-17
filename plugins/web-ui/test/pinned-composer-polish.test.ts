@@ -19,7 +19,7 @@ test("editable background activity is rendered inside the composer surface", () 
     chat,
     /composerForm\(agent, html`\$\{glanceTier \? nothing : liveWorkStatus\(agent\)\} \$\{backgroundActivityStrip\(\)\}`\)/,
   );
-  assert.match(composer, /<form class="composer-wrap[^]*?\$\{header\}/);
+  assert.match(composer, /<form[^]*?class="composer-wrap[^]*?\$\{header\}/);
   assert.match(
     css,
     /\.composer-wrap > \.bg-activity \{[^}]*background: color-mix\(in srgb, var\(--secondary\) 40%, var\(--background\)\);/,
@@ -27,8 +27,14 @@ test("editable background activity is rendered inside the composer surface", () 
 });
 
 test("composer status rows share the responsive input font size", () => {
-  const sizes = [...css.matchAll(/--composer-font-size: (\d+)px/g)].map((match) => Number(match[1]));
-  assert.deepEqual(sizes, [15, 16]);
+  const sizes = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].flatMap((rule) =>
+    [...rule[2].matchAll(/--composer-font-size: (\d+)px/g)].map((match) => [rule[1].trim(), Number(match[1])]),
+  );
+  assert.deepEqual(sizes, [
+    [".composer-wrap", 15],
+    [".composer-wrap", 16],
+    ["body.app-edit-embed .composer-wrap", 13],
+  ]);
   for (const selector of [".live-work-line", ".bg-activity-strip", ".composer-input"]) {
     const blocks = css.matchAll(new RegExp(`${selector.replaceAll(".", "\\.")} \\{([^}]+)\\}`, "g"));
     const declarations = [...blocks].flatMap((match) => [...match[1].matchAll(/font-size: ([^;]+);/g)]);
@@ -43,4 +49,13 @@ test("queued cards tuck beneath the next card just as the queue tucks beneath th
   assert.doesNotMatch(strip, /gap:/);
   assert.match(strip, /margin: 0 auto -10px;/);
   assert.match(stacked, /margin-top: -10px;/);
+});
+
+test("collapsed prompt content uses a readable two-line cutoff", () => {
+  const selector = ".message-stack .user-row:not(:has(~ .user-row)):not(.pin-expanded) .user-bubble > .pin-content";
+  const rule = css.slice(css.indexOf(`${selector} {`)).split("}")[0] ?? "";
+  assert.match(rule, /max-height: 2lh;/);
+  assert.match(rule, /overflow: hidden;/);
+  assert.doesNotMatch(rule, /mask-image|blur/);
+  assert.equal(css.includes(`${selector}::after`), false);
 });

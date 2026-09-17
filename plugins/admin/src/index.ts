@@ -28,12 +28,17 @@ function signedHeaders(method: string, corePath: string, rawBody: string): Recor
   return signedRequestHeaders(CORE_SIGNING_SECRET, method, corePath, rawBody, { "content-type": "application/json" });
 }
 
-const BASE_HTML = readFileSync(
-  join(dirname(fileURLToPath(import.meta.url)), "../public/index.html"),
-  "utf8",
-).replaceAll("__ADMIN_BASE__", () => ADMIN_BASE_PATH);
+const BASE_HTML = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../public/index.html"), "utf8")
+  .replaceAll("__ADMIN_BASE__", () => ADMIN_BASE_PATH)
+  .replace(
+    "<style data-admin-components></style>",
+    () =>
+      "<style data-admin-components>" +
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../public/admin-components.css"), "utf8") +
+      "</style>",
+  );
 const BRAND_MARK = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../public/brand-mark.svg"));
-const ADMIN_SCRIPT = BASE_HTML.match(/<script>([\s\S]*?)<\/script>/)?.[1] ?? "";
+const ADMIN_SCRIPT = BASE_HTML.match(/<script>([\s\S]*?)<\/script>/i)?.[1] ?? "";
 const ADMIN_CSP = [
   "default-src 'self'",
   `script-src 'sha256-${createHash("sha256").update(ADMIN_SCRIPT).digest("base64")}'`,
@@ -42,7 +47,7 @@ const ADMIN_CSP = [
   "connect-src 'self'",
   "frame-ancestors 'none'",
   "base-uri 'none'",
-  "form-action 'self'",
+  `form-action 'self'${process.env.QM_SLACK_SERVICE_URL ? ` ${new URL(process.env.QM_SLACK_SERVICE_URL).origin} https://slack.com` : ""}`,
   "object-src 'none'",
 ].join("; ");
 
@@ -121,6 +126,8 @@ async function forward(
       },
       ...(body ? { body } : {}),
     });
+    const timing = r.headers.get("server-timing");
+    if (timing) res.setHeader("server-timing", timing);
     if (r.body && gzipAccepted(req)) {
       res.writeHead(r.status, {
         "content-type": "application/json",
@@ -286,7 +293,7 @@ const WRITES = new Map<string, string[]>([
   ["skills", ["DELETE"]],
   ["skill-packs", ["POST", "PATCH", "DELETE"]],
   ["users", ["PUT", "POST"]],
-  ["slack-installation", ["PUT", "DELETE"]],
+  ["slack-installation", ["POST", "PUT", "DELETE"]],
   ["model-providers", ["PUT", "DELETE"]],
   ["model-registry", ["POST", "PUT", "DELETE"]],
   ["custom-providers", ["PUT", "DELETE"]],
@@ -345,6 +352,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const method = req.method ?? "GET";
 
   const serveShell = async (): Promise<void> => {
+    if (process.env.QM_SLACK_SERVICE_URL) res.setHeader("referrer-policy", "strict-origin");
     const shell = brandedShell(await brandCache.forRender());
     const gz = gzipAccepted(req);
     const etag = gz ? shell.gzipEtag : shell.etag;
@@ -413,7 +421,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         );
       }
       const scopeId = decodeURIComponent(rest);
-      return forward(req, res, principal, "GET", `/v1/admin/scopes/${encodeURIComponent(scopeId)}`);
+      return forward(req, res, principal, "GET", `/v1/admin/scopes/${encodeURIComponent(scopeId)}${url.search}`);
     }
     if (method === "POST" && rest.endsWith("/auto-flagger/test")) {
       const scope = decodeURIComponent(rest.slice(0, -"/auto-flagger/test".length));

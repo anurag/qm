@@ -15,11 +15,13 @@ import {
   type SpawnedProcess,
 } from "@anthropic-ai/claude-agent-sdk";
 import { fromJSONSchema, type ZodObject } from "zod";
+import { contentText, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { CONFIG_DEFAULTS, type Config } from "../config.ts";
 import { isDeliveryNote } from "../core/attachments.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 import {
   contextTokenBudgetForModel,
+  getRequiredModel,
   DEFAULT_AGENT_MODEL_ID,
   modelSupportedByHarness,
   modelSupportsFastMode,
@@ -28,14 +30,9 @@ import { startSignalPoll, type RunSignalStore } from "../runs/run-signal-store.t
 import type { TaskStatus, TaskStore } from "../tasks/task-store.ts";
 import type { ScopeId } from "../types.ts";
 import { swallow } from "../util/errors.ts";
-import { compactTranscript, deterministicCompactSummary } from "./context-compaction.ts";
+import { summarizeHistory } from "./history-summary.ts";
 import { defineHarness, type Harness, type HarnessTurnInput, type HarnessTurnResult } from "./harness.ts";
-import {
-  buildDetectionPrompt,
-  CONTEXT_COMPACTION_PROMPT,
-  parseDetectVerdict,
-  renderDetectPrompt,
-} from "./pi-harness.ts";
+import { buildDetectionPrompt, parseDetectVerdict, renderDetectPrompt } from "./pi-harness.ts";
 import { coreToolOptions } from "./agent-tools.ts";
 import {
   bridgedTools,
@@ -48,7 +45,7 @@ import {
   transitionTask,
   type HarnessToolPlumbing,
 } from "./harness-shared.ts";
-import { reconstructMessagesFromHistory, seedPriorTurns, type PiReplayMessage } from "./replay.ts";
+import { reconstructMessagesFromHistory, seedPriorTurns, zeroUsage, type PiReplayMessage } from "./replay.ts";
 
 export interface ClaudeHarnessOptions extends HarnessToolPlumbing {
   modelId?: string | ((scope?: ScopeId) => string | undefined);
@@ -353,6 +350,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
     const initial = userMessage(text, turn.images);
     let pendingPrompts = 1;
     let stopped = false;
+    let interrupted = false;
     let result: SDKResultMessage | null = null;
     const thinking: string[] = [];
     const flushThinking = async () => {
@@ -446,6 +444,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
     active.add(sdkQuery);
     const interrupt = async (fromUser: boolean) => {
       stopped ||= fromUser;
+      interrupted = true;
       queue.close();
       await sdkQuery.interrupt().catch(() => undefined);
       controller.abort();
@@ -542,7 +541,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       queue.push(initial);
       const consume = (async () => {
         for await (const message of sdkQuery) {
-          if (settled) break;
+          if (settled || interrupted) break;
           if (message.type === "assistant") {
             const usage = message.message.usage;
             const seen = {
@@ -645,6 +644,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
           result = message;
           await recordStep(message);
           await flushThinking();
+          if (interrupted) break;
           const terminal = ref.runtimeHandoff || ref.silentRequested || ref.pausedOnApproval;
           const text = message.subtype === "success" && !terminal ? message.result.trim() : "";
           if (text) {
@@ -678,26 +678,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             ])
           : consume);
       } catch (error) {
-        if (!controller.signal.aborted || error instanceof NonRetryableTurnError) throw error;
-        const reply = streamedText.trim();
-        await flushThinking();
-        if (reply && !ref.runtimeHandoff && !ref.silentRequested && !ref.pausedOnApproval) {
-          const finalEntry = await turn.emit({
-            type: "assistant",
-            payload: { text: reply, stopped: true },
-            scopeLabel: turn.scopeLabel,
-          });
-          await tapeReplyCheckpoint(turn, finalEntry);
-        }
-        return {
-          reply: ref.runtimeHandoff || ref.silentRequested || ref.pausedOnApproval ? "" : reply,
-          ...(!ref.runtimeHandoff || stopped ? { stopped: true as const } : {}),
-          ...(ref.runtimeHandoff ? { runtimeHandoff: ref.runtimeHandoff } : {}),
-          ...(ref.silentRequested ? { silent: true } : {}),
-          ...(ref.pendingApprovals?.length ? { pendingApprovals: ref.pendingApprovals } : {}),
-          ...(ref.pausedOnApproval ? { pausedOnApproval: true } : {}),
-          modelCalls: Math.max(1, callUsage.size),
-        };
+        if ((!interrupted && !controller.signal.aborted) || error instanceof NonRetryableTurnError) throw error;
       }
       const finalResult = result as SDKResultMessage | null;
       const stoppedPartial = async (): Promise<HarnessTurnResult> => {
@@ -719,8 +700,10 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
           ...(ref.silentRequested ? { silent: true } : {}),
           ...(ref.pendingApprovals?.length ? { pendingApprovals: ref.pendingApprovals } : {}),
           ...(ref.pausedOnApproval ? { pausedOnApproval: true } : {}),
+          modelCalls: Math.max(1, callUsage.size),
         };
       };
+      if (interrupted && (pendingPrompts > 0 || finalResult?.subtype !== "success")) return stoppedPartial();
       if (!finalResult) {
         if (controller.signal.aborted) return stoppedPartial();
         throw new Error("Claude Agent SDK ended without a result");
@@ -728,6 +711,12 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       if (finalResult.subtype !== "success") {
         if (stopped || ref.runtimeHandoff) return stoppedPartial();
         throw new Error(finalResult.errors.join("; ") || `Claude Agent SDK failed: ${finalResult.subtype}`);
+      }
+      if (
+        !toolsEnabled &&
+        (finalResult.is_error || (finalResult.stop_reason && finalResult.stop_reason !== "end_turn"))
+      ) {
+        throw new Error(`Claude utility response did not complete (${finalResult.stop_reason ?? "error"})`);
       }
       const terminal = ref.runtimeHandoff || ref.silentRequested || ref.pausedOnApproval;
       const reply = terminal ? "" : finalResult.result.trim();
@@ -830,16 +819,35 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
         }
       },
       async compactHistory(input) {
-        try {
-          const out = await single(CONTEXT_COMPACTION_PROMPT, compactTranscript(input.history), undefined, {
-            recordModelCall: input.recordModelCall,
+        const model = getRequiredModel(resolveModelId());
+        const summarize = oneShotRunner(async (turn) => {
+          const result = await runPrompt(turn, false);
+          if (result.stopped) throw new Error("Compaction was interrupted before completion");
+          return result;
+        });
+        return summarizeHistory(input.history, model, async (_model, context, options) => {
+          const text = await summarize(
+            context.systemPrompt ?? "",
+            context.messages.map((message) => contentText(message.content)).join("\n\n"),
+            options?.signal,
+            { recordModelCall: input.recordModelCall },
+            model.id,
+          );
+          const stream = createAssistantMessageEventStream();
+          stream.end({
+            role: "assistant",
+            content: [{ type: "text", text: text ?? "" }],
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            usage: zeroUsage(),
+            stopReason: "stop",
+            timestamp: Date.now(),
           });
-          return out ?? deterministicCompactSummary(input.history);
-        } catch (error) {
-          swallow("claude: compact", error);
-          return deterministicCompactSummary(input.history);
-        }
+          return stream;
+        });
       },
+
       contextTokenBudget(scopeLabel, model) {
         const id = modelSupportedByHarness(model, "claude")
           ? model!

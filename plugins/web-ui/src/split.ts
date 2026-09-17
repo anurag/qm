@@ -1,8 +1,10 @@
 import { openSessionShare } from "./session-share";
+import { preserveTranscriptScroll } from "./transcript-viewport";
 import { html, nothing, render, type TemplateResult } from "lit";
 import { ref } from "lit/directives/ref.js";
 import {
   Archive,
+  ArrowUpLeft,
   Binoculars,
   Box,
   Brain,
@@ -46,7 +48,7 @@ import {
   type SplitEdge,
 } from "./split-layout";
 import { paneKindByKey, paneKindEntry } from "./pane-kinds";
-import { preservingFocus } from "./pane-focus";
+import { focusComposerOnPaneClick, preservingFocus } from "./pane-focus";
 import { attachTooltip, tip } from "./tooltip";
 import { icon, workingWave } from "./ui";
 import { contextsState, scopeTitle } from "./contexts";
@@ -74,7 +76,7 @@ import {
   syncWorkingPulse,
 } from "./sessions";
 import { conversationBackground, type RowIndicators } from "./session-list";
-import { setScopedSession, type SessionTool } from "./session-scope";
+import { scopeToolCount, setScopedSession, type SessionTool } from "./session-scope";
 import {
   fetchTranscript,
   fetchUiState,
@@ -197,6 +199,14 @@ function buildDock(): DockviewApi {
     disableFloatingGroups: true,
   });
   const inner = dockEl.querySelector(":scope > .dv-dockview") as HTMLElement | null;
+  let restoreScroll = () => {};
+  api.onWillMutateLayout(() => {
+    restoreScroll = preserveTranscriptScroll(host);
+  });
+  api.onDidMutateLayout(() => {
+    restoreScroll();
+    restoreScroll = () => {};
+  });
   const box = (inner ?? dockEl).getBoundingClientRect();
   if (box.width > 0) api.layout(box.width, box.height, true);
   const holdTileCap = (e: DockviewWillDropEvent): void => {
@@ -220,11 +230,17 @@ function buildDock(): DockviewApi {
   });
   const guarded = new WeakSet<IDockviewGroupPanel>();
   api.onDidLayoutChange(() => {
+    const wasSingle = host.classList.contains("single-pane");
+    host.classList.toggle("single-pane", api.panels.length === 1);
+    if (wasSingle !== host.classList.contains("single-pane")) {
+      for (const actions of groupActions) actions.draw();
+    }
     for (const group of api.groups) {
       if (guarded.has(group)) continue;
       guarded.add(group);
       group.model.onWillDrop(holdTileCap);
     }
+    if (appState.currentView === "chats") syncUrlFromState();
     if (paneDrag) refreshPaneDrag();
     persistSoon();
   });
@@ -234,6 +250,7 @@ function buildDock(): DockviewApi {
   });
   api.onDidMaximizedGroupChange(() => {
     for (const a of groupActions) a.draw();
+    persistSoon();
   });
   dockEl.addEventListener("pointerdown", (e) => {
     if (!(e.target instanceof Element) || !e.target.closest(".dv-sash")) return;
@@ -786,7 +803,7 @@ function computeHeaderSignature(): string {
   return (dockApi?.panels ?? [])
     .map(
       (p) =>
-        `${p.id}|${paneSession(p)?.id ?? ""}|${paneCrumb(p) ?? ""}|${paneTitle(p)}|${paneIsWorking(p)}|${paneAwaitsInput(p)}|${paneBackground(p)?.label ?? ""}|${paneKindBadge(p)}`,
+        `${p.id}|${paneSession(p)?.id ?? ""}|${paneCrumb(p) ?? ""}|${paneTitle(p)}|${paneIsWorking(p)}|${paneAwaitsInput(p)}|${paneBackground(p)?.label ?? ""}|${paneKindBadge(p)}|${paneSession(p)?.parentSessionId ?? ""}|${sessionsState.list.find((row) => row.id === paneSession(p)?.parentSessionId)?.title ?? ""}`,
     )
     .join("~");
 }
@@ -803,6 +820,13 @@ function refreshHeaders(): void {
   for (const a of groupActions) a.draw();
   for (const c of paneContents.values()) c.syncTitle();
   syncDocumentTitle();
+  if (appState.currentView === "chats") syncUrlFromState();
+}
+
+export function singlePaneSessionId(): string | null {
+  if (!dockApi || dockApi.panels.length !== 1) return null;
+  const params = panelParams(dockApi.panels[0]!);
+  return paneKindEntry(params) ? null : (params.sessionId ?? null);
 }
 
 function paneSession(panel: IDockviewPanel): CoreSession | undefined {
@@ -940,6 +964,7 @@ class PaneContent implements IContentRenderer {
     this.panel = p.containerApi.getPanel(p.api.id) ?? null;
     this.params = (p.params ?? {}) as PaneParams;
     this.element.dataset.paneId = this.panelId;
+    focusComposerOnPaneClick(this.element, () => p.api.isActive);
     paneContents.set(this.panelId, this);
     this.resize.observe(this.element);
     this.syncZones();
@@ -1048,9 +1073,30 @@ class PaneContent implements IContentRenderer {
   }
 }
 
-function sessionActions(sessionId: string, inTab: boolean): TemplateResult {
+function sessionActions(sessionId: string, inTab: boolean, panelId: string): TemplateResult {
   const cls = inTab ? "split-tab-close" : "split-group-session-action";
-  return html`<button
+  const parentId = sessionsState.list.find((row) => row.id === sessionId)?.parentSessionId;
+  const parent = parentId ? sessionsState.list.find((row) => row.id === parentId) : undefined;
+  return html`${
+      parent
+        ? html`<button
+            type="button"
+            class="icon-btn subtle ${cls}"
+            aria-label=${`Back to parent: ${sessionTitle(parent)}`}
+            ${tip(`Back to ${sessionTitle(parent)}`)}
+            @pointerdown=${(e: Event) => {
+              if (inTab) e.stopPropagation();
+            }}
+            @click=${(e: Event) => {
+              if (inTab) e.stopPropagation();
+              focusPane(panelId);
+              void openSession(parent);
+            }}
+          >
+            ${icon(ArrowUpLeft, 13)}
+          </button>`
+        : nothing
+    }<button
       type="button"
       class="icon-btn subtle ${cls} split-tab-share"
       ${tip("Share conversation")}
@@ -1170,7 +1216,7 @@ class PaneTab implements ITabRenderer {
         ${
           this.inStrip
             ? html`<span class="split-tab-actions">
-                ${sessionId ? sessionActions(sessionId, true) : nothing}
+                ${sessionId ? sessionActions(sessionId, true, panel.id) : nothing}
                 <button
                   class="icon-btn subtle split-tab-close"
                   type="button"
@@ -1279,6 +1325,8 @@ class GroupActions implements IHeaderActionsRenderer {
       return g?.activePanel ?? g?.panels[0] ?? null;
     };
     const panel = activePanel();
+    const scope = panel ? paneScopeId(panel) : null;
+    const single = dockApi?.panels.length === 1;
     const sessionId =
       panel && !paneKindEntry(panelParams(panel)) ? (panelParams(panel).sessionId ?? paneSession(panel)?.id) : null;
     const maximized = props.api.isMaximized();
@@ -1288,6 +1336,7 @@ class GroupActions implements IHeaderActionsRenderer {
       this.draw();
       if (p) openPaneTool(p, tool);
     };
+    if (single) this.menuOpen = false;
     const menu = this.menuOpen
       ? html`
           <div
@@ -1352,36 +1401,57 @@ class GroupActions implements IHeaderActionsRenderer {
       },
     ];
     render(
-      html`<span class="split-tools">
-          <button
-            class="icon-btn subtle split-tools-btn ${this.menuOpen ? "active" : ""}"
-            type="button"
-            ${tip("Tools")}
-            aria-label="Tools"
-            aria-haspopup="menu"
-            aria-expanded=${this.menuOpen ? "true" : "false"}
-            @click=${() => {
-              this.menuOpen = !this.menuOpen;
-              this.draw();
-            }}
-          >
-            ${icon(MoreHorizontal, 15)}
-          </button>
-          ${menu}
-        </span>
-        ${sessionId ? sessionActions(sessionId, false) : nothing}
-        ${buttons.map(
-          (b) =>
-            html`<button
-              class="icon-btn subtle${b.cls ?? ""}"
-              type="button"
-              ${tip(b.label)}
-              aria-label=${b.label}
-              @click=${b.run}
-            >
-              ${b.glyph}
-            </button>`,
-        )}`,
+      html`${
+        single
+          ? html`<span class="split-single-tools">
+              ${PANE_TOOLS.map((t) => {
+                const count = scope ? scopeToolCount(t.tool, scope, () => this.draw()) : null;
+                return html`<button
+                  class="session-tool"
+                  type="button"
+                  aria-label=${t.label}
+                  ${tip(t.label)}
+                  @click=${() => runTool(t.tool)}
+                >
+                  ${icon(t.glyph, 15)}${count ? html`<span class="session-tool-count">${count}</span>` : nothing}
+                </button>`;
+              })}
+            </span>`
+          : html`<span class="split-tools">
+              <button
+                class="icon-btn subtle split-tools-btn ${this.menuOpen ? "active" : ""}"
+                type="button"
+                ${tip("Tools")}
+                aria-label="Tools"
+                aria-haspopup="menu"
+                aria-expanded=${this.menuOpen ? "true" : "false"}
+                @click=${() => {
+                  this.menuOpen = !this.menuOpen;
+                  this.draw();
+                }}
+              >
+                ${icon(MoreHorizontal, 15)}
+              </button>
+              ${menu}
+            </span>`
+      }
+      ${sessionId ? sessionActions(sessionId, false, panel!.id) : nothing}
+      ${
+        single
+          ? nothing
+          : buttons.map(
+              (b) =>
+                html`<button
+                  class="icon-btn subtle${b.cls ?? ""}"
+                  type="button"
+                  ${tip(b.label)}
+                  aria-label=${b.label}
+                  @click=${b.run}
+                >
+                  ${b.glyph}
+                </button>`,
+            )
+      }`,
       this.element,
     );
   }
@@ -1389,6 +1459,7 @@ class GroupActions implements IHeaderActionsRenderer {
   dispose(): void {
     document.removeEventListener("click", this.onDocClick);
     groupActions.delete(this);
+    this.props = null;
   }
 }
 

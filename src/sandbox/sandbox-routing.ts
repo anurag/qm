@@ -1,5 +1,5 @@
 import type { SandboxResources } from "./sandbox-resources.ts";
-import type { WorkspaceLayer } from "../types.ts";
+import { parseScopeId, type ScopeKind, type WorkspaceLayer } from "../types.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { swallow, swallowAs } from "../util/errors.ts";
 import {
@@ -19,6 +19,17 @@ import {
 export type SandboxBackendName =
   "sprites" | "aws" | "local" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "render";
 
+export type SandboxScopeDefaults = Partial<Record<ScopeKind, SandboxBackendName>>;
+
+export function sandboxDefaultForScope(
+  scope: string | undefined,
+  fallback: SandboxBackendName,
+  defaults?: SandboxScopeDefaults,
+): SandboxBackendName {
+  const kind = scope ? parseScopeId(scope).kind : null;
+  return (kind && defaults?.[kind]) || fallback;
+}
+
 export interface SandboxRoute {
   backend: SandboxBackendName;
   migratedAt?: string;
@@ -32,6 +43,7 @@ export interface RoutingSandboxOptions {
   backends: Partial<Record<SandboxBackendName, Sandbox>>;
   routes: DurableMap<SandboxRoute>;
   defaultBackend: SandboxBackendName;
+  scopeDefaults?: SandboxScopeDefaults;
   resources?: SandboxResources;
   onError?: (e: { category: string; code: string; message: string; scopeLabel?: string }) => void;
 }
@@ -57,7 +69,7 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
 
   async function pick(scopeId: string): Promise<{ name: SandboxBackendName; sandbox: Sandbox }> {
     const route = await routeFor(scopeId);
-    const name = route?.backend ?? defaultBackend;
+    const name = route?.backend ?? sandboxDefaultForScope(scopeId, defaultBackend, opts.scopeDefaults);
     const sandbox = backends[name];
     if (sandbox) return { name, sandbox };
     opts.onError?.({
@@ -92,7 +104,7 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
 
   async function pickStrict(scopeId: string): Promise<Sandbox> {
     const route = await routeFor(scopeId);
-    const name = route?.backend ?? defaultBackend;
+    const name = route?.backend ?? sandboxDefaultForScope(scopeId, defaultBackend, opts.scopeDefaults);
     const sandbox = backends[name];
     if (!sandbox) {
       throw new Error(
@@ -133,8 +145,9 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
   const router: Sandbox = {
     profile: fallback.profile,
 
-    async profileFor(scopeId: string): Promise<AgentComputerProfile> {
-      const resource = await opts.resources?.resolve(scopeId);
+    async profileFor(scopeId: string, sandboxId?: string): Promise<AgentComputerProfile> {
+      const resource = sandboxId ? await opts.resources?.get(sandboxId) : await opts.resources?.resolve(scopeId);
+      if (sandboxId && !resource) throw new Error("sandbox inventory unavailable");
       if (resource) {
         const sandbox = backends[resource.backend];
         if (!sandbox) throw new Error(`sandbox backend unavailable: ${resource.backend}`);
@@ -191,6 +204,14 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
     removeDir(handle, relDir) {
       const remove = () => forHandle(handle).removeDir(handle, relDir);
       return useHandle(handle, remove);
+    },
+    removeDirAndList(handle, removeRelDir, listRelDir) {
+      return useHandle(handle, async () => {
+        const sandbox = forHandle(handle);
+        if (sandbox.removeDirAndList) return sandbox.removeDirAndList(handle, removeRelDir, listRelDir);
+        await sandbox.removeDir(handle, removeRelDir);
+        return sandbox.listDir(handle, listRelDir);
+      });
     },
     teardown(handle, tdOpts?: TeardownOptions): Promise<void> {
       return useHandle(handle, () => forHandle(handle).teardown(handle, tdOpts));

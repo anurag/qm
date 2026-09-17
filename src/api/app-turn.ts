@@ -1,3 +1,4 @@
+import { isSubagentThreadRef } from "../sessions/session-syscalls.ts";
 import type { Conversation, Principal, TurnRequest, TurnResult } from "../types.ts";
 import { orgId as orgIdOf } from "../config.ts";
 import { scopeId } from "../types.ts";
@@ -24,6 +25,7 @@ import { resolveRuntimeChoiceDurable } from "../harness/harness-router.ts";
 import { swallow, swallowAs } from "../util/errors.ts";
 import { sleep } from "../util/async.ts";
 import { GENERIC_FAILURE_CLAUSE } from "../../plugins/chassis/src/failure-copy.ts";
+import { conversationFollowup } from "../wake/conversation-status.ts";
 
 import type { App, AppDeps } from "./app-types.ts";
 import { STALE_LEASE_GRACE_MS } from "./app-types.ts";
@@ -55,8 +57,11 @@ export function createTurnMethods(
   | "listSessionApprovals"
   | "pendingApprovalForThread"
   | "getRun"
+  | "subscribeRun"
+  | "syncRunStream"
   | "activeRunForThread"
   | "withdrawRun"
+  | "editQueuedRun"
   | "signalRun"
   | "replayOrphanedRunSignals"
 > {
@@ -75,7 +80,8 @@ export function createTurnMethods(
   } = h;
   const { shouldRouteToSpine, markTriggerHandled, addressedWakeText } = ambient;
   return {
-    async turn(req: TurnRequest): Promise<TurnResult> {
+    async turn(req: TurnRequest, replay?: { signalDedupKey: string }): Promise<TurnResult> {
+      const startedAt = performance.now();
       await deps.refreshModels?.();
       await deps.identity.refresh();
       const actor: Principal = deps.identity.resolve(req.actor);
@@ -122,6 +128,20 @@ export function createTurnMethods(
         }
       }
 
+      if (req.surface === "webhook" && req.triggered && !sessionParticipantIds) {
+        sessionParticipantIds = [actor.id];
+      }
+
+      if (isSubagentThreadRef(req.conversation.threadRef)) {
+        const target = await deps.sessions.getByThread(req.conversation.threadRef);
+        if (
+          !target?.spawnMeta ||
+          target.scopeId !== conversationScope(req.conversation, actor.id) ||
+          !(await deps.sessions.getForParticipant(target.id, actor.id)) ||
+          !(await h.principalCanWriteScope(actor.id, target.scopeId))
+        )
+          return { status: "refused", reason: "you cannot continue that subagent session" };
+      }
       const orgRuntimeScope = scopeId("org", orgIdOf());
       const turnRuntimeScope =
         req.conversation.kind === "dm"
@@ -249,10 +269,20 @@ export function createTurnMethods(
         ...(publishMembers ? { publishMembers } : {}),
       };
 
-      const origin = resolveTurnOrigin(req);
+      const approvedRequest = req.approval ? (await deps.approvals?.get(req.approval.requestId))?.request : undefined;
+      const sameApprovedMessage =
+        approvedRequest?.text === req.text &&
+        approvedRequest.actor.externalId === req.actor.externalId &&
+        approvedRequest.conversation.threadRef === req.conversation.threadRef;
+      let privateRequest = req.privateSessionMessage ? req : undefined;
+      if (approvedRequest?.privateSessionMessage) privateRequest = approvedRequest;
+      const origin = resolveTurnOrigin(privateRequest ?? req);
 
       const input = {
         surface: req.surface,
+        ...(sameApprovedMessage && approvedRequest?.sessionSenderId
+          ? { sessionSenderId: approvedRequest.sessionSenderId }
+          : {}),
         ...(req.deliveryTarget ? { deliveryTarget: req.deliveryTarget } : {}),
         ...(req.deliveryCandidates?.length ? { deliveryCandidates: req.deliveryCandidates } : {}),
         actor,
@@ -272,6 +302,13 @@ export function createTurnMethods(
         ...(!individualAuth && req.model ? { model: req.model } : {}),
         ...turnModelOptions(req),
         ...(req.readOnly ? { readOnly: true } : {}),
+        ...(privateRequest
+          ? {
+              privateSessionMessage: true as const,
+              sessionMessageDepth: privateRequest.sessionMessageDepth,
+              readOnly: true,
+            }
+          : {}),
         ...(req.skipMemory ? { skipMemory: true } : {}),
         ...(req.unattendedGrants?.length ? { unattendedGrants: req.unattendedGrants } : {}),
         ...(req.botActor ? { botActor: true } : {}),
@@ -299,6 +336,7 @@ export function createTurnMethods(
       }
       const blocked = await pendingApprovalResultForThread(conversation.threadRef, actor.id, { alwaysBlock: true });
       let request = input;
+      let idleDelivery: { threadRef: string; target: string } | undefined;
       if (blocked) {
         const record = req.approval ? await deps.approvals?.get(req.approval.requestId) : undefined;
         const blockedSession = blocked.sessionId ? await deps.sessions.get(blocked.sessionId) : null;
@@ -341,6 +379,8 @@ export function createTurnMethods(
         if (req.approval) dedupKey = `${dedupKey}:approval:${req.approval.requestId}:${req.approval.approved}`;
       }
 
+      if (replay) dedupKey = replay.signalDedupKey;
+
       if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
 
       if (
@@ -351,17 +391,108 @@ export function createTurnMethods(
         !req.spawned &&
         !req.idempotencyKey
       ) {
-        const live = await deps.runs.activeForThread(conversation.threadRef);
+        const conversationRouting =
+          req.surface === "slack" && conversation.kind === "dm" && origin.kind === "human" && !req.botActor;
+        if (conversationRouting && input.deliveryTarget && !req.gatewayContext?.details?.thread_ts) {
+          idleDelivery = { threadRef: conversation.threadRef, target: input.deliveryTarget.split(":")[0]! };
+        }
+        const conversationRuns = conversationRouting
+          ? (await deps.runs.list({ threadRef: conversation.threadRef })).filter(
+              (run) => run.request.actor.id === actor.id && resolveTurnOrigin(run.request).kind === "human",
+            )
+          : [];
+        const relatedRuns = conversationRuns.filter(
+          (run) => !run.sessionId.startsWith(`${conversation.threadRef}:status:`),
+        );
+        let live =
+          (await deps.runs.activeForThread(conversation.threadRef)) ??
+          relatedRuns.find((run) => !isTerminal(run.status)) ??
+          (redeliveryKey && deps.ambientJudge && !req.botActor ? relatedRuns[0] : null) ??
+          null;
+        let targetedCancel = false;
         const liveOriginKind = live ? resolveTurnOrigin(live.request).kind : undefined;
         const personIntoAutomation =
           liveOriginKind === "automation" &&
           (origin.kind === "human" || (origin.kind === "ambient" && origin.live === true)) &&
           !(origin.kind === "human" && isHalt(req.text));
         if (live && redeliveryKey && live.dedupKey === redeliveryKey) return { status: "silent" };
-        if (live && !isTerminal(live.status) && !personIntoAutomation) {
+        if (live && !personIntoAutomation) {
+          if (
+            conversationRouting &&
+            origin.kind === "human" &&
+            !req.botActor &&
+            redeliveryKey &&
+            deps.ambientJudge &&
+            live.request.actor.id === actor.id &&
+            liveOriginKind === "human"
+          ) {
+            const sourceSession = await deps.sessions.getByThread(live.request.conversation.threadRef);
+            if (!sourceSession || (await deps.sessions.participantsOf(sourceSession.id)).includes(actor.id)) {
+              const decision = await conversationFollowup({
+                request: input,
+                live,
+                entries: sourceSession ? await deps.sessions.visibleEntries(sourceSession.id, actor.id) : [],
+                relatedRuns: conversationRuns,
+                entriesForTask: async (run) => {
+                  const session = await deps.sessions.getByThread(run.request.conversation.threadRef);
+                  if (!session || !(await deps.sessions.participantsOf(session.id)).includes(actor.id)) return [];
+                  return deps.sessions.visibleEntries(session.id, actor.id);
+                },
+                sourceKey: redeliveryKey,
+                judge: async (system, prompt, signal) => {
+                  const started = Date.now();
+                  const raw = await deps.ambientJudge!(system, prompt, signal);
+                  deps.auditLog.record({
+                    at: Date.now(),
+                    principalId: actor.id,
+                    action: "conversation.route",
+                    resource: redeliveryKey,
+                    scopeLabel: conversationScope(conversation, actor.id),
+                    status: raw ? "answered" : "unavailable",
+                    detail: JSON.stringify({ latencyMs: Date.now() - started, input: JSON.parse(prompt), raw }),
+                  });
+                  return raw;
+                },
+              });
+              if (!decision) throw new Error("Conversation routing did not resolve; message must be retried");
+              if ("target" in decision) {
+                live = decision.target;
+                targetedCancel = decision.cancel;
+                if (isTerminal(live.status)) {
+                  if (targetedCancel) return { status: "ok", reply: "That task has already finished." };
+                  const { run, deduped } = await deps.runs.enqueue({
+                    sessionId: live.sessionId,
+                    request: {
+                      ...input,
+                      deliveryTarget: req.gatewayContext?.details?.thread_ts
+                        ? input.deliveryTarget
+                        : (live.request.deliveryTarget ?? input.deliveryTarget),
+                      conversation: { ...input.conversation, threadRef: live.request.conversation.threadRef },
+                    },
+                    dedupKey: redeliveryKey,
+                    maxAttempts: deps.maxAttempts,
+                  });
+                  if (deduped) return { status: "silent" };
+                  return req.async ? { status: "queued", runId: run.id, conversationAside: true } : drive(run.id);
+                }
+              } else {
+                const statusRequest = decision.request;
+                const { run, deduped } = await deps.runs.enqueue({
+                  sessionId: statusRequest.conversation.threadRef,
+                  request: statusRequest,
+                  ...(statusRequest.deliveryTarget === input.deliveryTarget ? { idleDelivery } : {}),
+                  dedupKey: redeliveryKey,
+                  maxAttempts: deps.maxAttempts,
+                });
+                if (deduped) return { status: "silent" };
+                return req.async ? { status: "queued", runId: run.id, conversationAside: true } : drive(run.id);
+              }
+            }
+          }
+          const targetRun = live;
           const steerText = attributedSteerText(
             actor,
-            origin.kind === "ambient" ? null : live.request.actor.id,
+            origin.kind === "ambient" ? null : targetRun.request.actor.id,
             req.text,
           );
           let injectedText = steerText;
@@ -374,7 +505,7 @@ export function createTurnMethods(
               ...(session ? { sessionId: session.id } : {}),
             });
             if (decision === "block")
-              return req.async ? { status: "queued", runId: live.id, steered: true } : drive(live.id);
+              return req.async ? { status: "queued", runId: targetRun.id, steered: true } : drive(targetRun.id);
             if (decision === "unscreened") injectedText = `${unscreenedNotice("mid-turn message")}\n${steerText}`;
           }
           // A mid-run message can carry files. They can't be materialized into
@@ -391,32 +522,44 @@ export function createTurnMethods(
             situation: origin.kind === "ambient" ? "ambientUpdate" : "addressed",
             ts: String(req.clientSentAt ?? Date.now()),
             text: injectedText,
-            halt: origin.kind === "human" && isHalt(req.text),
+            halt: origin.kind === "human" && (targetedCancel || isHalt(req.text)),
             ...(fileNames.length ? { fileNames } : {}),
           };
-          const route = routeWake(wake, true, resolveTurnOrigin(live.request).kind === "ambient");
+          const route = routeWake(wake, true, resolveTurnOrigin(targetRun.request).kind === "ambient");
           if (route.kind === "steer" || route.kind === "drop") {
             const steerTs = origin.kind === "human" ? (origin.messageTs ?? origin.entryTs) : origin.entryTs;
             let redelivered = false;
             const routedRunId = await withCurrentProjectRoster(async () => {
               if (route.kind === "steer")
-                redelivered = !(await deps.signals!.send(live.id, {
+                redelivered = !(await deps.signals!.send(targetRun.id, {
                   kind: route.signal,
                   ...(route.text ? { text: route.text } : {}),
                   ...(steerTs ? { ts: steerTs } : {}),
-                  ...(route.signal === "steer" ? { request: req } : {}),
+                  ...(route.signal === "steer"
+                    ? {
+                        request: {
+                          ...req,
+                          ...(conversationRouting
+                            ? {
+                                deliveryTarget: targetRun.request.deliveryTarget ?? req.deliveryTarget,
+                              }
+                            : {}),
+                          conversation: { ...req.conversation, threadRef: targetRun.request.conversation.threadRef },
+                        },
+                      }
+                    : {}),
                   ...(redeliveryKey ? { dedupeKey: redeliveryKey } : {}),
                 }));
-              return live.id;
+              return targetRun.id;
             });
             if (!routedRunId)
               return { status: "refused", reason: "project membership changed; retry from the current project" };
             if (redelivered)
               return req.async ? { status: "queued", runId: routedRunId, steered: true } : drive(routedRunId);
             if (route.kind === "steer") {
-              const after = await deps.runs.get(live.id);
+              const after = await deps.runs.get(targetRun.id);
               if (!after || isTerminal(after.status)) {
-                const own = (await replayOrphanedRunSignals(live.id)).find(
+                const own = (await replayOrphanedRunSignals(targetRun.id)).find(
                   (d) => d.signal.text === route.text && d.signal.ts === steerTs,
                 );
                 if (own?.replayRunId)
@@ -478,28 +621,24 @@ export function createTurnMethods(
         }
       }
 
-      const known = await deps.sessions.getByThread(conversation.threadRef);
-      const participants = known ? await deps.sessions.participantsOf(known.id) : [];
       const enqueue = () =>
         deps.runs.enqueue({
           sessionId: conversation.threadRef,
           request,
+          idleDelivery,
           maxAttempts: deps.maxAttempts,
           ...(dedupKey ? { dedupKey } : {}),
         });
+      const enqueueStartedAt = performance.now();
       const enqueued = await withCurrentProjectRoster(enqueue);
       if (!enqueued) return { status: "refused", reason: "project membership changed; retry from the current project" };
       const { run, deduped } = enqueued;
+      console.info("[turn] queued", {
+        runId: run.id,
+        preEnqueueMs: Math.round(enqueueStartedAt - startedAt),
+        enqueueMs: Math.round(performance.now() - enqueueStartedAt),
+      });
       if (deduped && redeliveryKey && run.dedupKey === redeliveryKey) return { status: "silent" };
-      if (!deduped) {
-        deps.sessionStateBus?.emit({
-          threadRef: conversation.threadRef,
-          ...(known ? { sessionId: known.id } : {}),
-          state: "working",
-          at: Date.now(),
-          participants: participants.length ? participants : [req.actor.externalId],
-        });
-      }
       if (spineRouted && !deduped) markTriggerHandled(input as OrchestratorInput);
       if (spineRouted) deps.engaged?.engage(conversation.threadRef);
       if (deduped && run.result && isTerminal(run.status)) return withAdminLink(run.result);
@@ -556,6 +695,21 @@ export function createTurnMethods(
       return pendingApprovalResultForThread(threadRef, viewer);
     },
 
+    subscribeRun(runId, listener, onResync) {
+      return (
+        deps.runStreamEvents?.subscribe(
+          (event) => {
+            if (event.runId === runId) listener(event);
+          },
+          { onResync },
+        ) ?? (() => {})
+      );
+    },
+
+    syncRunStream(runId, offset) {
+      deps.runStreamEvents?.emit({ runId, kind: "sync", offset });
+    },
+
     async getRun(runId, viewer) {
       const run = await deps.runs.get(runId);
       if (!run) return null;
@@ -573,6 +727,29 @@ export function createTurnMethods(
       return {
         status: run.status,
         result: run.result ? await withAdminLink(run.result) : run.result,
+        ...(run.request.surface === "web" &&
+        !run.request.approval &&
+        !run.request.envelopeWrapped &&
+        !(run.request.proactiveOpener && !run.request.text.trim()) &&
+        isPersonAuthored(resolveTurnOrigin(run.request).kind)
+          ? {
+              input: {
+                runId: run.id,
+                seq: run.turnUserSeq,
+                text: run.request.displayText ?? run.request.text ?? "",
+                createdAt: run.createdAt,
+                ...(run.request.attachments?.length
+                  ? {
+                      attachments: run.request.attachments.map(({ name, mimetype, sizeBytes }) => ({
+                        name,
+                        mimetype,
+                        sizeBytes,
+                      })),
+                    }
+                  : {}),
+              },
+            }
+          : {}),
         startedAt: run.startedAt,
         finishedAt: run.finishedAt,
         ...(partial ? { partial } : {}),
@@ -604,6 +781,22 @@ export function createTurnMethods(
           ...(run.request.attachments?.length ? { hasAttachments: true } : {}),
         }));
       return { runId: live.id, ...(queued.length ? { queued } : {}) };
+    },
+
+    async editQueuedRun(runId, text, expectedText, viewer) {
+      const run = await deps.runs.get(runId);
+      if (!run || (viewer && (!samePerson(run.request.actor.id, viewer) || !(await viewerMayUseRun(run, viewer)))))
+        return { edited: false, reason: "not_found" };
+      if (
+        run.request.surface !== "web" ||
+        run.request.envelopeWrapped ||
+        !isPersonAuthored(resolveTurnOrigin(run.request).kind)
+      )
+        return { edited: false, reason: "not_editable" };
+      if (!text.trim() && !run.request.attachments?.length) return { edited: false, reason: "empty_text" };
+      return (await deps.runs.editPendingText(runId, text, expectedText))
+        ? { edited: true }
+        : { edited: false, reason: "changed_or_started" };
     },
 
     async withdrawRun(runId, viewer) {

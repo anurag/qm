@@ -101,6 +101,18 @@ test("blank sandbox identities coexist and default changes never copy files or r
   assert.equal(a.resourceId, first.id);
 });
 
+test("explicit sandbox profiles follow selected storage rather than the parent's default provider", async () => {
+  const { backend, options, routes } = fixture();
+  const modal: Sandbox = { ...backend, profile: { ...backend.profile, backend: "modal" } };
+  const backends = { local: backend, modal };
+  const resources = createSandboxResources({ ...options, backends });
+  const router = createSandboxRouter({ backends, routes, defaultBackend: "local", resources });
+  const worker = await resources.create("alice", "personal:alice", "modal", "Worker");
+  assert.equal((await router.profileFor!("personal:alice")).backend, "local");
+  assert.equal((await router.profileFor!("personal:alice", worker.id)).backend, "modal");
+  assert.equal((await router.profileFor!("personal:alice")).backend, "local");
+});
+
 test("unset defaults remain unset durably while explicit execution remains usable", async () => {
   const { resources, router, layers, defaults } = fixture();
   const record = await resources.create("alice", "personal:alice", "local");
@@ -805,4 +817,20 @@ test("failed background registration kills its process and releases the resource
   assert.deepEqual(signals, ["unregistered:KILL"]);
   await resources.retire("alice", record.id);
   assert.equal((await resources.get(record.id)).cleanupPending, false);
+});
+
+test("resource activation honors scope defaults and preserves explicit legacy provider routes", async () => {
+  const { options, routes, backend } = fixture(undefined, ["personal:alice", "channel:room", "personal:existing"]);
+  await routes.put("personal:existing", { backend: "aws" });
+  const resources = createSandboxResources({
+    ...options,
+    backends: { modal: backend, sprites: backend, aws: backend },
+    defaultBackend: "sprites",
+    scopeDefaults: { personal: "modal", channel: "sprites" },
+  });
+  assert.equal((await resources.resolve("personal:alice"))?.backend, "modal");
+  assert.equal((await resources.resolve("channel:room"))?.backend, "sprites");
+  assert.equal((await resources.resolve("personal:existing"))?.backend, "aws");
+  assert.equal(resources.defaultBackend("personal:new"), "modal");
+  assert.equal(resources.defaultBackend("channel:new"), "sprites");
 });

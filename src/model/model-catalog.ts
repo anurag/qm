@@ -1,3 +1,4 @@
+import { gatewayModelCatalog } from "./gateway-models.ts";
 import {
   modelSupportedByHarness,
   registerOpenRouterCatalogModel,
@@ -42,7 +43,12 @@ export function builtInModelCatalog(): ModelCatalogEntry[] {
       : [];
   });
   const known = new Set(builtIns.map((model) => model.id));
-  return [...builtIns, ...[...overlayModelCatalog(), ...customModelCatalog()].filter((model) => !known.has(model.id))];
+  return [
+    ...builtIns,
+    ...[...overlayModelCatalog(), ...customModelCatalog(), ...gatewayModelCatalog()].filter(
+      (model) => !known.has(model.id),
+    ),
+  ];
 }
 
 async function boundedJson(response: Response): Promise<unknown> {
@@ -201,4 +207,18 @@ export function selectableCatalogForHarness(
       (model.provider !== "openrouter" || harness === "pi" || harness === "mock") &&
       modelSupportedByHarness(model.id, harness),
   );
+}
+
+export function cachedModelCatalog(fetcher: typeof fetch = fetch): {
+  models: ModelCatalogEntry[];
+  refreshing: boolean;
+} {
+  void selectableModelCatalog(fetcher);
+  const models = builtInModelCatalog();
+  const known = new Set(models.map((model) => model.id));
+  const entry = cache.get(fetcher);
+  return {
+    models: [...models, ...(entry?.dynamic ?? []).filter((model) => !known.has(model.id))],
+    refreshing: !!entry?.inFlight,
+  };
 }

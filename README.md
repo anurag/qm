@@ -68,9 +68,11 @@ flowchart LR
 ```
 
 For durability, set `DATABASE_URL` and `SESSION_STORE=postgres` — without it, sessions
-live in process memory and vanish on restart. To exercise a branch end to end — core,
-Slack, web, admin, portal, against a real model and real Postgres — run
-`npm run dev-instance`.
+live in process memory and vanish on restart. To exercise a branch against a real model and real Postgres, run
+`npm run dev-instance:web` for web/admin or `npm run dev-instance:slack` for Slack.
+Use `npm run dev-instance:both` when testing both surfaces together. Bare
+`npm run dev-instance` defaults to web for new instances and preserves the surface
+on reload. Switch an existing instance with an explicit surface command.
 
 ## Architecture
 
@@ -102,9 +104,9 @@ can only tighten:
 
 - **Strict** — every harness tool call pauses for human approval, except the two
   no-effect turn enders.
-- **Auto** (default) — a classifier screens provenance-labelled external data and tool
-  results before they reach the model; a deployment can point that at its own screening
-  proxy.
+- **Auto** (default) — blocks private-network access and uses a content screener when
+  the deployment configures one. Model screening is off by default; deployments can
+  use an external proxy or explicitly opt into the built-in model classifier.
 - **Dangerous** — no content screening, no pauses between tool calls.
 
 The predeclared command policy — approval rules and hard denials for things like
@@ -161,50 +163,81 @@ not a public issue.
 
 ## Customize your instance
 
-The deployment repository above carries config and a sandbox layer, and never needs a
-source checkout. Some organizations want the opposite trade: the whole codebase in one
-place, so engineers and coding agents read core and customizations together, while the
-customizations themselves stay private. For that, keep a **private fork**: a standalone
-private repository whose history begins as a clone of qm and whose core stays identical
-to upstream.
+Choose how you want to customize QM:
 
-Populate it once, then clone it to work in:
+- **Config, tools, skills, and services:** use the deployment repository above. It
+  pins `@yc-software/qm` and uses that release's runtime images; no source copy is needed.
+- **Changes to QM itself:** keep your own source fork, public or private. You may
+  modify any part of core, including the runtime, plugins, CLI, docs, and CI.
+  Contributing those changes upstream is optional.
+
+### Create a source fork
+
+For a private source fork, create a standalone private repository, outside GitHub's
+fork network. Seed only `main` and explicitly set it as the default branch:
 
 ```bash
 gh repo create <org>/qm-private --private
-
-git clone --bare git@github.com:yc-software/qm qm-seed.git
-git -C qm-seed.git push --mirror git@github.com:<org>/qm-private
-rm -rf qm-seed.git
-
-git clone git@github.com:<org>/qm-private
-git -C qm-private remote add upstream git@github.com:yc-software/qm
+git clone --single-branch --branch main --no-tags git@github.com:yc-software/qm qm-private
+git -C qm-private remote rename origin upstream
+git -C qm-private remote add origin git@github.com:<org>/qm-private
+git -C qm-private push -u origin main
+gh repo edit <org>/qm-private --default-branch main
 ```
 
-Create the private fork with a plain clone, as shown above, and never with GitHub's fork
-feature. The word "fork" here names the concept — a downstream copy that diverges
-deliberately and merges from upstream — not GitHub's Fork button. A GitHub fork inherits
-the visibility of the repository it came from, so a fork of a public repository cannot be
-made private. A GitHub fork also shares one object network with the repository it came
-from, so commits pushed to the fork stay fetchable by SHA from the public side. Many
-organizations disallow forking private repositories as well. A plain clone has none of
-these problems, and it costs one thing: the clone is an ordinary repository, so upstream's
-CI workflows run live in your own account. Expect to supply the secrets those workflows
-need, or disable the ones you do not want running.
+Do not seed with `git push --mirror`: it copies unrelated upstream branches and tags,
+leaves default-branch selection implicit, and can delete destination-only refs on later
+pushes. The `upstream` remote supplies source updates without copying those refs to your
+repository. For a public source fork, GitHub's Fork button is also an option. A GitHub
+fork of a public repository cannot be private; keep private work outside that network.
 
-Everything specific to your organization goes in `deploy/layers/<org>/` — config, sandbox
-tools and skills, plugin images, infrastructure — in the same shape `qm init` produces. See
-[`deploy/layers/README.md`](./deploy/layers/README.md). Core stays byte-identical to
-upstream, which is what keeps merges small.
+Review inherited workflows before enabling Actions or adding credentials. Choose the CI
+checks you want, and disable or adapt upstream release and publishing workflows for your
+own package and image registries. Copying the source does not configure production
+deployment CI.
 
-Two skills maintain the boundary in both directions. `update-qm` merges upstream qm into
-the private fork and opens the sync PR; `upstream-pr` sends an organization-agnostic fix back to
-qm, cutting the branch from `upstream/main` and checking the outgoing diff, commit
-messages, and screenshots for organization identifiers before it pushes. Nothing under
-`deploy/layers/` ever travels upstream.
+### Customize and run your source
+
+Keep deployment configuration, tools, skills, plugin images, and infrastructure in
+`deploy/layers/<org>/` in a private source fork, or in a separate private deployment
+repository when your source is public. Never commit secrets. See
+[`deploy/layers/README.md`](./deploy/layers/README.md) for initialization and layout.
+Keep deployment data separate from core code, but change core wherever your desired
+behavior requires it.
+
+From the source checkout, install dependencies with `npm ci` and use the in-tree CLI.
+After completing the provider setup in [`deployment.md`](./deployment.md), build and
+deploy your modified services explicitly:
+
+```bash
+node cli/bin/qm.ts check --config <deployment-dir>/qm.config.jsonc
+node cli/bin/qm.ts plan --config <deployment-dir>/qm.config.jsonc --build-from .
+node cli/bin/qm.ts up --config <deployment-dir>/qm.config.jsonc --build-from .
+node cli/bin/qm.ts check --config <deployment-dir>/qm.config.jsonc --live
+```
+
+Use this checkout's CLI when changing the CLI itself. Without `--build-from`, the
+normal deployment path selects published images, so editing source alone does not
+change the deployed runtime. If you publish custom images instead, configure their
+immutable references through `imageOverrides`. Follow the provider guide for sandbox
+image builds; service builds do not replace that step.
+
+### Keep it current
+
+For a source fork, `update-qm` merges upstream changes while preserving intentional
+local behavior. Land sync PRs with their merge ancestry intact, never squash or rebase
+them. Conflicts are expected maintenance work, not a requirement to discard
+customizations. Use `upstream-pr` only when you want to contribute a generic change;
+it prepares a clean upstream branch without private deployment data or history.
+
+For a package deployment, upgrade the exact `@yc-software/qm` dependency and lockfile,
+review contract changes and generated assets, then validate and deploy. There is no
+upstream source history to merge.
 
 ## Going deeper
 
+- [`docs/swarms.md`](./docs/swarms.md) — durable agent pools, scoped messages, and blank Modal workers
+- [`docs/model-gateway.md`](./docs/model-gateway.md) — discover and route models through a gateway
 - [`docs/getting-started.md`](./docs/getting-started.md) — first run, end to end
 - [`cli/README.md`](./cli/README.md) — the `qm` CLI and the deployment directory contract
 - [`docs/deploy-directory.md`](./docs/deploy-directory.md) — the deployment directory in full
@@ -215,3 +248,46 @@ messages, and screenshots for organization identifiers before it pushes. Nothing
 ## License
 
 Except where otherwise noted, QM is available under the [MIT License](./LICENSE).
+
+### Managed Slack installation
+
+A hosting provider can set `QM_SLACK_SERVICE_URL` (HTTPS),
+`QM_SLACK_SERVICE_TOKEN` (unique per deployment) on core. Optionally set
+`QM_SLACK_APP_ID` to pin a pre-existing app; otherwise the authenticated service
+assigns its app ID during installation. Events must match the stored app identity.
+Set `QM_SLACK_SERVICE_URL` on the admin/web service as well so its browser policy allows the installation form.
+The admin Slack card then offers **Add to Slack** through that service. Core calls
+`POST /install/start` with the deployment bearer credential and expects `{ "url":
+"https://<service>/..." }`. The browser submits a POST form to that URL; the service must validate its Origin against the company URL. The service owns browser-bound OAuth state, Slack
+signature verification, workspace ownership, and app credentials.
+
+The portal forwards only `POST /v1/slack/managed/installation`, `DELETE` on that
+same path, and `POST /v1/slack/managed/events` without a browser session. Core
+requires the deployment bearer credential on each request. Installation takes
+`botToken`, `appId`, `teamId`, `installId`, `installedAt` (epoch milliseconds), and
+optional `teamName`. Repeat the same installation request until it returns 200
+with `ready: true`; 202 means the encrypted token is saved but the runtime has
+not started. Older installation generations and conflicting workspaces fail
+closed. Deletion takes `installId` and only disables that generation.
+
+Delivery takes `{ installId, body, retryNum?, retryReason? }`, where `body` is the
+verified Slack event or decoded interaction payload. Core checks its workspace
+and app before passing it to the existing Slack runtime and acknowledgment
+machinery. There is no shared queue: unavailable core instances return failures,
+and the hosting service must relay those failures to Slack. The service must
+process lifecycle events and ignore revocations older than the installation.
+
+Managed deployments also support an administrator-provided Slack app through the same
+Slack settings card. Saving its validated bot and Socket Mode tokens replaces the
+managed runtime and rejects subsequent managed installation callbacks. To return to
+the managed app, disconnect the administrator-provided app in QM, then explicitly
+choose **Add to Slack**. Disconnecting alone does not permit old managed callbacks to
+restore an installation.
+
+Use the same Slack workspace when replacing the managed app, so existing conversations
+and memberships remain associated with that workspace. Invite the new bot to the
+channels it should serve; Slack does not transfer the old bot's memberships. Once
+replacement is verified, remove the old managed app from Slack to avoid two visible
+QM identities. QM rejects deliveries for the old installation as soon as the new
+credentials are saved. The replacement uses Socket Mode even if the deployment's
+environment previously selected HTTP events.

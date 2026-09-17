@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { Pool, PoolClient } from "pg";
+import { createKeyedQueue } from "../util/async.ts";
 import { errMessage, swallowAs } from "../util/errors.ts";
 
 export type { Pool, PoolClient };
@@ -30,6 +31,8 @@ export function configurePgPooling(config: PgPoolingConfig): void {
   poolingConfig = { ...config };
 }
 
+const migrationQueue = createKeyedQueue();
+
 const sharedPools = new Map<string, { pool: Pool; users: number }>();
 
 async function retainPool(connectionString: string, kind: "query" | "session" | "migration"): Promise<Pool> {
@@ -52,9 +55,14 @@ async function retainPool(connectionString: string, kind: "query" | "session" | 
     url = parsed.toString();
     ssl = { ssl: { ca: poolingConfig.caCert } };
   }
-  const pool = new pg.Pool({ connectionString: url, ...ssl, max, connectionTimeoutMillis: 10_000 });
-  pool.on("error", (error) => console.error("[pg] idle client error:", errMessage(error)));
+  const pool = guardedPool(new pg.Pool({ connectionString: url, ...ssl, max, connectionTimeoutMillis: 10_000 }));
   sharedPools.set(key, { pool, users: 1 });
+  return pool;
+}
+
+function guardedPool(pool: Pool): Pool {
+  pool.on("error", () => {});
+  pool.on("connect", (client) => client.on("error", (error) => console.error("[pg] client error:", errMessage(error))));
   return pool;
 }
 
@@ -165,7 +173,9 @@ export function assertOneStatement(stmt: string): void {
 }
 
 export function concurrentIndexName(stmt: string): string | undefined {
-  return /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_$]*)\b/i.exec(stmt)?.[1];
+  return /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_$]*)\s+ON\s/i.exec(
+    stmt,
+  )?.[1];
 }
 
 export function pgMigrationChecksum(statements: readonly string[]): string {
@@ -217,6 +227,42 @@ export async function applyPgMigrations(pool: Pool, migrations: readonly PgMigra
             `pg-pool: migration ${migration.id} checksum mismatch (database=${applied.rows[0].checksum}, source=${migration.checksum})`,
           );
         }
+        continue;
+      }
+      if (migration.statements.some((statement) => concurrentIndexName(statement))) {
+        if (migration.legacyId || !migration.statements.every((statement) => concurrentIndexName(statement))) {
+          throw new Error(`pg-pool: concurrent index migration ${migration.id} must contain only concurrent indexes`);
+        }
+        for (const statement of migration.statements) {
+          const name = concurrentIndexName(statement)!;
+          const table =
+            /\sON\s+(?:ONLY\s+)?([a-z_][a-z0-9_$]*(?:\.[a-z_][a-z0-9_$]*)?)\s*(?:USING\s+[a-z_]+\s*)?\(/i.exec(
+              statement,
+            )?.[1];
+          if (!table) throw new Error(`pg-pool: unsupported concurrent index target in ${migration.id}`);
+          const inspect = () =>
+            client.query<{ indisvalid: boolean; indisready: boolean; same_table: boolean; qualified_name: string }>(
+              `SELECT i.indisvalid, i.indisready, i.indrelid = t.oid AS same_table,
+                    quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS qualified_name
+             FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
+             JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = $2
+             JOIN pg_index i ON i.indexrelid = c.oid WHERE t.oid = to_regclass($1)`,
+              [table.toLowerCase(), name.toLowerCase()],
+            );
+          const existing = (await inspect()).rows[0];
+          if (existing && !existing.same_table)
+            throw new Error(`pg-pool: concurrent index ${name} belongs to a different table`);
+          if (existing?.indisvalid === false) await client.query(`DROP INDEX CONCURRENTLY ${existing.qualified_name}`);
+          await client.query(statement);
+          const built = (await inspect()).rows[0];
+          if (!built?.indisvalid || !built.indisready || !built.same_table) {
+            throw new Error(`pg-pool: concurrent index ${name} is not ready and valid`);
+          }
+        }
+        await client.query(`INSERT INTO ${PG_MIGRATIONS_TABLE}(id, checksum) VALUES ($1, $2)`, [
+          migration.id,
+          migration.checksum,
+        ]);
         continue;
       }
       await client.query("BEGIN");
@@ -334,18 +380,19 @@ export async function migrateRegisteredPgSchemas(connectionString?: string): Pro
     : [...registeredMigrations.entries()];
   for (const [databaseUrl, registered] of databases) {
     if (!registered?.size) continue;
-    const pg = (await import("pg")).default;
-    const pool = new pg.Pool({ connectionString: databaseUrl, ...pgCaOptions() });
-    pool.on("error", (error) => console.error("[pg] migration pool error:", errMessage(error)));
-    try {
-      await applyPgMaintenance(pool, [...(registeredPreMigrationMaintenance.get(databaseUrl)?.values() ?? [])]);
-      await applyPgMigrations(
-        pool,
-        [...registered.values()].sort((a, b) => a.id.localeCompare(b.id)),
-      );
-    } finally {
-      await pool.end();
-    }
+    await migrationQueue(databaseUrl, async () => {
+      const pg = (await import("pg")).default;
+      const pool = guardedPool(new pg.Pool({ connectionString: databaseUrl, ...pgCaOptions() }));
+      try {
+        await applyPgMaintenance(pool, [...(registeredPreMigrationMaintenance.get(databaseUrl)?.values() ?? [])]);
+        await applyPgMigrations(
+          pool,
+          [...registered.values()].sort((a, b) => a.id.localeCompare(b.id)),
+        );
+      } finally {
+        await pool.end();
+      }
+    });
   }
 }
 
@@ -394,12 +441,14 @@ export function createPgPool(
   let closed = false;
   const queryUrl = pooledDatabaseUrl(connectionString);
   async function withMigrationPool<T>(fn: (pool: Pool) => Promise<T>): Promise<T> {
-    const instance = await retainPool(connectionString, "migration");
-    try {
-      return await fn(instance);
-    } finally {
-      await releasePool(connectionString, instance, "migration");
-    }
+    return migrationQueue(connectionString, async () => {
+      const instance = await retainPool(connectionString, "migration");
+      try {
+        return await fn(instance);
+      } finally {
+        await releasePool(connectionString, instance, "migration");
+      }
+    });
   }
   async function ready(): Promise<void> {
     if (closed) throw new Error("Postgres store is closed");

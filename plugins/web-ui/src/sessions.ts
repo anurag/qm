@@ -12,6 +12,7 @@ import {
   ChevronRight,
   Clock3,
   Cog,
+  CornerLeftUp,
   EllipsisVertical,
   Folder,
   Hash,
@@ -34,6 +35,7 @@ import {
   fetchSessionApprovals,
   fetchTranscript,
   currentEarlierCount,
+  detachSession,
   inheritedTranscript,
   isContinuable,
   entriesToMessages,
@@ -52,6 +54,7 @@ import {
   activityOf,
   chatBrowseStatusMatches,
   bumpActivity,
+  sidebarSessions,
   groupProjectSessions,
   recencyGroup,
   recentProjectSeeds,
@@ -94,6 +97,7 @@ import {
   openBackgroundInCanvas,
   beginSessionDrag,
   endPaneDrag,
+  canvasToast,
   notifyPanesChanged,
   drawCanvas,
   closeSessionSurfaces,
@@ -235,6 +239,7 @@ function listWhen(ms: number): string {
 export function surfaceOf(s: CoreSession): string {
   if (s.threadRef.startsWith("web:")) return "web";
   if (s.threadRef.startsWith("dm:") || s.threadRef.startsWith("ch:")) return "slack";
+  if (s.threadRef.startsWith("agent:main:subagent:") && s.surface) return s.surface;
   return "core";
 }
 
@@ -310,7 +315,7 @@ export function slackLogo(size = 13): TemplateResult {
 }
 
 function visibleSessions(): CoreSession[] {
-  const sorted = [...sessionsState.list].sort((a, b) => activityOf(b) - activityOf(a));
+  const sorted = sidebarSessions(sessionsState.list).sort((a, b) => activityOf(b) - activityOf(a));
   return sessionsState.webOnly ? sorted.filter((s) => surfaceOf(s) === "web") : sorted;
 }
 
@@ -323,10 +328,14 @@ export function renderList(): void {
   const archived = visible.filter((s) => s.archived);
   const { pinned, rest } = splitPinned(active);
   const activeItems = recentItemsFor(rest);
-  const archivedItems: RecentItem[] = archived.map((session) => ({ kind: "session", session }));
+  const archivedItems: RecentItem[] = archived.map((session) => ({
+    kind: "session",
+    session,
+  }));
   armMidnightRefresh();
   render(
     html`
+      ${detachDropZone()}
       ${
         pinned.length
           ? html`
@@ -557,7 +566,7 @@ export function drawChatsPage(): void {
     appState.mainEl.replaceChildren(chatsPageHost);
   }
   const q = chatsPageQuery.trim().toLowerCase();
-  const rows = [...sessionsState.list]
+  const rows = sidebarSessions(sessionsState.list)
     .filter((s) => chatBrowseStatusMatches(s, chatsPageStatus))
     .filter((s) => chatsPageSurface === "all" || surfaceOf(s) === chatsPageSurface)
     .filter((s) => (chatsPageScope ? s.scopeId === chatsPageScope : true))
@@ -607,7 +616,7 @@ export function drawChatsPage(): void {
                 }}
               >
                 ${label}<span
-                  >${sessionsState.list.filter((session) => chatBrowseStatusMatches(session, value)).length}</span
+                  >${sidebarSessions(sessionsState.list).filter((session) => chatBrowseStatusMatches(session, value)).length}</span
                 >
               </button>`,
           )}
@@ -895,7 +904,7 @@ function sessionRow(s: CoreSession, projectChild = false): TemplateResult {
         aria-keyshortcuts="Space Shift+Space Control+Space Meta+Space"
         draggable=${saved ? "true" : "false"}
         @dragstart=${(e: DragEvent) => onSessionDragStart(e, s)}
-        @dragend=${() => endPaneDrag()}
+        @dragend=${() => endSessionDrag()}
         @mousedown=${(e: MouseEvent) => {
           if (saved && e.shiftKey) e.preventDefault();
         }}
@@ -987,14 +996,64 @@ function sessionRow(s: CoreSession, projectChild = false): TemplateResult {
   `;
 }
 
-function onSessionDragStart(e: DragEvent, s: CoreSession): void {
+let draggingChildId: string | null = null;
+
+export function onSessionDragStart(e: DragEvent, s: CoreSession): void {
   if (!s.id) {
     e.preventDefault();
     return;
   }
   e.dataTransfer?.setData("application/x-webui-session", s.id);
   if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-  beginSessionDrag(s);
+  draggingChildId = s.parentSessionId ? s.id : null;
+  appState.listEl?.classList.toggle("detach-drop-target", Boolean(draggingChildId));
+  if (!draggingChildId) beginSessionDrag(s);
+}
+
+export function endSessionDrag(): void {
+  draggingChildId = null;
+  appState.listEl?.classList.remove("detach-drop-target");
+  appState.listEl?.querySelector(".detach-drop-zone")?.classList.remove("over");
+  endPaneDrag();
+}
+
+async function promoteSession(id: string): Promise<void> {
+  sessionsState.openMenuId = null;
+  endSessionDrag();
+  try {
+    await detachSession(id);
+    await refreshSessions({ silent: true });
+  } catch (error) {
+    canvasToast(errMessage(error));
+    renderList();
+  }
+}
+
+function detachDropZone(): TemplateResult {
+  return html`<div
+    class="detach-drop-zone"
+    @dragenter=${(e: DragEvent) => {
+      if (!draggingChildId) return;
+      e.preventDefault();
+      (e.currentTarget as HTMLElement).classList.add("over");
+    }}
+    @dragover=${(e: DragEvent) => {
+      if (!draggingChildId) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    }}
+    @dragleave=${(e: DragEvent) => (e.currentTarget as HTMLElement).classList.remove("over")}
+    @drop=${(e: DragEvent) => {
+      const id = draggingChildId;
+      (e.currentTarget as HTMLElement).classList.remove("over");
+      if (!id) return;
+      e.preventDefault();
+      endSessionDrag();
+      void promoteSession(id);
+    }}
+  >
+    ${icon(CornerLeftUp, 13)}<span>Drop to make a top-level session</span>
+  </div>`;
 }
 
 const placeSessionMenu = (el?: Element): void => {
@@ -1523,6 +1582,7 @@ async function runSessionsRefresh(
       listSettled = null;
       sessionsLoading = false;
       renderList();
+      for (const conversation of allConversations()) conversation.redraw();
     }
   }
 }
@@ -1570,9 +1630,7 @@ export async function openSessionInto(
     sessionsState.openingKey = opening;
     renderList();
   }
-  const skeletonTimer = window.setTimeout(() => {
-    if (isLiveConversation(conv) && (!tracked || sessionsState.openingKey === opening)) conv.mountLoadingPane();
-  }, 140);
+  if (isLiveConversation(conv) && (!tracked || sessionsState.openingKey === opening)) conv.mountLoadingPane();
 
   const fetchEntries = (): Promise<TranscriptPage | null> =>
     fetchTranscript(s.id, { tailTurns: TAIL_TURNS }).catch(() => null);
@@ -1581,7 +1639,6 @@ export async function openSessionInto(
     entriesPrefetch ? entriesPrefetch.then((r) => r ?? fetchEntries()) : fetchEntries(),
     continuable ? (approvalsPrefetch ?? fetchSessionApprovals(s.id)) : Promise.resolve(null),
   ]);
-  window.clearTimeout(skeletonTimer);
   if (!isLiveConversation(conv)) return;
 
   if (tracked) {

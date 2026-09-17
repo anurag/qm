@@ -18,7 +18,7 @@ const SKILL_PACKS_DIR = `${SKILLS_DIR}/.packs`;
 export { SKILLS_DIR } from "./materialization-paths.ts";
 
 export interface SkillMaterializer {
-  materializeIndex(
+  reconcileIndex(
     sandbox: Sandbox,
     handle: SandboxHandle,
     resolved: SkillResolution[],
@@ -46,7 +46,7 @@ function indexHash(resolved: SkillResolution[]): string {
   const h = createHash("sha256");
   const entries = resolved
     .filter((r) => r.skill)
-    .map((r) => `${r.skill!.manifest.name}\0${r.skill!.scopeId}\0${r.skill!.id}\0${renderedBody(r)}`)
+    .map((r) => `${r.skill!.manifest.name}\0${r.skill!.scopeId}\0${r.skill!.id}`)
     .sort();
   for (const e of entries) {
     h.update(e);
@@ -66,7 +66,7 @@ function treeHash(resolution: SkillResolution, bundles: SkillBundle[]): string {
     .sort()
     .join("\0");
   return createHash("sha256")
-    .update(renderedBody(resolution))
+    .update(renderSkillBody(resolution))
     .update("\0")
     .update(files)
     .update("\0")
@@ -78,7 +78,7 @@ function packRoot(resolution: SkillResolution): string | null {
   return resolution.skill?.pack ? `${SKILL_PACKS_DIR}/${safeSkillDirName(resolution.skill.pack.packId)}` : null;
 }
 
-function renderedBody(resolution: SkillResolution): string {
+export function renderSkillBody(resolution: SkillResolution): string {
   const body = resolution.skill!.manifest.body;
   const root = packRoot(resolution);
   return root
@@ -213,7 +213,7 @@ async function layFiles(sandbox: Sandbox, handle: SandboxHandle, entries: LayEnt
   for (const e of entries) await sandbox.writeFile(handle, e.path, e.content);
 }
 
-async function materializeSkillIndexUnlocked(
+async function reconcileSkillIndexUnlocked(
   sandbox: Sandbox,
   handle: SandboxHandle,
   resolved: SkillResolution[],
@@ -261,13 +261,6 @@ async function materializeSkillIndexUnlocked(
   }
 
   const entries: LayEntry[] = [];
-  for (const r of resolved) {
-    if (!r.skill) continue;
-    entries.push({
-      path: `${SKILLS_DIR}/${safeSkillDirName(r.skill.manifest.name)}/SKILL.md`,
-      content: renderedBody(r),
-    });
-  }
   entries.push({
     path: INDEX_MARKER,
     content: JSON.stringify({
@@ -337,7 +330,7 @@ async function materializeSkillTreeUnlocked(
     await sandbox.removeDir(handle, dir);
   }
 
-  const entries: LayEntry[] = [{ path: `${dir}/SKILL.md`, content: renderedBody(resolution) }];
+  const entries: LayEntry[] = [{ path: `${dir}/SKILL.md`, content: renderSkillBody(resolution) }];
   for (const f of files) {
     let rel: string;
     try {
@@ -377,10 +370,10 @@ export function createSkillMaterializer(advisoryLock?: AdvisoryLock): SkillMater
     return queue(key, () => advisoryLock?.withLock(key, fn) ?? fn());
   };
   return {
-    materializeIndex(sandbox, handle, resolved, current) {
+    reconcileIndex(sandbox, handle, resolved, current) {
       return locked(handle, async () => {
         const latest = current ? await current() : resolved;
-        await materializeSkillIndexUnlocked(sandbox, handle, latest);
+        await reconcileSkillIndexUnlocked(sandbox, handle, latest);
       });
     },
     materializeTree(sandbox, handle, resolution, bundles = [], current) {
@@ -394,12 +387,12 @@ export function createSkillMaterializer(advisoryLock?: AdvisoryLock): SkillMater
 
 const localMaterializer = createSkillMaterializer();
 
-export function materializeSkillIndex(
+export function reconcileSkillIndex(
   sandbox: Sandbox,
   handle: SandboxHandle,
   resolved: SkillResolution[],
 ): Promise<void> {
-  return localMaterializer.materializeIndex(sandbox, handle, resolved);
+  return localMaterializer.reconcileIndex(sandbox, handle, resolved);
 }
 
 export function materializeSkillTree(
@@ -426,11 +419,11 @@ export function skillsIndex(resolved: SkillResolution[], provenanceScopes: reado
     const m = r.skill!.manifest;
     const shadow = r.shadowed.length ? " (shadows a broader-scope skill of the same name)" : "";
     const source = provenance.has(r.skill!.scopeId) ? ` [from ${r.skill!.scopeId}]` : "";
-    return `- **${m.name}**${source} — ${m.description}${shadow}  → read \`${SKILLS_DIR}/${safeSkillDirName(m.name)}/SKILL.md\``;
+    return `- **${m.name}**${source} — ${m.description}${shadow}  → read \`skill://${safeSkillDirName(m.name)}/SKILL.md\``;
   });
   return [
     "## Skills",
-    "You have these skills available. To use one, read its SKILL.md and follow it (run its steps with your tools):",
+    "Read published skills with the read tool at skill://<name>/SKILL.md; this does not start a sandbox. Read relative skill files at skill://<name>/<path>. These are read-only published sources, not filesystem paths. Execute scripts and access working copies under skills/<name>/ in the sandbox; ordinary filesystem reads preserve local edits.",
     ...lines,
   ].join("\n");
 }

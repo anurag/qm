@@ -1,8 +1,10 @@
+import { captureConnectionReturn } from "./connection-return";
 import { openModelConnectManager, renderModelConnectGate } from "./model-connect";
 import { html, nothing, render, type TemplateResult } from "lit";
 import {
   Box,
   Brain,
+  CalendarDays,
   Clock,
   Files,
   Folder,
@@ -25,6 +27,7 @@ import {
 } from "lucide";
 import {
   api,
+  ApiError,
   setSigninRequiredHandler,
   type SigninRequired,
   fetchRuntimeConfig,
@@ -45,7 +48,6 @@ import { clearAllDrafts, saveDraft, storedDraft } from "./drafts";
 import { deepLinkPath, isPlainLeftClick, parseDeepLink, UI_BASE } from "./deep-link";
 import {
   adoptRemoteSplit,
-  canvasToast,
   beginPaneKindDrag,
   drawCanvas,
   endPaneDrag,
@@ -56,6 +58,7 @@ import {
   mountRestoredCanvas,
   restoredCanvasNeedsSessionList,
   splitState,
+  singlePaneSessionId,
 } from "./split";
 import { activityOf } from "./session-list";
 import { replaceChildrenPreservingFocus } from "./pane-focus";
@@ -82,11 +85,11 @@ import { openChatSearch } from "./search";
 import { closeBrowse, openBrowse } from "./browse";
 import { attachTooltip, hideTooltip, tip } from "./tooltip";
 import { clearConnectorNotice, noteConnectorResult, renderConnectors, resetKeychainState } from "./connectors";
-import { renderDeploys } from "./deploys";
+import { openDeployById, renderDeploys } from "./deploys";
 import { renderMemory, resetMemoryState } from "./memory";
+import { renderCalendar } from "./calendar";
 import {
   inboxOpenCount,
-  openInboxItemById,
   refreshInbox,
   renderInbox,
   resetActiveInboxItem,
@@ -145,7 +148,7 @@ export function syncUrlFromState(sessionOverride?: string | null): void {
   const chatState = mainConversation().state;
   const fromState =
     sessionOverride !== undefined ? sessionOverride : (chatState.sessionId ?? chatState.rememberedSessionId);
-  const sessionId = splitState.active ? null : fromState;
+  const sessionId = splitState.active ? singlePaneSessionId() : fromState;
   const next = deepLinkPath(UI_BASE, appState.currentView, sessionId, contextsState.selected);
   if (`${location.pathname}${location.search}` !== next) history.replaceState(null, "", next);
 }
@@ -202,6 +205,7 @@ function resetSidebarWidth(): void {
 const ICON = {
   newChat: Plus,
   inbox: InboxGlyph,
+  calendar: CalendarDays,
   chats: MessageSquare,
   contexts: Folder,
   files: Files,
@@ -552,7 +556,7 @@ export function renderSidebarFooter(): void {
           aria-expanded=${userMenuOpen ? "true" : "false"}
           @click=${toggleUserMenu}
         >
-          <span class="user-name">${appState.me?.user ?? ""}</span>
+          <span class="user-name">${appState.me?.displayName?.trim() || appState.me?.user || ""}</span>
         </button>
         ${
           userMenuOpen
@@ -611,7 +615,8 @@ export function renderSidebarTop(): void {
   render(
     html`
       <nav class="nav quick-nav" @click=${onNavClick}>
-        ${navRow("chats", ICON.home, "Home")} ${can("inbox") ? inboxNavRow() : nothing}
+        ${navRow("chats", ICON.home, "Home")}
+        ${can("inbox") ? html`${inboxNavRow()} ${navRow("calendar", ICON.calendar, "Calendar")}` : nothing}
         ${actionRow(Search, "Search", () => {
           hideTooltip();
           openChatSearch();
@@ -692,6 +697,9 @@ export function switchView(v: View): void {
     case "inbox":
       void renderInbox();
       break;
+    case "calendar":
+      renderCalendar();
+      break;
     case "webhooks":
       void renderWebhooksPage();
       break;
@@ -756,6 +764,9 @@ function refreshActiveView(v: View): void {
     case "inbox":
       void renderInbox();
       break;
+    case "calendar":
+      renderCalendar();
+      break;
     case "contexts":
       void renderContexts();
       break;
@@ -797,6 +808,32 @@ export function showMainEmpty(text: string): void {
     appState.mainEl.replaceChildren(
       Object.assign(document.createElement("div"), { className: "empty", textContent: text }),
     );
+}
+
+function showConversationError(unavailable: boolean): void {
+  showMainEmpty("");
+  if (!appState.mainEl) return;
+  render(
+    html`
+      <section class="conversation-error" aria-labelledby="conversation-error-title">
+        <span class="conversation-error-code">${unavailable ? "Connection problem" : "404"}</span>
+        <h1 id="conversation-error-title" tabindex="-1">
+          ${unavailable ? "Couldn't load conversation" : "Conversation not found"}
+        </h1>
+        <p>
+          ${unavailable ? "Something went wrong loading this conversation. Please try again." : "This conversation may have been deleted, or you may be signed into an account that doesn’t have access."}
+        </p>
+        <div class="conversation-error-actions">
+          <a class="btn" href=${withBase("/")}>Back to chats</a>
+          ${unavailable ? html`<button class="btn" @click=${() => location.reload()}>Try again</button>` : nothing}
+        </div>
+      </section>
+    `,
+    appState.mainEl,
+  );
+  appState.mainEl.querySelector<HTMLElement>("h1")?.focus();
+  renderList();
+  document.title = `${unavailable ? "Couldn't load conversation" : "Conversation not found"} · ${brandName()}`;
 }
 
 function toggleSidebar(): void {
@@ -934,12 +971,12 @@ function warmDeferredChunks(): void {
 function openAppEditChat(slug: string): void {
   const user = appState.me?.user ?? "anon";
   const threadRef = `web:${user}:app-edit:${slug}`;
+  if (storedDraft(threadRef) === `Update my deployed app "${slug}": `) saveDraft(threadRef, "");
   const existing = sessionsState.list.find((s) => s.threadRef === threadRef);
   if (existing) {
     void openSession(existing);
     return;
   }
-  if (!storedDraft(threadRef)) saveDraft(threadRef, `Update my deployed app "${slug}": `);
   startNewChat(null, null, threadRef);
   renderList();
 }
@@ -954,15 +991,23 @@ export async function bootSafely(): Promise<void> {
 }
 
 export async function boot(): Promise<void> {
+  captureConnectionReturn(location.href);
   const params = new URLSearchParams(location.search);
   const {
     view: wanted,
     session: wantedSession,
     item: wantedItem,
   } = parseDeepLink(UI_BASE, location.pathname, location.search);
+  document.body.classList.toggle("app-edit-embed", wanted === "app-edit" && params.get("embed") === "1");
   const chatsLink = wanted === null || wanted === "chats";
   const linkedId = wantedSession && chatsLink ? wantedSession : null;
-  const entriesPrefetch = linkedId ? fetchTranscript(linkedId, { tailTurns: TAIL_TURNS }).catch(() => null) : null;
+  let transcriptUnavailable = false;
+  const loadLinkedTranscript = (id: string) =>
+    fetchTranscript(id, { tailTurns: TAIL_TURNS }).catch((error: unknown) => {
+      transcriptUnavailable = !(error instanceof ApiError && (error.status === 404 || error.status === 403));
+      return null;
+    });
+  const entriesPrefetch = linkedId ? loadLinkedTranscript(linkedId) : null;
   const approvalsPrefetch = linkedId ? fetchSessionApprovals(linkedId) : null;
   const runtimeConfigFetch = fetchRuntimeConfig();
   const remoteSplitFetch = fetchRemoteSplit();
@@ -1019,7 +1064,7 @@ export async function boot(): Promise<void> {
   const sessions = refreshSessions({ showLoading: true });
 
   if (wantedSession && !viewIntent && wanted !== "app-edit") {
-    const transcript = entriesPrefetch ?? fetchTranscript(wantedSession, { tailTurns: TAIL_TURNS }).catch(() => null);
+    const transcript = entriesPrefetch ?? loadLinkedTranscript(wantedSession);
     const linked = (await transcript)?.session;
     if (linked) {
       exitSplitIfActive();
@@ -1034,12 +1079,8 @@ export async function boot(): Promise<void> {
       exitSplitIfActive();
       revealSessionSurface(match);
       await openSession(match);
-    } else if (mountRestoredCanvas()) {
-      canvasToast("That conversation wasn't found, or you don't have access to it.");
-      syncUrlFromState();
     } else {
-      showMainEmpty("That conversation wasn't found, or you don't have access to it.");
-      renderList();
+      showConversationError(transcriptUnavailable);
     }
     return;
   }
@@ -1067,11 +1108,12 @@ export async function boot(): Promise<void> {
         params.get("scope") ?? (wantedItem ? resolveProjectScope(await ensureContexts(), wantedItem) : null);
       if (scope) contextsState.selected = scope;
     }
+    if (wanted === "deploys" && wantedItem) openDeployById(wantedItem);
     if (wanted === "crons" && wantedItem) openCronById(wantedItem);
     if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
-    if (wanted === "inbox" && wantedItem) openInboxItemById(wantedItem);
     if (wanted === "skills" && wantedItem) openSkillById(wantedItem);
     switchView(wanted as View);
+    if (wanted === "inbox") routeInboxHistory(wantedItem);
   } else if (connectedProvider && sessionsState.list.length) {
     const recent = [...sessionsState.list].sort((a, b) => activityOf(b) - activityOf(a))[0]!;
     exitSplitIfActive();

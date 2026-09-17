@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import vm from "node:vm";
 
 const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
 
@@ -33,7 +34,7 @@ test("admin shell uses the QM identity with org-injectable branding", () => {
   assert.match(html, /<title>QM Admin<\/title>/);
   assert.match(html, /<meta name="brand-self-label" content="QM" \/>/);
   assert.match(html, /<header class="top">/);
-  assert.match(html, /id="home-link">← Back to home<\/a>/);
+  assert.match(html, /id="home-link">[\s\S]*?<span>Back to home<\/span>\s*<\/a>/);
   assert.match(html, /<span class="brand-mark" aria-hidden="true"><\/span>/);
   assert.match(
     html,
@@ -46,10 +47,15 @@ test("admin shell uses the QM identity with org-injectable branding", () => {
 });
 
 test("admin shell groups control, logs, and artifacts like the reorganization", () => {
-  assert.match(
-    html,
-    /const SECTIONS = \[\s*\{ views: \["governance", "models", "credentials", "connectors", "customize", "users"\] \},\s*\{ label: "Logs", views: \["history", "slack", "judgments", "errors", "audit", "egress", "metrics"\] \},\s*\{ label: "Artifacts", views: \["files", "skills", "memory", "deployments", "crons", "retention"\] \},\s*\];/,
-  );
+  const sections = html.match(/const SECTIONS = (\[[\s\S]*?\n {6}\]);/)?.[1];
+  assert.ok(sections);
+  const actual = JSON.parse(JSON.stringify(vm.runInNewContext(sections)));
+  assert.deepEqual(actual, [
+    { views: ["governance", "models", "credentials", "connectors", "customize", "users"] },
+    { label: "Logs", views: ["history", "slack", "judgments", "errors", "audit", "egress", "metrics"] },
+    { label: "Artifacts", views: ["files", "skills", "memory", "deployments", "crons", "retention"] },
+    { views: ["design-system"] },
+  ]);
   assert.match(html, /history: "Sessions"/);
   assert.match(
     html,
@@ -82,7 +88,7 @@ test("connector setup uses the live catalog and shows exact provider and callbac
   assert.doesNotMatch(html, /const CONNECTOR_CATALOG = \[/);
   assert.match(html, /id="slack-bot-token"/);
   assert.match(html, /api\("PUT", "\/api\/slack-installation"/);
-  assert.match(html, /encrypted in durable storage/);
+  assert.match(html, /Use your own Slack app/);
 });
 
 test("temporary onboarding covers model credentials, Slack, and OAuth setup", () => {
@@ -101,7 +107,10 @@ test("temporary onboarding covers model credentials, Slack, and OAuth setup", ()
 test("admin shell addresses views by path, not a ?view= query param", () => {
   assert.match(html, /const path = API_BASE \+ "\/" \+ encodeURIComponent\(st\.view \|\| DEFAULT_VIEW\);/);
   assert.doesNotMatch(html, /p\.set\("view", st\.view\)/);
-  assert.match(html, /const raw = p\.get\("view"\) \|\| fromPath;/);
+  assert.match(
+    html,
+    /const raw = p\.get\("setup"\) === "slack" \|\| slackStep \? "connectors" : p\.get\("view"\) \|\| fromPath;/,
+  );
   assert.doesNotMatch(html, /st\.view !== "governance"/);
 });
 
@@ -223,7 +232,7 @@ test("control-plane pages use the shared web UI canvas without redundant page in
   assert.match(html, /id="slack-token-editor"/);
   assert.match(html, /id="soul-preview"/);
   assert.match(html, /body\[data-subview="connectors"\] \.shellbar/);
-  assert.match(html, /connectorTip\.className = "connector-dm-tip hidden"/);
+  assert.match(html, /connectorTip\.className = "connector-dm-tip admin-notice hidden"/);
   assert.doesNotMatch(html, /First match wins/);
   assert.doesNotMatch(html, /direct mutations blocked/);
   assert.doesNotMatch(html, /The org setting is a minimum/);
@@ -235,7 +244,6 @@ test("governance renders simple settings as compact rows with contextual actions
     "card-security-posture",
     "card-sharing-posture",
     "card-external-slack",
-    "card-base-model",
     "card-people-directory",
     "card-turn-wall-clock",
   ]) {
@@ -323,7 +331,10 @@ test("governance keeps effective-state summaries synchronized after focused save
 
 test("stale governance reads cannot overwrite a newer scope", () => {
   assert.match(html, /const requestId = \+\+governanceReq/);
-  assert.match(html, /if \(requestId !== governanceReq \|\| requestedScope !== scope\) return;/);
+  assert.match(
+    html,
+    /if \(requestId !== governanceReq \|\| requestedScope !== scope \|\| requestedView !== view\) return;/,
+  );
   assert.match(html, /encodeURIComponent\(requestedScope\) \+ "\/" \+ key/);
 });
 
@@ -425,7 +436,7 @@ test("governance SOUL workbench shows draft diff, history, and conflict-safe res
 });
 
 test("the hidden utility hides an element whose component rule is declared later", () => {
-  assert.match(html, /<aside class="environment-notice hidden" id="environment-notice"/);
+  assert.match(html, /<aside class="environment-notice admin-notice hidden" id="environment-notice"/);
   assert.match(html, /notice\.classList\.toggle\("hidden", !attachment\)/);
   assert.equal(resolvedDisplay(["environment-notice"]), "flex");
   assert.equal(resolvedDisplay(["environment-notice", "hidden"]), "none");
@@ -467,7 +478,7 @@ test("admin parity views expose the requested card groups and real navigation ac
     "+ Add flag",
     "View usage ›",
     "View users ›",
-    "Rotate tokens…",
+    "Use your own Slack app",
     "+ Add OAuth app",
   ]) {
     assert.ok(html.includes(action), `missing ${action}`);
@@ -500,6 +511,9 @@ test("custom providers share one in-place editor instead of linking to onboardin
   assert.match(html, /\$\("add-custom-provider"\)\.onclick = \(\) => openCustomProviderEditor\(\)/);
   assert.match(html, /\$\("onboarding-add-custom-provider"\)\.onclick = \(\) => openCustomProviderEditor\(\)/);
   assert.match(html, /edit\.onclick = \(\) => openCustomProviderEditor\(provider\)/);
+  assert.match(html, /<option value="openai-responses">OpenAI Responses<\/option>/);
+  assert.match(html, /CUSTOM_PROVIDER_PROTOCOL_LABELS\[provider\.protocol\] \|\| provider\.protocol/);
+  assert.match(html, /\$\("custom-provider-protocol"\)\.value = provider\?\.protocol \|\| "openai"/);
   assert.match(html, /actions\.append\(edit, customProviderRemoveButton\(provider\)\)/);
   assert.match(html, /if \(view === "models"\) await loadScope\(\)/);
   assert.doesNotMatch(html, /\$\("add-custom-provider"\)\.onclick = \(\) => \{[\s\S]*?setView\("onboarding"\)/);
@@ -538,7 +552,7 @@ test("governance follows the neutral web UI interaction palette", () => {
   assert.match(html, /\.viewlink \{[\s\S]*?color: var\(--muted\)/);
   assert.match(
     html,
-    /\.posture-choice:has\(input:checked\) \{\s*border-color: var\(--border\);\s*background: var\(--subtle\)/,
+    /\.posture-choice:has\(input:checked\) \{\s*border-color: transparent;\s*background: color-mix\(in srgb, var\(--text\) 4%, transparent\)/,
   );
 });
 

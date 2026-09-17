@@ -20,6 +20,7 @@ import type { IsCurrentSharedScopeMember, ManagedGroupDirectory } from "../../re
 import type { DirectoryStore } from "../../directory/directory-store.ts";
 import type { EnvironmentStore } from "../../environments/environment-store.ts";
 import type { SessionStore } from "../../sessions/session-store.ts";
+import type { SessionSyscallsFactory } from "../../sessions/session-syscalls.ts";
 import type { DeliveryStore } from "../../delivery/delivery-store.ts";
 import type { WorkspaceStore } from "../../workspace/workspace-store.ts";
 import type { Sandbox } from "../../sandbox/sandbox.ts";
@@ -63,6 +64,7 @@ import type { BrokeredLayerTool, LayerCredentialTool, DeploymentLayerRuntime } f
 import type { FileArtifactStore } from "../../files/file-artifact-store.ts";
 import type { DeployService } from "../../deploy/deploy-service.ts";
 import type { AclStore } from "../../acl/acl-store.ts";
+import type { SwarmService, SwarmTurn } from "../../swarms/swarm-service.ts";
 import type { ChannelPolicyStore } from "../../surface-cache/channel-policy-store.ts";
 import type { SurfaceCache } from "../../surface-cache/types.ts";
 
@@ -84,11 +86,14 @@ export interface OrchestratorInput extends Omit<
   | "liveActor"
 > {
   surface?: string;
+  privateSessionMessage?: true;
+  sessionMessageDepth?: number;
   actor: Principal;
   conversation: Conversation;
   origin: TurnOrigin;
   runId?: string;
   attempt?: number;
+  runLeaseToken?: string;
 
   runStartedAt?: number;
   finalAttempt?: boolean;
@@ -97,9 +102,11 @@ export interface OrchestratorInput extends Omit<
   queueMs?: number;
   sessionParticipantIds?: readonly string[];
   scopeVersion?: string;
+  swarm?: SwarmTurn;
 }
 
 export interface OrchestratorDeps {
+  swarms?: SwarmService;
   refreshModels?: () => Promise<void>;
   identity: IdentityService;
   resolution: ResolutionService;
@@ -112,6 +119,7 @@ export interface OrchestratorDeps {
   resolveBaseModelId?: () => string | undefined;
   sessionTapeMode?: "shadow" | "serve";
   sessions: SessionStore;
+  sessionSyscalls?: SessionSyscallsFactory;
   workspace: WorkspaceStore;
   files: FileArtifactStore;
   sandbox: Sandbox;
@@ -190,6 +198,7 @@ export interface OrchestratorDeps {
   surfaceContext?: SurfaceContextPuller;
   surfaceSearch?: SurfaceSearchStore;
   surfaceCache?: SurfaceCache;
+  slackContextSource?: "live" | "shadow" | "mirror";
   channelPolicy?: ChannelPolicyStore;
   surfaceDebugFooter?: boolean;
 }

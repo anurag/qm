@@ -113,7 +113,7 @@ test("Steer withdraws the queued run before it signals, and only then shows the 
   );
   assert.match(
     fn,
-    /if \(!outcome\.ok\) recoverEndedRunSteer\(agent, queued\.text, outcome\);/,
+    /if \(!outcome\.ok\) await recoverEndedRunSteer\(agent, queued\.text, outcome\);/,
     "a steer the run outlived is recovered (replayed run followed, or resent as its own turn)",
   );
   assert.match(fn, /if \(!\(await withdrawRun\(queued\.runId\)\)\) return ctx\.chat\.drawActiveChat\(agent\);/);
@@ -222,7 +222,7 @@ test("settling a turn follows the next queued run instead of sending it", () => 
   assert.doesNotMatch(fn, /queueTurn/, "it never submits anything");
   assert.match(
     fn,
-    /await \(next && !recorded \? agent\.prompt\(next\.text\) : agent\.continue\(\)\)/,
+    /await \(!active\.run\.input && next && !recorded \? agent\.prompt\(next\.text\) : agent\.continue\(\)\)/,
     "an already-recorded turn is resumed, never prompted a second time onto the screen",
   );
   assert.match(fn, /await refreshTranscriptFromEntries\(agent\)/);

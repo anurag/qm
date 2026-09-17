@@ -1,7 +1,10 @@
+import { provisionTrustedAdmin } from "./trusted-admin.ts";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 import { ADMIN_LOGIN_SCRIPT, ADMIN_LOGIN_SCRIPT_HASH, openAdminLogin } from "./admin-login.ts";
 import { LRUCache } from "lru-cache";
+import { createTrustedEntry, trustedEntryConfig } from "./trusted-entry.ts";
 import {
   deriveKey,
   seal,
@@ -33,6 +36,7 @@ import {
   proxyToSurface,
   proxyToDeployment,
   proxyToUpstream,
+  proxyToAppHost,
   FORWARD_AGENT_API_HEADERS,
   FORWARD_DEPLOYMENT_LAYER_HEADERS,
   FORWARD_OAUTH_HEADERS,
@@ -203,6 +207,23 @@ const DEV_SECRET = "dev-only-insecure-portal-session-secret";
 const sessionKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.session.v1");
 const tmpKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.tmp.v1");
 const impersonateKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.impersonate.v1");
+const trustedOidc = trustedEntryConfig(process.env, PUBLIC_URL);
+const trustedSignInLabel = trustedOidc ? process.env.PORTAL_TRUSTED_OIDC_LABEL?.trim() || undefined : undefined;
+const trustedAdminEnabled = process.env.PORTAL_TRUSTED_OIDC_ADMIN === "1";
+if (
+  trustedAdminEnabled &&
+  (!trustedOidc ||
+    !CORE_SIGNING_SECRET ||
+    !PORTAL_IDENTITY_SECRET ||
+    PORTAL_IDENTITY_SECRET.length < 32 ||
+    PORTAL_IDENTITY_SECRET === CORE_SIGNING_SECRET)
+)
+  throw new Error("Trusted administrator provisioning requires trusted OIDC and a distinct portal identity secret");
+const trustedEntry = trustedOidc
+  ? createTrustedEntry(trustedOidc, SESSION_SECRET ?? DEV_SECRET, (key, expiresAt) =>
+      claimOnce(coreClaimStore(CORE, CORE_SIGNING_SECRET, "portal"), key, expiresAt),
+    )
+  : null;
 const IMPERSONATE_TTL_S = Number(process.env.PORTAL_IMPERSONATE_TTL_S ?? 3600);
 
 const TMP_TTL_S = 600;
@@ -491,7 +512,10 @@ ${CARD_STYLE}
 </html>`;
 }
 
-export function signInErrorHtml(detail: string): string {
+export function signInErrorHtml(
+  detail: string,
+  retryPath: "/auth/login" | "/auth/trusted/login" = "/auth/login",
+): string {
   return cardPage({
     title: "Sign-in failed",
     heading: "We couldn't sign you in",
@@ -499,9 +523,9 @@ export function signInErrorHtml(detail: string): string {
     icon: ALERT_ICON,
     warn: true,
     extra: `<p class="reason"><strong>Details</strong>${escapeHtml(detail)}</p>`,
-    actions: `<a class="btn primary" href="/auth/login">Try signing in again</a>
-        <a class="btn ghost" href="/">Back to start</a>`,
-    help: "Still stuck? Make sure you're a member of the approved workspace, then contact your admin.",
+    actions: `<a class="btn primary" href="${retryPath}">Try signing in again</a>
+        ${retryPath === "/auth/trusted/login" && trustedSignInLabel ? '<a class="btn ghost" href="/auth/login?provider=primary">Use another sign-in method</a>' : '<a class="btn ghost" href="/">Back to start</a>'}`,
+    help: "Still stuck? Check that your account has access, then contact your admin.",
   });
 }
 
@@ -764,14 +788,31 @@ function isDeploymentLayerPassthrough(method: string, pathname: string): boolean
   return (method === "GET" || method === "PUT") && pathname === "/v1/deployment-layer";
 }
 
-function sessionCookieSet(value: string): string[] {
+function loginProviderCookie(sub: string): string[] {
+  if (!trustedOidc || !trustedSignInLabel) return [];
+  const issuerHash = createHash("sha256").update(trustedOidc.issuer).digest("hex");
+  return [
+    sub.startsWith(`oidc:${issuerHash}:`)
+      ? setCookie("portal_login_provider", issuerHash, {
+          path: "/",
+          maxAge: 365 * 24 * 60 * 60,
+          secure: SECURE_COOKIES,
+        })
+      : clearCookie("portal_login_provider", "/", SECURE_COOKIES),
+  ];
+}
+
+function sessionCookieSet(value: string, sub: string): string[] {
   const set = setCookie("portal_session", value, {
     path: "/",
     maxAge: SESSION_TTL_S,
     secure: SECURE_COOKIES,
     ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
   });
-  return COOKIE_DOMAIN ? [set, clearCookie("portal_session", "/", SECURE_COOKIES)] : [set];
+  return [
+    ...(COOKIE_DOMAIN ? [set, clearCookie("portal_session", "/", SECURE_COOKIES)] : [set]),
+    ...loginProviderCookie(sub),
+  ];
 }
 
 function setSession(res: ServerResponse, headers: string[]): void {
@@ -843,7 +884,7 @@ async function mintPlaygroundSession(req: IncomingMessage, res: ServerResponse):
     iat: now,
     exp: now + SESSION_TTL_S,
   };
-  setSession(res, sessionCookieSet(seal(session, sessionKey)));
+  setSession(res, sessionCookieSet(seal(session, sessionKey), session.sub));
   return session;
 }
 
@@ -865,7 +906,7 @@ function renewSessionCookie(req: IncomingMessage, res: ServerResponse): void {
     iat: now,
     exp: Math.min(now + SESSION_TTL_S, authenticatedAt + SESSION_MAX_TTL_S),
   };
-  setSession(res, sessionCookieSet(seal(renewed, sessionKey)));
+  setSession(res, sessionCookieSet(seal(renewed, sessionKey), renewed.sub));
 }
 
 const server = createServer((req, res) => {
@@ -887,6 +928,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   res.setHeader("x-content-type-options", "nosniff");
   res.setHeader("x-frame-options", "DENY");
 
+  const requestHost = (req.headers.host ?? "").toLowerCase().split(":")[0]!;
+  const appSuffix = APPS_DOMAIN ? `.${APPS_DOMAIN.toLowerCase()}` : undefined;
+  if (appSuffix && (requestHost.endsWith(appSuffix) || requestHost === APPS_DOMAIN?.toLowerCase())) {
+    const label = requestHost.slice(0, -appSuffix.length);
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) return json(res, 404, { error: "not_found" });
+    return proxyToAppHost(req, res, CORE);
+  }
+
   void refreshSurfaceConfig();
 
   if (method === "GET" && pathname === "/healthz") return json(res, 200, { ok: true });
@@ -897,6 +946,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 
   if (pathname === "/auth/login" && method === "GET") return authLogin(req, res, url);
   if (pathname === "/auth/callback" && method === "GET") return authCallback(req, res, url);
+  if (pathname.startsWith("/auth/trusted/") && method === "GET") return trustedAuth(req, res, url);
   if (pathname === "/auth/admin-login") return adminLogin(req, res);
   if (pathname === "/auth/logout" && method === "POST") {
     if (!sameOriginRequest(req)) return json(res, 403, { error: "forbidden" });
@@ -924,7 +974,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         return json(res, 503, { error: "revocation_failed" });
       }
     }
+    const signedOutSession = currentSession(req);
     setSession(res, [
+      ...(signedOutSession ? loginProviderCookie(signedOutSession.sub) : []),
       clearCookie("portal_session", "/", SECURE_COOKIES, COOKIE_DOMAIN),
       ...(COOKIE_DOMAIN ? [clearCookie("portal_session", "/", SECURE_COOKIES)] : []),
       clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
@@ -1014,6 +1066,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return json(res, 400, { error: "bad_request", message: "illegal path" });
   }
 
+  if (
+    (pathname === "/v1/slack/managed/installation" && (method === "POST" || method === "DELETE")) ||
+    (pathname === "/v1/slack/managed/events" && method === "POST")
+  ) {
+    return proxyToUpstream(req, res, { baseUrl: CORE, path: pathname, search: "" }, [
+      "authorization",
+      "content-type",
+      "content-length",
+    ]);
+  }
+
   if (method === "POST" && /^\/v1\/webhooks\/incoming\/[^/]+$/.test(pathname)) {
     return proxyToUpstream(req, res, { baseUrl: CORE, path: pathname, search: url.search }, FORWARD_WEBHOOK_HEADERS);
   }
@@ -1067,6 +1130,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       corePath: `/v1/keychain/drops/${dropSubmit[1]}${url.search}`,
       session,
     });
+  }
+
+  if (
+    ((method === "GET" || method === "POST") && pathname === "/v1/background-work") ||
+    (method === "POST" && pathname === "/v1/deployment/live-session")
+  ) {
+    return proxyToUpstream(req, res, { baseUrl: CORE, path: pathname, search: url.search }, [
+      ...FORWARD_DEPLOYMENT_LAYER_HEADERS,
+      "authorization",
+    ]);
   }
 
   if (isDeploymentLayerPassthrough(method, pathname)) {
@@ -1244,6 +1317,52 @@ async function adminLogin(req: IncomingMessage, res: ServerResponse): Promise<vo
   res.end();
 }
 
+async function trustedAuth(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  if (!trustedEntry) return json(res, 404, { error: "not_found" });
+  const cookieName = "portal_trusted_tmp";
+  const path = "/auth/trusted";
+  if (url.pathname === `${path}/login`) {
+    const returnTo =
+      url.searchParams.get("returnTo") ??
+      openTmp(readCookie(req.headers.cookie, "portal_oidc_tmp"), tmpKey, Date.now())?.returnTo ??
+      null;
+    const login = trustedEntry.start(sanitizeReturnTo(returnTo, PUBLIC_URL, APPS_DOMAIN));
+    setSession(res, [setCookie(cookieName, login.cookie, { path, maxAge: login.ttl, secure: SECURE_COOKIES })]);
+    res.writeHead(302, { location: login.location, "cache-control": "no-store" });
+    return void res.end();
+  }
+  if (url.pathname !== `${path}/callback`) return json(res, 404, { error: "not_found" });
+  setSession(res, [clearCookie(cookieName, path, SECURE_COOKIES)]);
+  try {
+    const identity = await trustedEntry.finish(readCookie(req.headers.cookie, cookieName), url);
+    if (trustedAdminEnabled) {
+      await provisionTrustedAdmin(
+        {
+          core: CORE,
+          signingSecret: CORE_SIGNING_SECRET!,
+          identitySecret: PORTAL_IDENTITY_SECRET!,
+          org: ORG,
+          issuer: trustedOidc!.issuer,
+        },
+        identity.subject,
+      );
+      adminCache.delete(identity.sub);
+    }
+    setAuthenticatedSession(res, identity.sub, identity.name);
+    res.writeHead(302, {
+      location: sanitizeReturnTo(identity.returnTo, PUBLIC_URL, APPS_DOMAIN),
+      "cache-control": "no-store",
+    });
+    res.end();
+  } catch {
+    sendHtml(
+      res,
+      400,
+      signInErrorHtml("Trusted sign-in failed. Please start again from your provider.", "/auth/trusted/login"),
+    );
+  }
+}
+
 function setAuthenticatedSession(res: ServerResponse, sub: string, name = ""): void {
   const now = Math.floor(Date.now() / 1000);
   const session: SessionClaims = {
@@ -1256,18 +1375,33 @@ function setAuthenticatedSession(res: ServerResponse, sub: string, name = ""): v
     ...(name ? { name } : {}),
   };
   setSession(res, [
-    ...sessionCookieSet(seal(session, sessionKey)),
+    ...sessionCookieSet(seal(session, sessionKey), session.sub),
+    clearCookie("portal_trusted_tmp", "/auth/trusted", SECURE_COOKIES),
     clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
     clearCookie("portal_impersonate", "/", SECURE_COOKIES),
   ]);
 }
 
 function authLogin(req: IncomingMessage, res: ServerResponse, url: URL): void {
+  if (
+    trustedOidc &&
+    trustedSignInLabel &&
+    url.searchParams.get("provider") !== "primary" &&
+    readCookie(req.headers.cookie, "portal_login_provider") ===
+      createHash("sha256").update(trustedOidc.issuer).digest("hex")
+  ) {
+    const returnTo = sanitizeReturnTo(url.searchParams.get("returnTo"), PUBLIC_URL, APPS_DOMAIN);
+    res.writeHead(302, {
+      location: `/auth/trusted/login?returnTo=${encodeURIComponent(returnTo)}`,
+      "cache-control": "no-store",
+    });
+    return void res.end();
+  }
   const returnTo = sanitizeReturnTo(url.searchParams.get("returnTo"), PUBLIC_URL, APPS_DOMAIN);
   const localSession = localDevSession(req, Date.now(), true);
   if (localSession) {
     setSession(res, [
-      ...sessionCookieSet(seal(localSession, sessionKey)),
+      ...sessionCookieSet(seal(localSession, sessionKey), localSession.sub),
       clearCookie("portal_oidc_tmp", "/auth", SECURE_COOKIES),
       ...(AUTH_BROKER_UPSTREAM ? [clearCookie("qm_idp_session", AUTH_BROKER_PREFIX, true)] : []),
       clearCookie(LOCAL_LOGOUT_COOKIE, "/", SECURE_COOKIES),
@@ -1491,7 +1625,11 @@ export async function startServer(): Promise<void> {
       throw new Error("Embedded auth requires the loopback broker upstream");
     }
     const auth = await import("../../auth/src/index.ts");
-    const broker = await auth.startServer({ port: 8099, host: "127.0.0.1" });
+    const broker = await auth.startServer({
+      port: 8099,
+      host: "127.0.0.1",
+      ...(trustedSignInLabel ? { trustedSignInLabel } : {}),
+    });
     server.once("close", () => broker.close());
     server.once("error", () => broker.close());
   }

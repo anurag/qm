@@ -1,6 +1,7 @@
+import { openDeploymentPermissions } from "./deploy-permissions";
 import { html, nothing, render, type TemplateResult } from "lit";
 import { live } from "lit/directives/live.js";
-import { Archive, Check, Copy, ExternalLink, Pencil, RotateCcw, X } from "lucide";
+import { Archive, Check, Copy, ExternalLink, RotateCcw, X } from "lucide";
 import { api, withBase } from "./core-bridge";
 import { errMessage } from "../../chassis/src/errors";
 import { copyText, icon, relTime } from "./ui";
@@ -35,6 +36,7 @@ import {
   type DeploymentView,
 } from "./deploy-view";
 import { tip } from "./tooltip";
+import { deepLinkPath, UI_BASE } from "./deep-link";
 
 const DEPLOY_TABS: Array<{ value: DeploymentTab; label: string }> = [
   { value: "yours", label: "Yours" },
@@ -50,6 +52,7 @@ let deployQuery = "";
 let deployTab: DeploymentTab = "yours";
 let deployPageHost: HTMLElement | null = null;
 let activeDeploy: DeploymentView | null = null;
+let visibleVersionCount = 10;
 let editingDeploy: { id: string; field: "displayName" | "name" } | null = null;
 let deployDraft = "";
 let deploySaving = false;
@@ -95,11 +98,11 @@ function permissionBadge(d: DeploymentView): TemplateResult {
 
 function ownerLabel(d: DeploymentView): string {
   const me = appState.me?.user;
-  if (d.ownerScopeId === `personal:${me}`) return "Your personal context";
+  if (d.ownerScopeId === `personal:${me}`) return "Owned by you";
   if (d.ownerScopeId?.startsWith("personal:"))
-    return `${friendlyPrincipal(d.ownerScopeId.slice("personal:".length))} · Personal`;
+    return `Owned by ${friendlyPrincipal(d.ownerScopeId.slice("personal:".length))}`;
   if (d.ownerScopeId?.startsWith("org:")) return "Organization";
-  return d.createdBy ? `Shared context · created by ${friendlyPrincipal(d.createdBy)}` : "Shared context";
+  return "Shared context";
 }
 
 function deployTabs(): TemplateResult {
@@ -226,11 +229,19 @@ function drawDeploysPage(): void {
   );
 }
 
+let pendingDeployId: string | null = null;
+
+export function openDeployById(id: string): void {
+  pendingDeployId = id;
+}
+
 async function openDeploy(d: DeploymentView): Promise<void> {
+  visibleVersionCount = 10;
   editingDeploy = null;
   deployDraft = "";
   deployNotices = withoutDeploymentDetailNotice(deployNotices);
   activeDeploy = d;
+  history.replaceState(null, "", deepLinkPath(UI_BASE, "deploys", null, null, d.id));
   drawDeployDetail(d, true);
   try {
     const response = await api<{ deployment?: DeploymentView }>(`/api/deployments/${encodeURIComponent(d.id)}`);
@@ -246,7 +257,7 @@ async function openDeploy(d: DeploymentView): Promise<void> {
 
 function drawDeployDetail(d: DeploymentView, loading = false): void {
   if (appState.currentView !== "deploys" || !appState.mainEl || activeDeploy?.id !== d.id) return;
-  const host = document.createElement("div");
+  const host = appState.mainEl.querySelector<HTMLElement>(".deploy-detail-pane") ?? document.createElement("div");
   host.className = "resource-pane deploy-detail-pane";
   const versions = [...(d.versions ?? [])].sort((a, b) => b.version - a.version);
   const running = d.status === "running";
@@ -267,86 +278,36 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
           </div>
           <div class="actions">
             ${running && d.webUrl ? html`<a class="btn primary" href=${withBase(d.webUrl)} target="_blank" rel="noreferrer">Open app ${icon(ExternalLink, 14)}</a>` : nothing}
-            ${running && canManage(d) ? html`<button class="btn" type="button" @click=${(event: Event) => void openLiveEdit(d, event.currentTarget as HTMLButtonElement)}>${icon(Pencil, 14)}<span>Edit live</span></button>` : nothing}
             ${d.webUrl ? html`<button class="btn" type="button" @click=${(event: Event) => void copyText(new URL(withBase(d.webUrl!), window.location.href).href, event.currentTarget as HTMLButtonElement)}>${icon(Copy, 14)}<span>Copy URL</span></button>` : nothing}
           </div>
         </div>
         ${loading ? html`<div class="hint">Loading authoritative app details…</div>` : nothing}
         ${deployNotices.detail?.id === d.id ? html`<div class="status">${deployNotices.detail.text}</div>` : nothing}
 
-        <section class="deploy-detail-section">
-          <h3>Overview</h3>
-          <div class="deploy-facts">
-            <div><span>Status</span><strong>${statusLabel(d)}</strong></div>
-            <div><span>Live version</span><strong>${d.appliedVersion ?? d.currentVersion ?? "None"}</strong></div>
-            <div><span>Latest version</span><strong>${d.currentVersion ?? "None"}</strong></div>
-            <div>
-              <span>Last deployed</span
-              ><strong>${deploymentLatestAt(d) ? new Date(deploymentLatestAt(d)).toLocaleString() : "Never"}</strong>
-            </div>
-            <div>
-              <span>Last opened</span
-              ><strong>${d.lastAccessAt ? relTime(d.lastAccessAt) : "No recorded access"}</strong>
-            </div>
-            <div><span>Access</span><strong>${permissionBadge(d)}</strong></div>
+        <div class="deploy-summary">
+          <span>Live v${d.appliedVersion ?? d.currentVersion ?? "—"}</span>
+          ${d.currentVersion !== undefined && d.appliedVersion !== undefined && d.currentVersion !== d.appliedVersion ? html`<span>Latest v${d.currentVersion}</span>` : nothing}
+          ${deploymentLatestAt(d) ? html`<span ${tip(new Date(deploymentLatestAt(d)).toLocaleString())}>Updated ${relTime(deploymentLatestAt(d))}</span>` : nothing}
+        </div>
+        <div class="deploy-access-line">
+          <div>
+            <span>${ownerLabel(d)}</span>
+            ${contextScope && contextScope !== d.ownerScopeId ? html`<span class="deploy-secondary-context">Created in ${scopeChip(contextScope)}</span>` : nothing}
+            ${d.createdBy && d.ownerScopeId !== `personal:${d.createdBy}` ? html`<span class="deploy-secondary-context">Created by ${friendlyPrincipal(d.createdBy)}</span>` : nothing}
           </div>
-        </section>
-
-        <section class="deploy-detail-section">
-          <h3>Ownership and access</h3>
-          <div class="field">
-            <label>Created in</label>
-            <div class="value">${contextScope ? scopeChip(contextScope) : "Unknown"}</div>
-          </div>
-          <div class="field">
-            <label>Owner</label>
-            <div class="value">${ownerLabel(d)}</div>
-          </div>
-          ${
-            d.createdBy
-              ? html`<div class="field">
-                  <label>Created by</label>
-                  <div class="value">${friendlyPrincipal(d.createdBy)}</div>
-                </div>`
-              : nothing
-          }
-          ${
-            d.gitUrl
-              ? html`<div class="field deploy-git-field">
-                  <label>Git remote</label>
-                  <div class="value">
-                    <code>${d.gitUrl}</code
-                    ><button
-                      class="icon-btn subtle"
-                      type="button"
-                      ${tip("Copy Git remote")}
-                      aria-label="Copy Git remote"
-                      @click=${(event: Event) => void copyText(d.gitUrl!, event.currentTarget as HTMLButtonElement)}
-                    >
-                      ${icon(Copy, 14)}
-                    </button>
-                  </div>
-                  <p class="hint">
-                    ${d.permission === "write" ? "Clone or push a new version with this short-lived authenticated URL." : "Clone source with this short-lived read-only authenticated URL."}
-                  </p>
-                </div>`
-              : nothing
-          }
-        </section>
+          ${d.ownerScopeId === `personal:${appState.me?.user}` ? html`<button class="btn" type="button" @click=${() => void openDeploymentPermissions(d.id, deploymentTitle(d), d.ownerScopeId!)}>Permissions</button>` : permissionBadge(d)}
+        </div>
 
         ${
           canManage(d)
             ? html`<section class="deploy-detail-section">
                 <h3>Settings</h3>
                 <div class="deploy-setting-row">
-                  <div>
-                    <strong>Display name</strong
-                    ><span>The human-friendly name shown here. This does not change the app URL.</span>
-                  </div>
-                  ${editingName ? deployEditForm(d, "displayName") : html`<div class="deploy-setting-value"><span dir="auto">${d.displayName || "Using URL slug"}</span><button class="btn" type="button" @click=${() => startEditDeploy(d, "displayName")}>Edit</button></div>`}
+                  <div><strong>Display name</strong><span>Shown in the app bar and app list.</span></div>
+                  ${editingName ? deployEditForm(d, "displayName") : html`<div class="deploy-setting-value"><span dir="auto">${deploymentTitle(d)}</span><button class="btn" type="button" @click=${() => startEditDeploy(d, "displayName")}>Edit</button></div>`}
                 </div>
                 <div class="deploy-setting-row">
-                  <div><strong>URL slug</strong><span>Changes the app URL. Existing links do not redirect.</span></div>
+                  <div><strong>App URL</strong><span>Changes the app URL. Existing links do not redirect.</span></div>
                   ${editingSlug ? deployEditForm(d, "name") : html`<div class="deploy-setting-value"><code>/d/${deploymentSlug(d)}/</code><button class="btn" type="button" @click=${() => startEditDeploy(d, "name")}>Change</button></div>`}
                 </div>
                 <div class="actions deploy-danger-actions">
@@ -374,7 +335,7 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
           ${
             versions.length
               ? html`<div class="deploy-version-list">
-                  ${versions.map(
+                  ${versions.slice(0, visibleVersionCount).map(
                     (version) => html`
                       <div class="deploy-version-row">
                         <div>
@@ -382,8 +343,7 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
                           >${version.version === d.appliedVersion ? html`<span class="badge ok">Live</span>` : nothing}${version.version === d.currentVersion && version.version !== d.appliedVersion ? html`<span class="badge">Latest</span>` : nothing}
                         </div>
                         <div>
-                          <span>${new Date(version.createdAt).toLocaleString()}</span
-                          >${version.commit ? html`<code ${tip(version.commit)}>${version.commit.slice(0, 10)}</code>` : nothing}
+                          <span>${new Date(version.createdAt).toLocaleString()}</span>
                         </div>
                       </div>
                     `,
@@ -391,13 +351,27 @@ function drawDeployDetail(d: DeploymentView, loading = false): void {
                 </div>`
               : html`<div class="empty compact">No version history available.</div>`
           }
+          ${
+            versions.length > visibleVersionCount
+              ? html`<button
+                  class="btn"
+                  type="button"
+                  @click=${() => {
+                    visibleVersionCount += 10;
+                    drawDeployDetail(d);
+                  }}
+                >
+                  Show older versions
+                </button>`
+              : nothing
+          }
         </section>
       </div>
       ${archiveCandidate ? archiveDialog(archiveCandidate) : nothing} ${deployToast ? undoToast(deployToast) : nothing}
     `,
     host,
   );
-  appState.mainEl.replaceChildren(host);
+  if (host.parentElement !== appState.mainEl) appState.mainEl.replaceChildren(host);
 }
 
 function returnToDeploysList(): void {
@@ -405,6 +379,7 @@ function returnToDeploysList(): void {
   deployDraft = "";
   deployNotices = withoutDeploymentDetailNotice(deployNotices);
   activeDeploy = null;
+  history.replaceState(null, "", deepLinkPath(UI_BASE, "deploys", null));
   drawDeploysPage();
 }
 
@@ -701,21 +676,6 @@ function undoToast(toast: { deployment: DeploymentView; text: string; undo?: boo
   </div>`;
 }
 
-async function openLiveEdit(d: DeploymentView, button: HTMLButtonElement): Promise<void> {
-  const tab = window.open("about:blank", "_blank");
-  try {
-    const r = await api<{ url?: string }>(`/api/deployments/${encodeURIComponent(d.id)}/owner-url`);
-    if (!r.url) throw new Error("no live URL for this app");
-    if (tab) tab.location.href = r.url;
-    else window.open(r.url, "_blank");
-  } catch (error) {
-    tab?.close();
-    deployNotices = withDeploymentDetailNotice(deployNotices, d.id, errMessage(error, "Could not open live editing."));
-    drawDeployDetail(activeDeploy ?? d);
-    button.blur();
-  }
-}
-
 async function refreshDeployments(): Promise<"updated" | "failed" | "superseded"> {
   const seq = ++deployRefreshSeq;
   try {
@@ -735,6 +695,8 @@ async function refreshDeployments(): Promise<"updated" | "failed" | "superseded"
 
 export async function renderDeploys(): Promise<void> {
   if (appState.currentView !== "deploys") return;
+  const requestedId = pendingDeployId;
+  pendingDeployId = null;
   archiveCandidate = null;
   restoreArchiveFocus = false;
   setDeployBackgroundInert(false);
@@ -754,5 +716,7 @@ export async function renderDeploys(): Promise<void> {
   drawDeploysPage();
   await refreshDeployments();
   if (seq !== appState.viewRenderSeq || appState.currentView !== "deploys") return;
-  if (deploymentListRefreshCanRedraw(activeDeploy?.id)) drawDeploysPage();
+  if (requestedId) {
+    await openDeploy(deployList.find((d) => d.id === requestedId) ?? { id: requestedId });
+  } else if (deploymentListRefreshCanRedraw(activeDeploy?.id)) drawDeploysPage();
 }

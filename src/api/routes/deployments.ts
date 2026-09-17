@@ -1,3 +1,4 @@
+import { SocksProxyAgent } from "socks-proxy-agent";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import {
@@ -9,9 +10,8 @@ import {
 } from "node:http2";
 import { spawn } from "node:child_process";
 import { basename, dirname } from "node:path";
-import { deploymentView, type App, type DeployInput } from "../app.ts";
+import { deploymentView, type App, type DeployInput, type RedeployInput } from "../app.ts";
 import { errMessage } from "../../util/errors.ts";
-import { resolveBranding } from "../../resolution/branding.ts";
 import { canonicalPayload, escapeHtml, sendJson, verifyOrReject } from "../http.ts";
 import { mintPortalIdentity, verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../auth/portal-identity.ts";
 import { audit, authorizeAdmin, isObj, orgScope } from "./shared.ts";
@@ -19,25 +19,35 @@ import { parseScopeId, scopeId, type Permission } from "../../types.ts";
 import type { ApiCtx, BaseCtx, Route } from "./route.ts";
 import { CONFIG_DEFAULTS } from "../../config.ts";
 import { resolveShareTarget as resolveShareTargetGrammar } from "../artifact-share.ts";
-import {
-  mintDeployOwnerToken,
-  verifyDeployGitAccess,
-  verifyDeployOwnerToken,
-  viewerIdentityKey,
-} from "../../deploy/access-token.ts";
+import { verifyDeployGitAccess, viewerIdentityKey } from "../../deploy/access-token.ts";
 import { APP_SHELL_PATH_PREFIX, appShellHtml } from "../../deploy/app-shell.ts";
 import { principalDestination } from "../../reach/reach.ts";
 import { portalSessionSub } from "../../deploy/viewer-session.ts";
 import { proxyHeaders } from "../../util/http-proxy.ts";
 
-function isDeployInput(b: unknown): b is DeployInput {
+function deploymentProxyAgent(port?: number): { agent?: SocksProxyAgent } {
+  if (port === undefined) return {};
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("Invalid deployment SOCKS port");
+  return { agent: new SocksProxyAgent(`socks5h://127.0.0.1:${port}`, { keepAlive: false }) };
+}
+
+const isStringRecord = (v: unknown): v is Record<string, string> =>
+  isObj(v) && !Array.isArray(v) && Object.values(v).every((x) => typeof x === "string");
+
+function isRedeployInput(b: unknown): b is RedeployInput {
   return (
     isObj(b) &&
-    typeof b.ownerScopeId === "string" &&
-    typeof b.createdBy === "string" &&
     typeof b.entrypoint === "string" &&
-    Array.isArray(b.files)
+    Array.isArray(b.files) &&
+    (b.homeFiles === undefined || Array.isArray(b.homeFiles)) &&
+    (b.env === undefined || isStringRecord(b.env)) &&
+    b.stampEnv === undefined &&
+    (b.alwaysOn === undefined || typeof b.alwaysOn === "boolean")
   );
+}
+
+function isDeployInput(b: unknown): b is DeployInput {
+  return isObj(b) && typeof b.ownerScopeId === "string" && typeof b.createdBy === "string" && isRedeployInput(b);
 }
 
 async function proxyDeployment(ctx: BaseCtx): Promise<void> {
@@ -143,6 +153,7 @@ async function proxyAdminDeployment(ctx: BaseCtx): Promise<void> {
 }
 
 const GATEWAY_AUTH_HEADERS = [
+  "x-qm-app-host",
   "x-signature",
   "x-timestamp",
   "x-as-principal",
@@ -538,15 +549,25 @@ async function proxyReach(
     return;
   }
   const htmlNav = wantsWarmingPage(req, method);
-  const up = requestFn({ hostname: host, port, path: subPath + url.search, method, headers }, (upRes) => {
-    up.setTimeout(0);
-    markUpstreamUp(upstreamKey);
-    upRes.on("error", () => res.destroy());
-    armThrottleShield(upstreamKey, upRes.statusCode ?? 0, upRes);
-    const headers = gatewaySafeResponseHeaders(upRes.headers, opts?.sandbox ?? false);
-    res.writeHead(upRes.statusCode ?? 502, headers);
-    upRes.pipe(res);
-  });
+  const up = requestFn(
+    {
+      hostname: host,
+      port,
+      path: subPath + url.search,
+      method,
+      headers,
+      ...deploymentProxyAgent(reach.endpoint.socksProxyPort),
+    },
+    (upRes) => {
+      up.setTimeout(0);
+      markUpstreamUp(upstreamKey);
+      upRes.on("error", () => res.destroy());
+      armThrottleShield(upstreamKey, upRes.statusCode ?? 0, upRes);
+      const headers = gatewaySafeResponseHeaders(upRes.headers, opts?.sandbox ?? false);
+      res.writeHead(upRes.statusCode ?? 502, headers);
+      upRes.pipe(res);
+    },
+  );
   const dialMs = warmingDialTimeoutMs(
     upstreamKey,
     htmlNav,
@@ -623,7 +644,14 @@ function deploymentFetchHttp1(
     const { host, port, tls, proxyHeaders } = endpoint.endpoint;
     const requestFn = tls ? httpsRequest : httpRequest;
     const request = requestFn(
-      { hostname: host, port, path, method: "GET", headers: { ...proxyHeaders, "accept-encoding": "identity" } },
+      {
+        hostname: host,
+        port,
+        path,
+        method: "GET",
+        headers: { ...proxyHeaders, "accept-encoding": "identity" },
+        ...deploymentProxyAgent(endpoint.endpoint.socksProxyPort),
+      },
       async (response) => {
         clearTimeout(timeout);
         try {
@@ -736,32 +764,41 @@ async function fetchDeploymentResponse(
   }
 }
 
-function cookieValue(header: string | undefined, name: string): string {
-  for (const part of (header ?? "").split(";")) {
-    const p = part.trim();
-    if (p.startsWith(`${name}=`)) return p.slice(name.length + 1);
-  }
-  return "";
-}
-
 export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
   const { req, res, app, deps, url, pathname } = ctx;
   const appsDomain = deps.deployAppsDomain;
   const gateSecret = deps.deployGateSecret;
-  if (!appsDomain || !gateSecret) return false;
+  const fromAppHost = req.headers["x-qm-app-host"] === "1";
+  if (!appsDomain || !gateSecret) {
+    if (!fromAppHost) return false;
+    sendJson(res, 503, { error: "unavailable", message: "app gateway is not configured" });
+    return true;
+  }
   const rawHost = (req.headers.host ?? "").split(":")[0]!.toLowerCase();
   const suffix = `.${appsDomain.toLowerCase()}`;
-  if (!rawHost || !rawHost.endsWith(suffix)) return false;
-  const slug = rawHost.slice(0, -suffix.length);
-  if (!slug || slug.includes(".")) {
+  if (!rawHost || !rawHost.endsWith(suffix)) {
+    if (!fromAppHost) return false;
     sendJson(res, 404, { error: "not_found" });
     return true;
+  }
+  const slug = rawHost.slice(0, -suffix.length);
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug)) {
+    sendJson(res, 404, { error: "not_found" });
+    return true;
+  }
+  if (!["GET", "HEAD", "OPTIONS"].includes(ctx.method)) {
+    const origin = req.headers.origin;
+    const site = req.headers["sec-fetch-site"];
+    if ((origin !== undefined && origin !== `https://${rawHost}`) || (site !== undefined && site !== "same-origin")) {
+      sendJson(res, 403, { error: "forbidden", message: "cross-origin app request refused" });
+      return true;
+    }
   }
   const safePathname =
     pathname.startsWith("/") && !pathname.startsWith("//") && !/[\\\x00-\x1f]/.test(pathname) ? pathname : "/";
   const staleAccess = url.searchParams.has("access");
   url.searchParams.delete("access");
-  const fromOwnerQuery = url.searchParams.get("owner") ?? "";
+  const staleOwner = url.searchParams.has("owner");
   url.searchParams.delete("owner");
   const signInAttempted = url.searchParams.get("dpl_signin") === "1";
   url.searchParams.delete("dpl_signin");
@@ -770,70 +807,8 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     res.writeHead(302, { location: safePathname + (qs ? `?${qs}` : ""), "cache-control": "no-store" });
     res.end();
   };
-  let ownerCookie: string | null = null;
-  if (fromOwnerQuery) {
-    const session = await verifyDeployOwnerToken(gateSecret, fromOwnerQuery, slug);
-    if (session && (await app.canManageDeployment(slug, session.sub))) {
-      const maxAge = Math.max(1, Math.floor((session.exp - Date.now()) / 1000));
-      ownerCookie = `dpl_owner=${fromOwnerQuery}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
-    }
-  }
-  if (ownerCookie) {
-    const qs = url.searchParams.toString();
-    res.writeHead(302, {
-      "set-cookie": [ownerCookie],
-      location: safePathname + (qs ? `?${qs}` : ""),
-    });
-    res.end();
-    return true;
-  }
-  if (staleAccess && ctx.method === "GET" && !cookieValue(req.headers.cookie, "dpl_owner")) {
+  if ((staleAccess || staleOwner) && ctx.method === "GET") {
     cleanUrlRedirect();
-    return true;
-  }
-  let ownerSub: string | null = null;
-  const ownerCookieValue = cookieValue(req.headers.cookie, "dpl_owner");
-  if (ownerCookieValue) {
-    const session = await verifyDeployOwnerToken(gateSecret, ownerCookieValue, slug);
-    if (session && (await app.canManageDeployment(slug, session.sub))) ownerSub = session.sub;
-  }
-  if (ownerSub && ctx.method === "GET" && pathname.startsWith(APP_SHELL_PATH_PREFIX)) {
-    if (pathname === "/__claw__/version") {
-      const d = await app.getDeployment(slug);
-      if (!d) sendJson(res, 404, { error: "not_found" });
-      else sendJson(res, 200, { version: d.appliedVersion ?? d.currentVersion });
-      return true;
-    }
-    sendJson(res, 404, { error: "not_found" });
-    return true;
-  }
-  if (ownerSub) {
-    if (signInAttempted && ctx.method === "GET") {
-      cleanUrlRedirect();
-      return true;
-    }
-    // A top-level document load gets the owner shell: a slim top bar over the app
-    // (framed same-origin) with a slide-out chat column for iterating on it. The
-    // frame's own load carries sec-fetch-dest: iframe, so it proxies straight through.
-    const isTopDocument = String(req.headers["sec-fetch-dest"] ?? "") === "document";
-    if (ctx.method === "GET" && isTopDocument && deps.deployAppsLoginUrl) {
-      const accent = (await resolveBranding(deps.config, orgScope(deps), deps.brandingDefault)).accent;
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-      res.end(
-        appShellHtml({
-          slug,
-          portalUrl: deps.deployAppsLoginUrl,
-          path: safePathname + url.search,
-          ...(accent ? { accent } : {}),
-        }),
-      );
-      return true;
-    }
-    const reach = await app.reachDeployment(slug, "", { bypassAcl: true });
-    const sub = deps.deployAppsSessionSecret
-      ? portalSessionSub(req.headers.cookie, deps.deployAppsSessionSecret)
-      : null;
-    await proxyReach(ctx, reach, pathname, sub ?? undefined);
     return true;
   }
   const sessionSecret = deps.deployAppsSessionSecret;
@@ -847,7 +822,7 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
   if (!sub) {
     const qs = url.searchParams.toString();
     const returnTo = `https://${rawHost}${safePathname}?${qs ? `${qs}&` : ""}dpl_signin=1`;
-    const signIn = `${loginUrl}/auth/login?returnTo=${encodeURIComponent(returnTo)}`;
+    const signIn = `${loginUrl}${deps.deployAppsLoginPath ?? "/auth/login"}?returnTo=${encodeURIComponent(returnTo)}`;
     if (!wantsHtml) {
       sendJson(res, 401, { error: "unauthorized", message: "sign-in required", loginUrl: signIn });
     } else if (signInAttempted) {
@@ -863,7 +838,35 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     }
     return true;
   }
-  const reach = await app.reachDeployment(slug, sub);
+  const bareApp = url.searchParams.get("__qm_no_shell") === "1";
+  url.searchParams.delete("__qm_no_shell");
+  const isTopDocument = String(req.headers["sec-fetch-dest"] ?? "") === "document";
+  const isShellRequest = pathname.startsWith(APP_SHELL_PATH_PREFIX);
+  const canManage = await app.canManageDeployment(slug, sub);
+  if (ctx.method === "GET" && ((!bareApp && isTopDocument) || isShellRequest) && canManage) {
+    if (signInAttempted) {
+      cleanUrlRedirect();
+      return true;
+    }
+    const deployment = await app.getDeployment(slug);
+    if (isShellRequest) {
+      if (pathname === "/__claw__/version" && deployment)
+        sendJson(res, 200, { version: deployment.appliedVersion ?? deployment.currentVersion });
+      else sendJson(res, 404, { error: "not_found" });
+      return true;
+    }
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+    res.end(
+      appShellHtml({
+        slug,
+        name: deployment?.displayName ?? slug,
+        portalUrl: loginUrl,
+        path: safePathname + url.search,
+      }),
+    );
+    return true;
+  }
+  const reach = await app.reachDeployment(slug, sub, canManage ? { bypassAcl: true } : undefined);
   if (reach.status === "denied") {
     const owner = (await app.getDeployment(slug).catch(() => null))?.ownerScopeId;
     const ev = {
@@ -1192,36 +1195,13 @@ async function deploymentGitUrl(ctx: ApiCtx): Promise<void> {
   return sendJson(res, 200, result);
 }
 
-const OWNER_LINK_TTL_MS = 5 * 60 * 1000;
-
-async function deploymentOwnerUrl(ctx: ApiCtx): Promise<void> {
-  const { res, app, params, deps } = ctx;
-  const sub = ctx.capability?.actorId ?? ctx.actor?.p ?? ctx.url.searchParams.get("principalId");
-  if (!sub) return sendJson(res, 403, { error: "forbidden", message: "an identified caller is required" });
-  const gateSecret = deps.deployGateSecret;
-  const appsDomain = deps.deployAppsDomain;
-  const deployment = await app.getDeployment(params.id!);
-  if (!deployment) return sendJson(res, 404, { error: "not_found" });
-  const slug = deployment.name ?? deployment.id;
-  if (!gateSecret || !appsDomain)
-    return sendJson(res, 503, {
-      error: "unavailable",
-      message: `app subdomains are not configured — this app is reachable signed-in at /d/${slug}/; set DEPLOY_APPS_DOMAIN (with AWS_DEPLOY_GATE_SECRET) to enable per-app subdomains and live editing`,
-    });
-  if (!(await app.canManageDeployment(deployment.id, sub, ctx.capability?.scopeId)))
-    return sendJson(res, 403, { error: "forbidden", message: "only someone who manages this app can edit it live" });
-  const exp = Date.now() + OWNER_LINK_TTL_MS;
-  const token = await mintDeployOwnerToken(gateSecret, { slug, sub, exp });
-  return sendJson(res, 200, { url: `https://${slug}.${appsDomain}/?owner=${token}`, expiresAt: exp });
-}
-
 async function createDeployment(ctx: ApiCtx): Promise<void> {
   const { res, app, body } = ctx;
   if (!isDeployInput(body)) return sendJson(res, 400, { error: "bad_request", message: "expected a DeployInput" });
   const principalId = ctx.capability?.actorId ?? ctx.actor?.p;
   if (principalId && body.createdBy !== principalId) return sendJson(res, 403, { error: "forbidden" });
   try {
-    return sendJson(res, 200, { deployment: await app.deploy(body) });
+    return sendJson(res, 200, { deployment: deploymentView(await app.deploy(body)) });
   } catch (e) {
     return sendJson(res, 400, { error: "deploy_failed", message: errMessage(e) });
   }
@@ -1350,12 +1330,15 @@ async function redeployDeployment(ctx: ApiCtx): Promise<void> {
   const id = await deploymentId(app, params.id!);
   if (!id) return sendJson(res, 404, { error: "not_found" });
   if (!(await callerMayManageDeployment(ctx, id))) return sendJson(res, 403, { error: "forbidden" });
-  const b = body as { entrypoint?: unknown; files?: unknown };
-  if (typeof b.entrypoint !== "string" || !Array.isArray(b.files)) {
-    return sendJson(res, 400, { error: "bad_request", message: "entrypoint (string) and files (array) required" });
+  if (!isRedeployInput(body)) {
+    return sendJson(res, 400, {
+      error: "bad_request",
+      message:
+        "entrypoint (string) and files (array) required; env must be a string map, homeFiles an array, alwaysOn a boolean",
+    });
   }
   try {
-    return sendJson(res, 200, { deployment: await app.redeploy(id, { entrypoint: b.entrypoint, files: b.files }) });
+    return sendJson(res, 200, { deployment: deploymentView(await app.redeploy(id, body)) });
   } catch (e) {
     return sendJson(res, 400, { error: "deploy_failed", message: errMessage(e) });
   }
@@ -1460,6 +1443,16 @@ export function resolveShareTarget(app: App, input: { scope?: string; recipient?
   });
 }
 
+export async function getDeploymentShares(ctx: ApiCtx): Promise<void> {
+  const { res, app, params, capability } = ctx;
+  if (!capability) return sendJson(res, 403, { error: "forbidden" });
+  const deployment = await app.getDeployment(params.id!);
+  if (!deployment) return sendJson(res, 404, { error: "not_found" });
+  if (deployment.ownerScopeId !== `personal:${capability.actorId}`)
+    return sendJson(res, 403, { error: "forbidden", message: "Only the owner can edit app permissions." });
+  return sendJson(res, 200, { grantees: await app.deploymentGrantees(deployment.id) });
+}
+
 export async function shareDeployment(ctx: ApiCtx): Promise<void> {
   const { res, app, params, body, capability } = ctx;
   if (!capability)
@@ -1533,7 +1526,7 @@ export const deploymentRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/deployments/:id/fetch", auth: "either", handle: fetchDeployment },
   { method: "GET", path: "/v1/deployments/:id/logs", auth: "either", handle: deploymentLogs },
   { method: "GET", path: "/v1/deployments/:id/git-url", auth: "either", handle: deploymentGitUrl },
-  { method: "GET", path: "/v1/deployments/:id/owner-url", auth: "source", handle: deploymentOwnerUrl },
+  { method: "GET", path: "/v1/deployments/:id/share", auth: "either", handle: getDeploymentShares },
   { method: "POST", path: "/v1/deployments/:id/share", auth: "either", handle: shareDeployment },
   { method: "POST", path: "/v1/deployments/:id/rollback", auth: "source", handle: rollbackDeployment },
   { method: "POST", path: "/v1/deployments/:id/redeploy", auth: "source", handle: redeployDeployment },
