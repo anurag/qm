@@ -135,8 +135,15 @@ replacement.
 current operator environment values and does not reverse database migrations.
 The prior commit is restored with the previous core build. Verify
 compatibility before a rollback that follows a configuration or schema change.
-`qm rollback` takes no `--to`; it targets the release before the current one,
-or the last successful release after an interrupted `qm up`.
+Without `--to`, it targets the release before the current one, or the last
+successful release after an interrupted `qm up`. The CLI retains the last ten
+releases in `render.resources.json`; `qm status` lists them with their labels
+and commits. `qm rollback --to <target>` selects a retained release by its
+label, by a commit prefix, or by one of its Render deploy IDs, and restores the
+recorded builds after it confirms that each build still exists and carries that
+commit. A full 40-character commit that no retained release recorded is built
+again from the repository instead. An interrupted rollback continues toward the
+same target on the next `qm rollback`.
 
 ## Data and credentials
 

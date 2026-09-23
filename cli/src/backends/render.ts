@@ -116,12 +116,66 @@ interface State {
   pendingPurge?: boolean;
   pendingCreate?: string;
   releases?: Release[];
+  releaseCount?: number;
   updateInProgress?: boolean;
-  rollbackProgress?: Release & { interruptedUpdate: boolean; restored: Record<string, string> };
+  rollbackProgress?: RollbackProgress;
 }
 interface Release {
-  services: Record<string, string>;
+  label: string;
   commit: string;
+  createdAt: string;
+  services: Record<string, string>;
+}
+interface RollbackProgress {
+  mode: "restore" | "rebuild";
+  label?: string;
+  commit: string;
+  services: Record<string, string>;
+  interruptedUpdate: boolean;
+  restored: Record<string, string>;
+}
+const RETAINED_RELEASES = 10;
+function recordRelease(state: State, commit: string, services: Record<string, string>): Release {
+  state.releaseCount = (state.releaseCount ?? 0) + 1;
+  const release: Release = { label: `r${state.releaseCount}`, commit, createdAt: new Date().toISOString(), services };
+  state.releases = [release, ...(state.releases ?? [])].slice(0, RETAINED_RELEASES);
+  return release;
+}
+function describeRelease(release: Release): string {
+  return `${release.label} (${release.commit.slice(0, 7)}, ${release.createdAt})`;
+}
+type RollbackTarget = { mode: "restore"; release: Release } | { mode: "rebuild"; commit: string };
+function resolveRollbackTarget(state: State, to: string | undefined): RollbackTarget {
+  const releases = state.releases ?? [];
+  const retained = releases.length
+    ? `Retained releases: ${releases.map(describeRelease).join(", ")}`
+    : "No release is retained";
+  if (to === undefined) {
+    const release = releases[state.updateInProgress === true ? 0 : 1];
+    if (!release || !Object.keys(release.services).length)
+      throw new CliError(`No previous Render release is recorded for rollback. ${retained}`);
+    return { mode: "restore", release };
+  }
+  const value = to.trim();
+  const byLabel = releases.find((release) => release.label === value);
+  if (byLabel) return { mode: "restore", release: byLabel };
+  if (/^dep-[a-z0-9]+$/.test(value)) {
+    const byDeploy = releases.find((release) => Object.values(release.services).includes(value));
+    if (byDeploy) return { mode: "restore", release: byDeploy };
+    throw new CliError(`No retained Render release contains deploy ${value}. ${retained}`);
+  }
+  if (/^[0-9a-f]{7,40}$/i.test(value)) {
+    const commit = value.toLowerCase();
+    const matches = releases.filter((release) => release.commit.startsWith(commit));
+    if (matches.length === 1) return { mode: "restore", release: matches[0]! };
+    if (matches.length > 1)
+      throw new CliError(`Commit ${value} matches several retained releases; use a release label. ${retained}`);
+    if (commit.length === 40) return { mode: "rebuild", commit };
+    throw new CliError(
+      `No retained Render release was built from ${value}; give the full 40-character commit to build it. ${retained}`,
+    );
+  }
+  throw new CliError(`Rollback target ${JSON.stringify(to)} is not a release label, commit, or deploy ID. ${retained}`);
 }
 type Workload = RenderBuild & {
   name: string;
@@ -1058,7 +1112,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           if (!current || current.status !== "live") throw new CliError(`${workload.name} has no live deployment`);
           release[workload.name] = current.id;
         }
-        state.releases = [{ services: release, commit }, ...(state.releases ?? []).slice(0, 1)];
+        recordRelease(state, commit, release);
         delete state.updateInProgress;
         saveState(ctx, state);
         const retained = Object.keys(state.services).filter((name) => !desired.some((item) => item.name === name));
@@ -1084,6 +1138,8 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           `${name}: ${service.suspended}, ${recent?.status ?? "no deploy"} (${service.id})${service.serviceDetails.url ? ` ${service.serviceDetails.url}` : ""}`,
         );
       }
+      for (const [index, release] of (state.releases ?? []).entries())
+        note(`release ${describeRelease(release)}${index === 0 ? " latest" : ""}`);
     },
     logs: async (service, opts) => {
       const request = api(ctx);
@@ -1212,43 +1268,92 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       }),
     rollback: async (to) =>
       locked(ctx, async () => {
-        if (to) throw new CliError("Render rollback uses the last successful deployment; omit --to");
         const request = api(ctx);
         const state = readState(ctx);
         if (!state.rollbackProgress) {
           const interruptedUpdate = state.updateInProgress === true;
-          const release = state.releases?.[interruptedUpdate ? 0 : 1];
-          if (!release || !Object.keys(release.services).length)
-            throw new CliError("No successful Render deployment is recorded for rollback");
-          state.rollbackProgress = { ...release, interruptedUpdate, restored: {} };
+          const target = resolveRollbackTarget(state, to);
+          state.rollbackProgress =
+            target.mode === "restore"
+              ? {
+                  mode: "restore",
+                  label: target.release.label,
+                  commit: target.release.commit,
+                  services: target.release.services,
+                  interruptedUpdate,
+                  restored: {},
+                }
+              : { mode: "rebuild", commit: target.commit, services: {}, interruptedUpdate, restored: {} };
+        } else if (to !== undefined) {
+          const resumed = state.rollbackProgress;
+          const target = resolveRollbackTarget(state, to);
+          const same =
+            target.mode === "restore"
+              ? resumed.mode === "restore" && resumed.label === target.release.label
+              : resumed.mode === "rebuild" && resumed.commit === target.commit;
+          if (!same)
+            throw new CliError(
+              `Render rollback to ${resumed.label ?? resumed.commit} is incomplete; run qm rollback without --to to finish it`,
+            );
         }
-        const target = state.rollbackProgress;
+        const progress = state.rollbackProgress;
         const bound = await inventory(ctx, request, state);
-        for (const [name, deployId] of Object.entries(target.services)) {
+        if (!bound.services.has("core")) throw new CliError("The core service is missing");
+        const targets =
+          progress.mode === "restore"
+            ? Object.keys(progress.services)
+            : workloads(ctx)
+                .filter((workload) => !workload.diskSizeGB)
+                .map((workload) => workload.name);
+        for (const name of targets) {
           const service = bound.services.get(name);
           if (!service || service.serviceDetails.disk)
             throw new CliError(`The rollback service ${name} is missing or has a disk`);
-          await request(`/services/${service.id}/deploys/${deployId}`);
+          if (progress.mode !== "restore" || progress.restored[name]) continue;
+          const deployId = progress.services[name]!;
+          let deploy: RenderDeploy;
+          try {
+            deploy = await request<RenderDeploy>(`/services/${service.id}/deploys/${deployId}`);
+          } catch (error) {
+            if (error instanceof RenderApiError && error.status === 404)
+              throw new CliError(
+                `The ${name} build ${deployId} of release ${progress.label} no longer exists on Render; choose another release or give the full commit to build it`,
+              );
+            throw error;
+          }
+          if (deploy.commit?.id !== progress.commit)
+            throw new CliError(
+              `The ${name} build ${deployId} was made from commit ${deploy.commit?.id ?? "unknown"}, not ${progress.commit}`,
+            );
         }
-        if (!bound.services.has("core")) throw new CliError("The core service is missing");
         saveState(ctx, state);
         const core = bound.services.get("core")!;
         for (const key of ["RENDER_DEPLOY_COMMIT", "GIT_SHA"])
-          await request(`/services/${core.id}/env-vars/${key}`, "PUT", { value: target.commit });
-        for (const [name, deployId] of Object.entries(target.services)) {
-          if (target.restored[name]) continue;
+          await request(`/services/${core.id}/env-vars/${key}`, "PUT", { value: progress.commit });
+        for (const name of targets) {
+          if (progress.restored[name]) continue;
           const service = bound.services.get(name)!;
-          const deploy = await request<RenderDeploy>(`/services/${service.id}/rollback`, "POST", { deployId });
-          await waitDeploy(request, service, deploy.id, undefined, target.commit);
-          target.restored[name] = deploy.id;
+          if (progress.mode === "restore") {
+            const deployed = await request<RenderDeploy>(`/services/${service.id}/rollback`, "POST", {
+              deployId: progress.services[name],
+            });
+            await waitDeploy(request, service, deployed.id, undefined, progress.commit);
+            progress.restored[name] = deployed.id;
+          } else {
+            await deploy(request, service, progress.commit);
+            const current = await latestDeploy(request, service);
+            if (!current || current.status !== "live") throw new CliError(`${name} has no live deployment`);
+            progress.restored[name] = current.id;
+          }
           saveState(ctx, state);
         }
-        const previous = state.releases?.[target.interruptedUpdate ? 1 : 0];
-        state.releases = [{ services: target.restored, commit: target.commit }, ...(previous ? [previous] : [])];
+        const release = recordRelease(state, progress.commit, progress.restored);
         delete state.updateInProgress;
         delete state.rollbackProgress;
         saveState(ctx, state);
-        note("Previous Render builds restored. Postgres and object data are retained; migrations are not reversed");
+        note(
+          `${progress.mode === "restore" ? `Release ${progress.label} restored` : `Commit ${progress.commit.slice(0, 7)} built and deployed`} as ${release.label}. Postgres and object data are retained; migrations are not reversed`,
+        );
       }),
     doctor: async () => {
       const values = credentialValues(ctx);

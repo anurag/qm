@@ -29,7 +29,10 @@ function deployment(t: TestContext, portal = false) {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const bin = join(dir, "bin");
   mkdirSync(bin);
-  writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"a".repeat(40)}' "$4"\n`);
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\ncommit=$(cat '${join(dir, "commit")}' 2>/dev/null || printf '%s' '${"a".repeat(40)}')\nprintf '%s\t%s\n' "$commit" "$4"\n`,
+  );
   chmodSync(join(bin, "git"), 0o755);
   const originalPath = process.env.PATH;
   process.env.PATH = `${bin}:${originalPath}`;
@@ -60,6 +63,7 @@ function deployment(t: TestContext, portal = false) {
     ctx,
     backend: hostingProvider("render").createBackend(ctx),
     saved: () => JSON.parse(readFileSync(join(dir, "render.resources.json"), "utf8")),
+    setCommit: (commit: string) => writeFileSync(join(dir, "commit"), commit),
   };
 }
 type Deployment = ReturnType<typeof deployment>;
@@ -117,6 +121,7 @@ function cloud(t: TestContext, d: Deployment) {
     services: new Map<string, Service>(),
     envs: new Map<string, Record<string, string>>(),
     deploys: new Map<string, { id: string; status: string; commit?: { id: string } }>(),
+    deploysById: new Map<string, { id: string; status: string; commit?: { id: string } }>(),
     projects: new Map<string, Project>(),
     database: undefined as Database | undefined,
     intercept: undefined as ((call: Call) => Response | undefined | Promise<Response | undefined>) | undefined,
@@ -242,6 +247,7 @@ function cloud(t: TestContext, d: Deployment) {
       );
       const deploy = { id: `dep-${++state.next}`, status: state.automaticDeployStatus, commit: { id: "b".repeat(40) } };
       state.deploys.set(id, deploy);
+      state.deploysById.set(deploy.id, deploy);
       return Response.json({ service, deployId: deploy.id });
     }
     const id = path.split("/")[2]!;
@@ -293,21 +299,28 @@ function cloud(t: TestContext, d: Deployment) {
         return empty();
       }
       if (path === `/services/${id}/rollback`) {
-        const deploy = { id: `dep-${++state.next}`, status: "live", commit: { id: "a".repeat(40) } };
+        const source = state.deploysById.get(body.deployId);
+        if (!source) return missing();
+        const deploy = { id: `dep-${++state.next}`, status: "live", commit: source.commit };
         state.deploys.set(id, deploy);
+        state.deploysById.set(deploy.id, deploy);
         return Response.json(deploy);
       }
       if (path === `/services/${id}/deploys`) {
         if (method === "GET") return Response.json([{ deploy: state.deploys.get(id) }]);
         const deploy = { id: `dep-${++state.next}`, status: state.nextDeployStatus, commit: { id: body.commitId } };
         state.deploys.set(id, deploy);
+        state.deploysById.set(deploy.id, deploy);
         return Response.json(deploy);
       }
       if (path.endsWith("/cancel") && path.includes("/deploys/")) {
         state.deploys.get(id)!.status = "canceled";
         return empty();
       }
-      if (path.startsWith(`/services/${id}/deploys/`)) return Response.json(state.deploys.get(id));
+      if (path.startsWith(`/services/${id}/deploys/`)) {
+        const deploy = state.deploysById.get(path.split("/").at(-1)!);
+        return deploy ? Response.json(deploy) : missing();
+      }
       if (path === `/services/${id}/jobs` && method === "POST")
         return Response.json({ id: "job-acmecanary", serviceId: id, status: "pending" }, { status: 201 });
       if (path === `/services/${id}/jobs/job-acmecanary`)
@@ -316,12 +329,15 @@ function cloud(t: TestContext, d: Deployment) {
         return Response.json({ id: "job-acmecanary", serviceId: id, status: "canceled" });
       if (path.endsWith("/suspend") || path.endsWith("/resume")) {
         service.suspended = path.endsWith("/suspend") ? "suspended" : "not_suspended";
-        if (service.suspended === "not_suspended")
-          state.deploys.set(id, {
+        if (service.suspended === "not_suspended") {
+          const deploy = {
             id: `dep-${++state.next}`,
             status: state.automaticDeployStatus,
             commit: { id: "b".repeat(40) },
-          });
+          };
+          state.deploys.set(id, deploy);
+          state.deploysById.set(deploy.id, deploy);
+        }
         return empty();
       }
     }
@@ -1381,6 +1397,7 @@ test("Render rejects a live service built from a different source commit", async
     if (path !== "/services/srv-acme-core/deploys" || method !== "POST") return undefined;
     const deploy = { id: "dep-wrong", status: "live", commit: { id: "b".repeat(40) } };
     c.deploys.set("srv-acme-core", deploy);
+    c.deploysById.set(deploy.id, deploy);
     return Response.json(deploy);
   };
   await assert.rejects(d.backend.up({ dryRun: false }), /deployed commit b+.*expected a+/);
@@ -1620,4 +1637,157 @@ test("Render records a service after its creation reply is lost and ignores same
   assert.equal(d.saved().pendingCreate, undefined);
   assert.deepEqual(d.saved().services.core, { id: "srv-acme-core", name: "acme-core", type: "web_service" });
   assert.equal(c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/services").length, 0);
+});
+
+test("Render rollback --to restores a retained release by label, commit prefix, or deploy ID", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.setCommit("c".repeat(40));
+  await d.backend.up({ dryRun: false });
+  d.setCommit("d".repeat(40));
+  await d.backend.up({ dryRun: false });
+  const [third, second, first] = d.saved().releases as Array<{
+    label: string;
+    commit: string;
+    services: Record<string, string>;
+  }>;
+  assert.deepEqual(
+    [first!, second!, third!].map((release) => [release.label, release.commit[0]]),
+    [
+      ["r1", "a"],
+      ["r2", "c"],
+      ["r3", "d"],
+    ],
+  );
+  const restores = (mark: number) =>
+    writes(c.calls.slice(mark))
+      .filter((call) => call.path.endsWith("/rollback"))
+      .map((call) => [call.path, (call.body as { deployId: string }).deployId]);
+  let mark = c.calls.length;
+  await d.backend.rollback("r1");
+  assert.deepEqual(restores(mark), [
+    ["/services/srv-acme-core/rollback", first!.services.core],
+    ["/services/srv-acme-web-ui/rollback", first!.services["web-ui"]],
+  ]);
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "a".repeat(40));
+  assert.equal(d.saved().releases[0].label, "r4");
+  assert.equal(d.saved().releases[0].commit, "a".repeat(40));
+  mark = c.calls.length;
+  await d.backend.rollback("c".repeat(7));
+  assert.deepEqual(restores(mark)[0], ["/services/srv-acme-core/rollback", second!.services.core]);
+  assert.equal(d.saved().releases[0].label, "r5");
+  mark = c.calls.length;
+  await d.backend.rollback(third!.services["web-ui"]!);
+  assert.deepEqual(restores(mark)[0], ["/services/srv-acme-core/rollback", third!.services.core]);
+  assert.equal(c.envs.get("srv-acme-core")!.GIT_SHA, "d".repeat(40));
+  assert.equal(d.saved().releases.length, 6);
+});
+
+test("Render rollback --to rejects unknown, ambiguous, and short targets and lists the releases", async (t) => {
+  const d = deployment(t);
+  cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  await d.backend.up({ dryRun: false });
+  await assert.rejects(
+    async () => d.backend.rollback("r9"),
+    /not a release label, commit, or deploy ID\. Retained releases: r2 \(aaaaaaa, .*\), r1/,
+  );
+  await assert.rejects(
+    async () => d.backend.rollback("dep-nope"),
+    /No retained Render release contains deploy dep-nope/,
+  );
+  await assert.rejects(
+    async () => d.backend.rollback("a".repeat(7)),
+    /matches several retained releases; use a release label/,
+  );
+  await assert.rejects(async () => d.backend.rollback("f".repeat(7)), /give the full 40-character commit to build it/);
+  assert.equal(d.saved().rollbackProgress, undefined);
+});
+
+test("Render rollback --to builds a full commit that no retained release recorded", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const mark = c.calls.length;
+  await d.backend.rollback("f".repeat(40));
+  const written = writes(c.calls.slice(mark));
+  assert.equal(
+    written.some((call) => call.path.endsWith("/rollback")),
+    false,
+  );
+  assert.deepEqual(
+    written.filter((call) => call.path.endsWith("/deploys")).map((call) => [call.path, call.body]),
+    ["core", "web-ui"].map((name) => [
+      `/services/srv-acme-${name}/deploys`,
+      { clearCache: "do_not_clear", commitId: "f".repeat(40) },
+    ]),
+  );
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "f".repeat(40));
+  const [latest, previous] = d.saved().releases;
+  assert.equal(latest.label, "r2");
+  assert.equal(latest.commit, "f".repeat(40));
+  assert.deepEqual(Object.keys(latest.services).sort(), ["core", "web-ui"]);
+  assert.equal(previous.label, "r1");
+});
+
+test("Render rollback refuses a release whose build is gone or was made from another commit", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.setCommit("c".repeat(40));
+  await d.backend.up({ dryRun: false });
+  const first = d.saved().releases[1];
+  c.deploysById.delete(first.services["web-ui"]);
+  const mark = c.calls.length;
+  await assert.rejects(
+    async () => d.backend.rollback("r1"),
+    /web-ui build dep-\d+ of release r1 no longer exists on Render/,
+  );
+  assert.equal(
+    writes(c.calls.slice(mark)).some((call) => call.path.endsWith("/rollback") || call.path.includes("/env-vars/")),
+    false,
+  );
+  assert.equal(d.saved().rollbackProgress, undefined);
+  c.deploysById.set(first.services["web-ui"], {
+    id: first.services["web-ui"],
+    status: "live",
+    commit: { id: "e".repeat(40) },
+  });
+  await assert.rejects(async () => d.backend.rollback("r1"), /web-ui build dep-\d+ was made from commit e+, not a+/);
+});
+
+test("Render rollback retains ten releases, lists them in status, and resumes only toward the same target", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  for (let index = 0; index < 12; index++) {
+    d.setCommit(index.toString(16).repeat(40).slice(0, 40));
+    await d.backend.up({ dryRun: false });
+  }
+  const labels = d.saved().releases.map((release: { label: string }) => release.label);
+  assert.deepEqual(labels, ["r12", "r11", "r10", "r9", "r8", "r7", "r6", "r5", "r4", "r3"]);
+  const lines: string[] = [];
+  const log = t.mock.method(console, "log", (message: string) => void lines.push(String(message)));
+  await d.backend.status();
+  log.mock.restore();
+  assert.ok(
+    lines.some((line) => /^release r12 \(bbbbbbb, .*\) latest$/.test(line)),
+    lines.join("\n"),
+  );
+  assert.equal(lines.filter((line) => line.startsWith("release r")).length, 10);
+  c.intercept = ({ path, method }) =>
+    path === "/services/srv-acme-web-ui/rollback" && method === "POST"
+      ? new Response(null, { status: 500 })
+      : undefined;
+  await assert.rejects(async () => d.backend.rollback("r5"), /HTTP 500/);
+  assert.equal(d.saved().rollbackProgress.label, "r5");
+  c.intercept = undefined;
+  await assert.rejects(
+    async () => d.backend.rollback("r4"),
+    /rollback to r5 is incomplete; run qm rollback without --to/,
+  );
+  await d.backend.rollback("r5");
+  assert.equal(d.saved().rollbackProgress, undefined);
+  assert.equal(d.saved().releases[0].label, "r13");
+  assert.equal(d.saved().releases[0].commit, "4".repeat(40));
 });
