@@ -10,7 +10,12 @@ interface ScaffoldFile {
 }
 
 export interface ProviderScaffold {
-  renderConfig(orgId: string, modelProvider: ModelProvider, emailTransport: EmailTransport): string;
+  renderConfig(
+    orgId: string,
+    modelProvider: ModelProvider,
+    emailTransport: EmailTransport,
+    source?: { repo: string; branch: string },
+  ): string;
   ignores: readonly string[];
   agentsAppendix: string;
   files(config: QmConfig): ScaffoldFile[];
@@ -48,8 +53,9 @@ function renderConfig(orgId: string, values: ConfigValues): string {
   // "botName": "straylight",
   // "orgName": "Acme Corp",
 
-  // Where to deploy: "docker" runs local containers, "fly" deploys Fly apps,
-  // and "aws" runs the control plane on ECS and agent computers on Lambda MicroVMs.
+  // Where to deploy: "docker" runs local containers, "fly" deploys Fly apps, "aws" runs
+  // the control plane on ECS and agent computers on Lambda MicroVMs, and "render" builds
+  // Render services from Git with native Render Sandboxes as agent computers.
   "target": ${JSON.stringify(values.target)},
 
   // The vendor supplying the base model: "anthropic", "openai", or "openrouter"
@@ -283,4 +289,98 @@ export const awsScaffold: ProviderScaffold = {
   configurationHint: "aws: finish the account, region, public edge, GitHub OIDC, and identity gate fields before setup",
   finalCommand: "terraform -chdir=infra init && terraform -chdir=infra apply",
   finalWhy: "create inert infrastructure; finish the edge + portal steps in AGENTS.md before up",
+};
+
+export const renderScaffold: ProviderScaffold = {
+  renderConfig: (
+    orgId,
+    modelProvider,
+    emailTransport,
+    source = { repo: "https://github.com/yc-software/qm", branch: "main" },
+  ) =>
+    renderConfig(orgId, {
+      target: "render",
+      modelProvider,
+      publicUrl: `https://${orgId}-portal.onrender.com`,
+      providerFields: `
+  // The core API address. Render assigns both URLs; qm up rewrites them here.
+  "apiUrl": ${JSON.stringify(`https://${orgId}-core.onrender.com`)},
+
+  // Render coordinates. workspaceId is the workspace that owns the deployment
+  // (tea-... or usr-...). Every service builds from source.repo at source.branch; each qm up
+  // resolves that branch to one commit and pins every build to it. Plans name
+  // Render instance types; storage is the bundled MinIO service and its disk.
+  "render": {
+    "workspaceId": "tea-replaceme",
+    "source": ${JSON.stringify(source)},
+    "region": "oregon",
+    "corePlan": "2c-4g",
+    "servicePlan": "0.5c-512mb",
+    "postgresPlan": "0.5c-1g",
+    "postgresDiskSizeGB": 10,
+    "storage": { "type": "minio", "plan": "0.5c-512mb", "diskSizeGB": 10 }
+  },
+`,
+      services: ["core", "slack", "web-ui", "admin", "portal", "auth"],
+      env: `{ "core": { "HARNESS": "pi", "SANDBOX_BACKEND": "render", "DEPLOY_PROVIDER": "render", "SNAPSHOT_STORE": "s3", "TRANSFER_STORE": "s3" }, "slack": { "SLACK_IDENTITY_EMAIL": "1" }, "auth": { "AUTH_EMAIL_TRANSPORT": ${JSON.stringify(emailTransport)} } }`,
+      secretEnv: `,
+
+  // The initial admin seed is kept in the provider secret store, never in config.
+  "secretEnv": { "core": { "ADMIN_GRANTS": "ADMIN_GRANTS" } }`,
+      sandbox: `,
+
+  // Agent computers run as native Render Sandboxes in this workspace.
+  "sandbox": { "backend": "render" }`,
+    }),
+  ignores: [
+    ".env",
+    "node_modules/",
+    ".generated/",
+    ".render.lock/",
+    ".render.lock-*/",
+    "render.resources.json",
+    "render.resources.json.tmp",
+  ],
+  agentsAppendix: `
+## Render deployment
+
+Render builds every service from render.source in Git; no local Docker or image
+publication is involved. qm up creates one project with a production environment
+for core, web UI, portal, Render Postgres, and bundled MinIO, then
+uploads the deployment layer. Native Render Sandboxes are workspace resources.
+Published apps have no disk; each app uses its own database and scoped object
+storage. qm down retains Postgres and MinIO data, and qm rollback restores the
+prior service builds without reversing database migrations.
+
+.codex/skills/deploy-qm/references/render.md is the Render reference: setup,
+updates, data and credentials, archive and restore, and permanent cleanup.
+`,
+  files: () => [
+    {
+      segments: ["sandbox", "skills", "render-platform", "SKILL.md"],
+      content: `---
+name: render-platform
+description: Build and publish apps on this QM Render deployment. Use when an app needs persistent data, background work, or a deployment update.
+---
+Use the built-in deployment tools to publish, update, archive, and restore apps.
+The platform creates diskless app services in this deployment's Render project.
+Use the provided DATABASE_URL for persistent relational data. Use the provided
+S3 bucket, endpoint, and scoped credentials for persistent files and objects.
+Local files, including SQLite databases, are temporary and are lost at deploy.
+Use PORT for the listening port and bind the server to 0.0.0.0.
+
+Keep app credentials inside the app environment. Never give an app the Render API
+key, the core database URL, or MinIO administrator credentials. Each app receives
+its own database and object prefix. Archive retains data. Restore reuses that data.
+
+The agent executes in native Render Sandboxes. Save useful workspace changes
+before an operation that replaces a sandbox. Sandboxes are workspace resources;
+app services, Postgres, and MinIO belong to this deployment's project.
+Do not create infrastructure outside that project or change DNS or Cloudflare rules.
+`,
+    },
+  ],
+  configurationHint: "render: set workspaceId, region, and the email access gate before setup",
+  finalCommand: "npm exec qm -- up",
+  finalWhy: "provision Render services and upload the QM deployment layer",
 };

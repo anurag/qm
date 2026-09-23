@@ -32,6 +32,25 @@ The CLI deploys long-running QM services; it is not the runtime. Docker runs
 them locally, Fly runs them as Fly apps with Fly Machines for agent computers, and AWS
 runs digest-pinned ARM64 tasks on ECS Fargate with Lambda MicroVM agent computers.
 
+## Render
+
+```bash
+npm exec qm -- init . --org acme --target render \
+  --repo https://github.com/acme/qm --branch main
+npm install
+npm exec qm -- setup
+npm exec qm -- check
+npm exec qm -- plan
+npm exec qm -- up
+npm exec qm -- check --live
+```
+
+Set `render.workspaceId` and the email access gate before setup. Render builds
+every service from Git and creates one project for the QM services, Postgres,
+and bundled MinIO; no AWS account or external object store is needed. The
+[Render runbook](templates/deployment/references/render.md) covers updates,
+rollback, archive and restore, and permanent cleanup.
+
 ## Deployment directory
 
 ```text
@@ -164,7 +183,7 @@ the proxy verdict. Route the proxy token through
 ## Commands
 
 ```text
-init [dir] [--org id] [--target docker|fly|aws]
+init [dir] [--org id] [--target docker|fly|aws|render] [--model-provider anthropic|openai|openrouter] [--repo url --branch name]
 check [--json] [--live]
 doctor
 infra render|build-image|delete-image|delete-task-definitions
