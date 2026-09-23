@@ -303,7 +303,8 @@ export const renderScaffold: ProviderScaffold = {
       modelProvider,
       publicUrl: `https://${orgId}-portal.onrender.com`,
       providerFields: `
-  // The core API address. Render assigns both URLs; qm up rewrites them here.
+  // The core API address. Render assigns both URLs and qm up rewrites them here.
+  // Set your own HTTPS origins instead to use custom domains; see the Render reference.
   "apiUrl": ${JSON.stringify(`https://${orgId}-core.onrender.com`)},
 
   // Render coordinates. workspaceId is the workspace that owns the deployment

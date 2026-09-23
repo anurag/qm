@@ -2,7 +2,12 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { appPrefixOf, renderPlanId, updateConfigUrls, type QmConfig, type RenderConfig } from "../config.ts";
-import { deploymentLayerRequest, httpDeploymentLayerTransport, syncDeploymentLayer } from "../deployment-layer.ts";
+import {
+  deploymentLayerRequest,
+  httpDeploymentLayerTransport,
+  syncDeploymentLayer,
+  type DeploymentLayerTransport,
+} from "../deployment-layer.ts";
 import { CliError, errMessage, note, ok, step } from "../log.ts";
 import { renderMinioCommand, renderMinioInitCommand } from "../render-minio.ts";
 import type { ResolvedPlugin } from "../plugins.ts";
@@ -15,22 +20,25 @@ import { doctorCommon, localDoctorSecrets } from "./doctor.ts";
 import type { DeployContext } from "./registry.ts";
 import type { Backend } from "./types.ts";
 
-export const renderDeploymentLayerTransport = httpDeploymentLayerTransport({
-  timeoutMs: 60_000,
-  urlOf: (config) => {
-    if (!config.apiUrl) throw new CliError("Render requires apiUrl; qm init --target render sets it");
-    const origin = renderOrigin(config.apiUrl);
-    if (!origin) throw new CliError("Render deployment-layer URL must be the assigned HTTPS core onrender.com URL");
-    return new URL("/v1/deployment-layer", origin);
-  },
+function layerTransport(originOf: (config: QmConfig) => string): DeploymentLayerTransport {
+  return httpDeploymentLayerTransport({
+    timeoutMs: 60_000,
+    urlOf: (config) => new URL("/v1/deployment-layer", originOf(config)),
+  });
+}
+export const renderDeploymentLayerTransport = layerTransport((config) => {
+  if (!config.apiUrl) throw new CliError("Render requires apiUrl; qm init --target render sets it");
+  const origin = httpsOrigin(config.apiUrl);
+  if (!origin) throw new CliError("Render deployment-layer URL must be an HTTPS origin");
+  return origin;
 });
 
-function renderOrigin(value: string | undefined): string | undefined {
+function httpsOrigin(value: string | undefined): string | undefined {
   const url = URL.parse(value ?? "");
   if (
     !url ||
     url.protocol !== "https:" ||
-    !url.hostname.endsWith(".onrender.com") ||
+    url.port ||
     url.username ||
     url.password ||
     url.pathname !== "/" ||
@@ -39,6 +47,10 @@ function renderOrigin(value: string | undefined): string | undefined {
   )
     return undefined;
   return url.origin;
+}
+function assignedOrigin(value: string | undefined): string | undefined {
+  const origin = httpsOrigin(value);
+  return origin && new URL(origin).hostname.endsWith(".onrender.com") ? origin : undefined;
 }
 
 type ServiceType = "web_service" | "private_service";
@@ -244,7 +256,8 @@ function client(apiKey: string): RenderRequest {
         response.headers.get("render-request-id"),
       );
     const text = await response.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+    if (!text) return undefined as T;
+    return (response.headers.get("content-type")?.includes("json") ? JSON.parse(text) : text) as T;
   };
 }
 function coordinates(config: QmConfig): RenderConfig {
@@ -518,8 +531,81 @@ export function renderInternalUrl(service: Pick<RenderService, "name" | "slug">)
   return `http://${service.slug}:8080`;
 }
 function publicUrl(service: RenderService): string {
-  const origin = renderOrigin(service.serviceDetails.url);
+  const origin = assignedOrigin(service.serviceDetails.url);
   if (!origin) throw new CliError(`Render returned an invalid public address for ${service.name}`);
+  return origin;
+}
+interface CustomDomain {
+  id: string;
+  name: string;
+  domainType: "apex" | "subdomain";
+  redirectForName: string;
+  verificationStatus: "verified" | "unverified";
+}
+function primaryDomain(domain: CustomDomain, service: RenderService): CustomDomain {
+  if (domain.redirectForName)
+    throw new CliError(
+      `${service.name}: ${domain.name} redirects to ${domain.redirectForName} on Render; configure https://${domain.redirectForName} or remove the redirect in the Render dashboard`,
+    );
+  return domain;
+}
+function customDomainPath(service: RenderService, name?: string): string {
+  return `/services/${service.id}/custom-domains${name ? `/${encodeURIComponent(name)}` : ""}`;
+}
+function dnsInstruction(domain: CustomDomain, service: RenderService): string {
+  const record = domain.domainType === "apex" ? "an ALIAS or ANAME record" : "a CNAME record";
+  return `point ${domain.name} at ${new URL(publicUrl(service)).hostname} with ${record}; Render verifies the domain and issues its certificate when the record resolves`;
+}
+async function ensureCustomDomain(request: RenderRequest, service: RenderService, origin: string): Promise<void> {
+  const name = new URL(origin).hostname;
+  const existing = (await list<CustomDomain>(request, customDomainPath(service), "customDomain")).find(
+    (item) => item.name === name,
+  );
+  let domain = existing;
+  if (!domain) {
+    const created = await request<CustomDomain | CustomDomain[]>(customDomainPath(service), "POST", { name });
+    domain = (Array.isArray(created) ? created : [created]).find((item) => item.name === name);
+    if (!domain) throw new CliError(`Render returned no custom domain ${name} for ${service.name}`);
+  }
+  primaryDomain(domain, service);
+  if (existing && domain.verificationStatus !== "verified")
+    await request(`${customDomainPath(service, domain.id)}/verify`, "POST");
+  if (domain.verificationStatus === "verified") ok(`${service.name}: custom domain ${name} verified`);
+  else note(`${service.name}: custom domain ${name} is unverified; ${dnsInstruction(domain, service)}`);
+}
+async function bindUrl(
+  request: RenderRequest,
+  service: RenderService,
+  configured: string | undefined,
+): Promise<string> {
+  const origin = httpsOrigin(configured);
+  if (!origin || assignedOrigin(origin)) return publicUrl(service);
+  await ensureCustomDomain(request, service, origin);
+  return origin;
+}
+async function verifiedUrl(
+  request: RenderRequest,
+  service: RenderService,
+  configured: string | undefined,
+): Promise<string> {
+  const origin = httpsOrigin(configured);
+  if (!origin) throw new CliError(`${service.name} has no HTTPS origin URL configured; run qm check`);
+  if (assignedOrigin(origin)) {
+    if (origin !== publicUrl(service))
+      throw new CliError("Configured Render URLs do not match the owned services; run qm up");
+    return origin;
+  }
+  const name = new URL(origin).hostname;
+  let domain: CustomDomain;
+  try {
+    domain = primaryDomain(await request<CustomDomain>(customDomainPath(service, name)), service);
+  } catch (error) {
+    if (error instanceof RenderApiError && error.status === 404)
+      throw new CliError(`${service.name} has no custom domain ${name}; run qm up`);
+    throw error;
+  }
+  if (domain.verificationStatus !== "verified")
+    throw new CliError(`${service.name}: custom domain ${name} is unverified; ${dnsInstruction(domain, service)}`);
   return origin;
 }
 async function latestDeploy(request: RenderRequest, service: RenderService): Promise<RenderDeploy | undefined> {
@@ -867,8 +953,17 @@ export function renderConfigErrors(
     errors.push({ clause: "config.v1", message });
   };
   if (!config.apiUrl) add("Render requires apiUrl; qm init --target render sets it");
-  for (const url of [config.publicUrl, config.apiUrl]) {
-    if (url && !renderOrigin(url)) add("Render hosting currently uses the assigned HTTPS onrender.com URLs");
+  const origins = [config.publicUrl, config.apiUrl].map(httpsOrigin);
+  for (const [index, url] of [config.publicUrl, config.apiUrl].entries()) {
+    if (url && !origins[index]) add("Render publicUrl and apiUrl must be HTTPS origin URLs on port 443");
+  }
+  const [web, api] = origins.map((origin) => (origin ? new URL(origin).hostname : undefined));
+  if (web && api) {
+    if (web === api) add("Render publicUrl and apiUrl must use different hostnames");
+    else if (web === `www.${api}` || api === `www.${web}`)
+      add(
+        "Render publicUrl and apiUrl cannot be an apex domain and its www subdomain; Render pairs them as a redirect",
+      );
   }
   if (config.plugins.some((plugin) => plugin.name === "minio"))
     add("Render plugin minio conflicts with the bundled Render minio service");
@@ -1046,9 +1141,14 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             connections.storage = { endpoint: publicUrl(service), secretKey: env.QM_STORAGE_SECRET_KEY };
           }
         }
+        const coreOrigin = publicUrl(services.get("core")!);
         const urls = {
-          apiUrl: publicUrl(services.get("core")!),
-          publicUrl: publicUrl(services.get(ctx.config.services.includes("portal") ? "portal" : "web-ui")!),
+          apiUrl: await bindUrl(request, services.get("core")!, ctx.config.apiUrl),
+          publicUrl: await bindUrl(
+            request,
+            services.get(ctx.config.services.includes("portal") ? "portal" : "web-ui")!,
+            ctx.config.publicUrl,
+          ),
         };
         const current = readFileSync(ctx.configPath, "utf8");
         const updated = updateConfigUrls(current, urls);
@@ -1092,7 +1192,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         }
         await poll("core readiness", async () => {
           try {
-            return (await fetch(`${urls.apiUrl}/healthz`, { signal: AbortSignal.timeout(30_000), redirect: "error" }))
+            return (await fetch(`${coreOrigin}/healthz`, { signal: AbortSignal.timeout(30_000), redirect: "error" }))
               .ok;
           } catch {
             return false;
@@ -1102,7 +1202,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
           config: ctx.config,
           configDir: ctx.configDir,
           sandboxDir: ctx.sandboxDir,
-          transport: renderDeploymentLayerTransport,
+          transport: layerTransport(() => coreOrigin),
           ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
         });
         const release: Record<string, string> = {};
@@ -1137,6 +1237,11 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         note(
           `${name}: ${service.suspended}, ${recent?.status ?? "no deploy"} (${service.id})${service.serviceDetails.url ? ` ${service.serviceDetails.url}` : ""}`,
         );
+      }
+      for (const service of bound.services.values()) {
+        if (service.type !== "web_service" || service.serviceDetails.disk) continue;
+        for (const domain of await list<CustomDomain>(request, customDomainPath(service), "customDomain"))
+          note(`${service.name}: custom domain ${domain.name} ${domain.verificationStatus}`);
       }
       for (const [index, release] of (state.releases ?? []).entries())
         note(`release ${describeRelease(release)}${index === 0 ? " latest" : ""}`);
@@ -1397,12 +1502,11 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       const core = bound.services.get("core");
       const web = bound.services.get(ctx.config.services.includes("portal") ? "portal" : "web-ui");
       if (!core || !web) throw new CliError("The Render deployment has no core or web service; run qm up");
-      if (ctx.config.apiUrl !== publicUrl(core) || ctx.config.publicUrl !== publicUrl(web))
-        throw new CliError("Configured Render URLs do not match the owned services; run qm up");
-      for (const [name, url] of [
-        ["core", ctx.config.apiUrl],
-        ["web", ctx.config.publicUrl],
-      ]) {
+      for (const [name, service, configured] of [
+        ["core", core, ctx.config.apiUrl],
+        ["web", web, ctx.config.publicUrl],
+      ] as const) {
+        const url = await verifiedUrl(request, service, configured);
         const response = await fetch(`${url}/healthz`, {
           signal: AbortSignal.timeout(30_000),
           redirect: "error",

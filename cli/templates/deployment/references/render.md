@@ -195,6 +195,34 @@ mc alias set qm https://<prefix>-minio.onrender.com qm-storage "$QM_STORAGE_SECR
 mc cat "qm/qm-storage/$key" | tar -xOf - ./workspace/qm-computer-proof.txt
 ```
 
+## Custom domains
+
+The assigned `onrender.com` URLs work without DNS changes. To serve QM on your
+own domains, set `publicUrl` and `apiUrl` to HTTPS origins with different
+hostnames, for example `https://qm.example.com` and `https://api.qm.example.com`,
+then run `qm up`. The CLI adds each hostname as a custom domain of the portal
+(or of the web UI when there is no portal) and of core, keeps your URLs in the
+config, and prints the DNS record to create: a CNAME record for a subdomain, or
+an ALIAS or ANAME record for an apex domain, that points at the service's
+assigned `onrender.com` hostname. When the DNS provider has neither record type
+for an apex domain, use the A record that Render documents for custom domains.
+Render verifies the domain and issues its TLS certificate after the record
+resolves; `qm up` triggers a new verification for a domain that is still
+unverified.
+
+Until both domains are verified, sandboxes and published apps cannot reach
+core, because core advertises the custom `apiUrl` as its public API address.
+`qm check --live` fails until both domains are verified, then checks health
+through them. `qm status` lists each service's custom domains with their
+verification status. Run `qm slack render` after changing `publicUrl`. The
+`onrender.com` URLs remain active beside the custom domains. `qm up` uses them
+for its readiness poll and deployment-layer upload, so setup completes before
+the DNS records exist; `qm layer sync` and `qm conformance` use the configured
+`apiUrl` and need its DNS record. Render pairs an apex domain with its `www`
+subdomain as a redirect; configure the primary hostname, not the redirect. A
+hostname that is removed from the config stays on its service until it is
+removed in the Render dashboard.
+
 ## Operations
 
 `qm status`, `qm logs`, and `qm check --live` inspect the recorded resources.
@@ -231,4 +259,4 @@ Purge retains the Render project and environments. It does not delete workspace
 sandboxes or snapshots; those must be retired before core is removed.
 
 Do not change unrelated infrastructure, DNS, or Cloudflare rules. The assigned
-`onrender.com` URLs are sufficient for this target.
+`onrender.com` URLs are sufficient for this target; custom domains are optional.

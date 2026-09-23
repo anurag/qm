@@ -109,6 +109,16 @@ interface Project {
   owner: { id: string };
   environmentIds: string[];
 }
+interface CustomDomainRecord {
+  id: string;
+  name: string;
+  domainType: "apex" | "subdomain";
+  publicSuffix: string;
+  verificationStatus: "verified" | "unverified";
+  redirectForName: string;
+  createdAt: string;
+  server: { id: string; name: string };
+}
 interface Call {
   path: string;
   method: string;
@@ -123,6 +133,7 @@ function cloud(t: TestContext, d: Deployment) {
     deploys: new Map<string, { id: string; status: string; commit?: { id: string } }>(),
     deploysById: new Map<string, { id: string; status: string; commit?: { id: string } }>(),
     projects: new Map<string, Project>(),
+    customDomains: new Map<string, CustomDomainRecord[]>(),
     database: undefined as Database | undefined,
     intercept: undefined as ((call: Call) => Response | undefined | Promise<Response | undefined>) | undefined,
     nextDeployStatus: "live",
@@ -144,7 +155,7 @@ function cloud(t: TestContext, d: Deployment) {
     if (url.origin !== "https://api.render.com") {
       if (path === "/healthz") return new Response("ok");
       if (path === "/v1/deployment-layer") {
-        assert.equal(url.origin, state.services.get("srv-acme-core")!.serviceDetails.url);
+        assert.ok([state.services.get("srv-acme-core")!.serviceDetails.url, d.ctx.config.apiUrl].includes(url.origin));
         return Response.json({ status: "applied", durable: true, version: 1 });
       }
       throw new Error(`Unexpected application request ${path}`);
@@ -294,6 +305,32 @@ function cloud(t: TestContext, d: Deployment) {
         return empty();
       }
       if (path === `/services/${id}/secret-files`) return empty();
+      if (path === `/services/${id}/custom-domains`) {
+        const domains = state.customDomains.get(id) ?? [];
+        if (method === "GET")
+          return Response.json(domains.map((customDomain) => ({ customDomain, cursor: customDomain.id })));
+        const record = (name: string, redirectForName: string): CustomDomainRecord => ({
+          id: `cd-${++state.next}`,
+          name,
+          domainType: name.split(".").length > 2 ? "subdomain" : "apex",
+          publicSuffix: name.split(".").at(-1)!,
+          verificationStatus: "unverified",
+          redirectForName,
+          createdAt: "2026-09-21T00:00:00Z",
+          server: { id, name: service.name },
+        });
+        const domain = record(body.name, "");
+        const created = domain.domainType === "apex" ? [domain, record(`www.${domain.name}`, domain.name)] : [domain];
+        state.customDomains.set(id, [...domains, ...created]);
+        return Response.json(created, { status: 201 });
+      }
+      if (path.startsWith(`/services/${id}/custom-domains/`)) {
+        const key = decodeURIComponent(path.split("/")[4]!);
+        const domain = (state.customDomains.get(id) ?? []).find((item) => item.id === key || item.name === key);
+        if (!domain) return missing();
+        if (path.endsWith("/verify")) return new Response("Custom domain verification triggered", { status: 202 });
+        return Response.json(domain);
+      }
       if (path.startsWith(`/services/${id}/env-vars/`)) {
         state.envs.get(id)![decodeURIComponent(path.split("/").at(-1)!)] = body.value;
         return empty();
@@ -1162,14 +1199,106 @@ test("Render updates retain stored operator secrets for the core", async (t) => 
   assert.equal(c.envs.get("srv-acme-web-ui")!.RESEND_API_KEY, undefined);
 });
 
-test("Render rejects disk shrink and non-Render custom URLs", async (t) => {
+test("Render rejects disk shrink, plain HTTP URLs, and a shared hostname", async (t) => {
   const d = deployment(t);
   cloud(t, d);
   await d.backend.up({ dryRun: false });
   if (d.ctx.config.render!.storage.type === "minio") d.ctx.config.render!.storage.diskSizeGB = 1;
   await assert.rejects(d.backend.up({ dryRun: false }), /cannot shrink/);
+  for (const publicUrl of ["http://qm.example.com", "https://qm.example.com:8443"]) {
+    d.ctx.config.publicUrl = publicUrl;
+    assert.ok(
+      renderConfigErrors(d.ctx.config, []).some((error) => /HTTPS origin URLs on port 443/.test(error.message)),
+    );
+  }
   d.ctx.config.publicUrl = "https://qm.example.com";
-  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /onrender.com/.test(error.message)));
+  d.ctx.config.apiUrl = "https://qm.example.com/";
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /different hostnames/.test(error.message)));
+  d.ctx.config.apiUrl = "https://www.qm.example.com";
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /www subdomain/.test(error.message)));
+  d.ctx.config.apiUrl = "https://api.qm.example.com";
+  assert.deepEqual(renderConfigErrors(d.ctx.config, []), []);
+});
+
+test("Render binds operator custom domains and checks their verification live", async (t) => {
+  const d = deployment(t, true);
+  mkdirSync(d.ctx.sandboxDir);
+  const c = cloud(t, d);
+  const raw = JSON.parse(readFileSync(d.ctx.configPath, "utf8"));
+  Object.assign(raw, { publicUrl: "https://acme.example", apiUrl: "https://api.acme.example" });
+  writeFileSync(d.ctx.configPath, JSON.stringify(raw));
+  Object.assign(d.ctx.config, { publicUrl: raw.publicUrl, apiUrl: raw.apiUrl });
+  const domainWrites = (calls: Call[]) =>
+    writes(calls)
+      .filter((call) => call.path.includes("/custom-domains"))
+      .map((call) => [call.method, call.path.replace(/cd-\d+/, "cd"), call.body]);
+  const application = (calls: Call[], path: string) =>
+    calls
+      .filter((call) => call.url.origin !== "https://api.render.com" && call.path === path)
+      .map((call) => call.url.origin);
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls), [
+    ["POST", "/services/srv-acme-core/custom-domains", { name: "api.acme.example" }],
+    ["POST", "/services/srv-acme-portal/custom-domains", { name: "acme.example" }],
+  ]);
+  assert.equal(readFileSync(d.ctx.configPath, "utf8"), JSON.stringify(raw));
+  assert.equal(d.ctx.config.apiUrl, "https://api.acme.example");
+  assert.equal(c.envs.get("srv-acme-core")!.PUBLIC_API_URL, "https://api.acme.example");
+  assert.equal(c.envs.get("srv-acme-core")!.PUBLIC_WEB_URL, "https://acme.example");
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_API_CORS_ALLOW_ORIGIN, "https://acme.example");
+  assert.deepEqual([...new Set(application(c.calls, "/healthz"))], ["https://acme-core-assigned.onrender.com"]);
+  assert.deepEqual(application(c.calls, "/v1/deployment-layer"), ["https://acme-core-assigned.onrender.com"]);
+  assert.deepEqual(
+    c.customDomains.get("srv-acme-portal")!.map((domain) => [domain.name, domain.redirectForName]),
+    [
+      ["acme.example", ""],
+      ["www.acme.example", "acme.example"],
+    ],
+  );
+  let mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls.slice(mark)), [
+    ["POST", "/services/srv-acme-core/custom-domains/cd/verify", undefined],
+    ["POST", "/services/srv-acme-portal/custom-domains/cd/verify", undefined],
+  ]);
+  d.ctx.config.publicUrl = "https://www.acme.example";
+  const redirected =
+    /acme-portal: www\.acme\.example redirects to acme\.example on Render; configure https:\/\/acme\.example/;
+  await assert.rejects(d.backend.up({ dryRun: false }), redirected);
+  d.ctx.config.publicUrl = "https://acme.example";
+  await assert.rejects(
+    async () => d.backend.checkLive!(),
+    /acme-core: custom domain api\.acme\.example is unverified; point api\.acme\.example at acme-core-assigned\.onrender\.com with a CNAME record/,
+  );
+  c.customDomains.get("srv-acme-core")![0]!.verificationStatus = "verified";
+  d.ctx.config.publicUrl = "https://www.acme.example";
+  await assert.rejects(async () => d.backend.checkLive!(), redirected);
+  d.ctx.config.publicUrl = "https://acme.example";
+  await assert.rejects(
+    async () => d.backend.checkLive!(),
+    /acme-portal: custom domain acme\.example is unverified; point acme\.example at acme-portal-assigned\.onrender\.com with an ALIAS or ANAME record/,
+  );
+  c.customDomains.get("srv-acme-portal")![0]!.verificationStatus = "verified";
+  mark = c.calls.length;
+  await d.backend.checkLive!();
+  assert.deepEqual(application(c.calls.slice(mark), "/healthz"), ["https://api.acme.example", "https://acme.example"]);
+  assert.deepEqual(application(c.calls.slice(mark), "/v1/deployment-layer"), ["https://api.acme.example"]);
+  await d.backend.status();
+  c.customDomains.set("srv-acme-portal", []);
+  await assert.rejects(async () => d.backend.checkLive!(), /acme-portal has no custom domain acme\.example; run qm up/);
+  mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls.slice(mark)), [
+    ["POST", "/services/srv-acme-portal/custom-domains", { name: "acme.example" }],
+  ]);
+  Object.assign(raw, { publicUrl: "https://acme-portal.onrender.com", apiUrl: "https://acme-core.onrender.com" });
+  writeFileSync(d.ctx.configPath, JSON.stringify(raw));
+  Object.assign(d.ctx.config, { publicUrl: raw.publicUrl, apiUrl: raw.apiUrl });
+  mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls.slice(mark)), []);
+  assert.equal(d.ctx.config.publicUrl, "https://acme-portal-assigned.onrender.com");
+  assert.equal(loadConfigAt(d.ctx.configPath).config.apiUrl, "https://acme-core-assigned.onrender.com");
 });
 
 test("Render reports status, logs, and signed layer health from saved IDs", async (t) => {
@@ -1213,7 +1342,7 @@ test("Render layer transport rejects missing or invalid core URLs before sending
     undefined,
     "http://core.onrender.com",
     "https://user:password@core.onrender.com",
-    "https://core.example.com",
+    "https://core.onrender.com:8443",
     "https://core.onrender.com/path",
     "https://core.onrender.com?query=value",
     "https://core.onrender.com#fragment",

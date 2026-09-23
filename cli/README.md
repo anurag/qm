@@ -49,7 +49,7 @@ Set `render.workspaceId` and the email access gate before setup. Render builds
 every service from Git and creates one project for the QM services, Postgres,
 and bundled MinIO; no AWS account or external object store is needed. The
 [Render runbook](templates/deployment/references/render.md) covers updates,
-rollback, archive and restore, and permanent cleanup.
+rollback, custom domains, archive and restore, and permanent cleanup.
 
 ## Deployment directory
 
