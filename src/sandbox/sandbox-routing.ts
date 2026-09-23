@@ -173,7 +173,11 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
         const routedLayers = layers.map((layer) =>
           layer.mode === "rw" ? { ...layer, scopeId: resource.backingScopeId } : layer,
         );
-        const handle = await opts.resources!.use(resource.id, () => sandbox.provision(routedLayers, provOpts), true);
+        const handle = await opts.resources!.use(
+          resource.id,
+          () => sandbox.provision(routedLayers, provOpts),
+          !sandbox.profile.concurrentProvision,
+        );
         return { ...handle, backend: resource.backend, scopeId: resource.ownerScopeId, resourceId: resource.id };
       }
       const { name, sandbox } = await pick(scope);
@@ -219,7 +223,7 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
     teardown(handle, tdOpts?: TeardownOptions): Promise<void> {
       const action = () => forHandle(handle).teardown(handle, tdOpts);
       return handle.resourceId && opts.resources
-        ? opts.resources.use(handle.resourceId, action, handle.backend !== "modal" || !!tdOpts?.destroy)
+        ? opts.resources.use(handle.resourceId, action, !forHandle(handle).profile.concurrentUse || !!tdOpts?.destroy)
         : action();
     },
 

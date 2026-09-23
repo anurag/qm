@@ -183,7 +183,7 @@ export function createSandboxResources(opts: {
   const use = async <T>(id: string, action: () => Promise<T>, exclusive = false): Promise<T> => {
     const record = await get(id);
     const lock =
-      exclusive || record.backend !== "modal" || !opts.lock.withSharedLock
+      exclusive || !opts.backends[record.backend]?.profile.concurrentUse || !opts.lock.withSharedLock
         ? opts.lock.withLock
         : opts.lock.withSharedLock;
     return lock(`sandbox-resource:${id}`, async () => {
