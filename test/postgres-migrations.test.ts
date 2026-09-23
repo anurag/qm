@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import pg from "pg";
 import {
   applyPgMigrations,
@@ -232,3 +233,49 @@ test("pre-migration maintenance can repair schema before a released migration", 
     await admin.end();
   }
 });
+
+for (const lock of ["qm:schema-maintenance", "qm:schema-migrations"]) {
+  test(`waiting for the ${lock} lock does not deadlock a concurrent index build`, { skip }, async () => {
+    const admin = new pg.Pool({ connectionString: databaseUrl });
+    const holder = new pg.Client({ connectionString: databaseUrl });
+    const { id, table } = names();
+    const store = createPgPool(
+      databaseUrl!,
+      [{ id, statements: [`ALTER TABLE ${table} ADD COLUMN extra INT`] }],
+      [{ id: `${id}/repair`, beforeMigrations: true, statements: ["SELECT 1"] }],
+    );
+    await holder.connect();
+    try {
+      await admin.query(`CREATE TABLE ${table}(value INT NOT NULL)`);
+      await admin.query(`INSERT INTO ${table}(value) VALUES (1)`);
+      const holderPid = (await holder.query<{ pid: number }>("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
+      await holder.query("SELECT pg_advisory_lock(hashtext($1))", [lock]);
+      const ready = store.pool();
+      ready.catch(() => {});
+      const deadline = Date.now() + 10_000;
+      let waiting = 0;
+      while (!waiting && Date.now() < deadline) {
+        const waiters = await admin.query(
+          "SELECT 1 FROM pg_stat_activity WHERE pid NOT IN (pg_backend_pid(), $1) AND query LIKE '%advisory_lock(hashtext(%'",
+          [holderPid],
+        );
+        waiting = waiters.rowCount ?? 0;
+        if (!waiting) await delay(50);
+      }
+      assert.ok(waiting, "the store never waited for the schema lock");
+      try {
+        await holder.query(`CREATE INDEX CONCURRENTLY ${table}_idx ON ${table}(value)`);
+      } finally {
+        await holder.query("SELECT pg_advisory_unlock(hashtext($1))", [lock]);
+      }
+      await ready;
+      assert.deepEqual(await store.q(`SELECT value, extra FROM ${table}`), [{ value: 1, extra: null }]);
+    } finally {
+      await holder.end();
+      await store.close();
+      await admin.query(`DROP TABLE IF EXISTS ${table}`);
+      await admin.query(`DELETE FROM ${PG_MIGRATIONS_TABLE} WHERE id = $1`, [id]);
+      await admin.end();
+    }
+  });
+}
