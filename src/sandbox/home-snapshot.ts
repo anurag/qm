@@ -4,6 +4,7 @@ import {
   CompleteMultipartUploadCommand,
   CopyObjectCommand,
   CreateMultipartUploadCommand,
+  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   PutObjectCommand,
@@ -63,6 +64,7 @@ interface StoredSnapshot {
 export interface HomeSnapshotStore {
   open(scope: string): Promise<StoredSnapshot | null>;
   put(scope: string, data: Uint8Array): Promise<void>;
+  delete?(scope: string): Promise<void>;
   createUpload(scope: string): Promise<SnapshotUpload>;
   adoptFromS3?(scope: string, ref: { bucket: string; key: string }): Promise<void>;
 }
@@ -87,6 +89,9 @@ export function createMemorySnapshotStore(): HomeSnapshotStore {
     },
     put: async (scope, data) => {
       map.set(scope, data);
+    },
+    delete: async (scope) => {
+      map.delete(scope);
     },
     createUpload: async (scope) => {
       const parts: Uint8Array[] = [];
@@ -129,6 +134,9 @@ export function createS3SnapshotStore(opts: S3SnapshotStoreOptions): HomeSnapsho
     },
     async put(scope, data): Promise<void> {
       await s3.send(new PutObjectCommand({ Bucket, Key: keyFor(scope), Body: data }));
+    },
+    async delete(scope): Promise<void> {
+      await s3.send(new DeleteObjectCommand({ Bucket, Key: keyFor(scope) }));
     },
     async createUpload(scope): Promise<SnapshotUpload> {
       const Key = keyFor(scope);
@@ -229,9 +237,18 @@ export interface HomeSnapshotOpsOptions<S> {
   timeoutMs?: number;
 }
 
+export class HomeExtractError extends Error {
+  readonly stopped: boolean;
+  constructor(label: string, exitCode: number, stderr: string) {
+    super(`${label} hydrate extract failed with exit ${exitCode}: ${stderr.slice(0, 200)}`);
+    this.name = "HomeExtractError";
+    this.stopped = exitCode === 124 || exitCode >= 128;
+  }
+}
+
 export interface HomeSnapshotOps<S> {
   snapshotHome(scope: string, session: S): Promise<void>;
-  hydrateHome(scope: string, session: S): Promise<boolean>;
+  hydrateHome(scope: string, session: S, options?: { replace?: boolean }): Promise<boolean>;
 }
 
 async function* coalesce(parts: AsyncIterable<Uint8Array>, size: number): AsyncGenerator<Uint8Array> {
@@ -260,6 +277,7 @@ export function createHomeSnapshotOps<S>(opts: HomeSnapshotOpsOptions<S>): HomeS
   const prunePaths = scratchInHome ? [...opts.prunePaths, `./${basename(homeTarPath)}*`] : opts.prunePaths;
   const partPath = (i: number): string => `${homeTarPath}.${i}.part`;
   const listPath = `${homeTarPath}.list`;
+  const prune = prunePaths.length ? `\\( ${prunePaths.map((p) => `-path ${shq(p)}`).join(" -o ")} \\) -prune -o ` : "";
 
   const startClock = (): (() => number) => {
     const deadline = Date.now() + timeoutMs;
@@ -336,10 +354,7 @@ export function createHomeSnapshotOps<S>(opts: HomeSnapshotOpsOptions<S>): HomeS
   return {
     async snapshotHome(scope, session): Promise<void> {
       const left = startClock();
-      const prune = prunePaths.length
-        ? `\\( ${prunePaths.map((p) => `-path ${shq(p)}`).join(" -o ")} \\) -prune -o `
-        : "";
-      const script = `cd ${shq(homeDir)} 2>/dev/null || exit 0; find . ${prune}\\( ! -type d -o -exec test -r {} \\; \\) -print0 > ${shq(listPath)} 2>/dev/null; tar --no-recursion --null -T ${shq(listPath)} -cf ${shq(homeTarPath)}; rc=$?; rm -f ${shq(listPath)}; exit $rc`;
+      const script = `cd ${shq(homeDir)} 2>/dev/null || exit 0; n=0; while :; do n=$((n + 1)); find . ${prune}\\( ! -type d -o -exec test -r {} \\; \\) -print0 > ${shq(listPath)} 2>/dev/null; tar --no-recursion --null -T ${shq(listPath)} -cf ${shq(homeTarPath)}; rc=$?; if [ "$rc" = 0 ] || [ "$n" -ge 3 ]; then break; fi; sleep 1; done; rm -f ${shq(listPath)}; exit $rc`;
       try {
         const made = await run(session, script, 180_000, left);
         if (made.exitCode !== 0) throw new Error(`${label} snapshot tar failed: ${made.stderr.slice(0, 200)}`);
@@ -361,7 +376,7 @@ export function createHomeSnapshotOps<S>(opts: HomeSnapshotOpsOptions<S>): HomeS
       }
     },
 
-    async hydrateHome(scope, session): Promise<boolean> {
+    async hydrateHome(scope, session, options): Promise<boolean> {
       const left = startClock();
       const stored = await withTimeout(() => store.open(scope), left(), `${label} hydrate open`);
       if (!stored) return false;
@@ -387,13 +402,16 @@ export function createHomeSnapshotOps<S>(opts: HomeSnapshotOpsOptions<S>): HomeS
         const validated = await run(session, `tar -tf ${shq(homeTarPath)} > /dev/null`, 180_000, left);
         if (validated.exitCode !== 0)
           throw new Error(`${label} hydrate archive invalid: ${validated.stderr.slice(0, 200)}`);
+        const clear = options?.replace
+          ? `find . ${prune}! -type d -exec rm -f {} + && { find . ${prune}-type d -print0 | sort -rz | xargs -0 rmdir 2>/dev/null; true; } && `
+          : "";
         const r = await run(
           session,
-          `cd ${shq(homeDir)} && tar -xf ${shq(homeTarPath)}; rc=$?; rm -f ${shq(homeTarPath)}; exit $rc`,
+          `cd ${shq(homeDir)} && ${clear}tar -xf ${shq(homeTarPath)}; rc=$?; rm -f ${shq(homeTarPath)}; exit $rc`,
           180_000,
           left,
         );
-        if (r.exitCode !== 0) throw new Error(`${label} hydrate extract failed: ${r.stderr.slice(0, 200)}`);
+        if (r.exitCode !== 0) throw new HomeExtractError(label, r.exitCode, r.stderr);
         return true;
       } finally {
         await removeScratch(session, "hydrate cleanup");
