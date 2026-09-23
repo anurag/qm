@@ -55,6 +55,9 @@ jobs:
         env:
           CORE_TEST_SHARD: ${{ matrix.shard }}/5
         run: npm run test:root:shard
+      - name: Render runner tests as root
+        if: matrix.shard == 1
+        run: sudo env "PATH=$PATH" node --test test/render-deploy-runner.test.ts
 
   core:
     name: Core

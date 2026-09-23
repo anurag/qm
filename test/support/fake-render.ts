@@ -14,6 +14,43 @@ import {
   type RenderSandboxInfo,
   type RenderSnapshot,
 } from "../../src/sandbox/render-client.ts";
+import type { RenderApi } from "../../src/deploy/render-api.ts";
+import type { Deployment } from "../../src/deploy/deploy-store.ts";
+import { scopeId } from "../../src/types.ts";
+
+export function fakeDeployment(versions: Deployment["versions"] = []): Deployment {
+  return {
+    id: randomUUID(),
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    currentVersion: 1,
+    status: "stopped",
+    endpoint: null,
+    versions,
+  };
+}
+
+export interface FakeRenderApiCall {
+  method: string;
+  path: string;
+  query: URLSearchParams;
+  body?: unknown;
+}
+
+export function createFakeRenderApi(
+  handle: (call: FakeRenderApiCall) => unknown,
+): RenderApi & { calls: FakeRenderApiCall[] } {
+  const calls: FakeRenderApiCall[] = [];
+  return {
+    calls,
+    async request<T>(method: string, path: string, body?: unknown): Promise<T | null> {
+      const url = new URL(path, "https://render.test");
+      const call = { method, path: url.pathname, query: url.searchParams, body };
+      calls.push(call);
+      return (await handle(call)) as T | null;
+    },
+  };
+}
 
 export function createFakeRender() {
   const execFileAsync = promisify(execFile);
