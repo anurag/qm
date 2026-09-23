@@ -8,6 +8,7 @@ import {
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import type { Deployment } from "../src/deploy/deploy-store.ts";
 import { fakeDeployment } from "./support/fake-render.ts";
+import { loadConfig } from "../src/config.ts";
 
 const sha = "a".repeat(40);
 const writePaths = {
@@ -265,6 +266,15 @@ function fixture(appRegion?: string) {
     },
   };
 }
+
+test("Render app region defaults to the core region and accepts a separate creation region", () => {
+  assert.equal(loadConfig({}).renderDeploy.appRegion, "oregon");
+  assert.equal(loadConfig({ RENDER_REGION: "ohio" }).renderDeploy.appRegion, "ohio");
+  const config = loadConfig({ RENDER_REGION: "oregon", RENDER_APP_REGION: " virginia " });
+  assert.equal(config.renderDeploy.region, "oregon");
+  assert.equal(config.renderDeploy.appRegion, "virginia");
+  assert.equal(config.renderSandbox.region, "oregon");
+});
 
 test("Render retains the app region through pending recovery and update after a default change", async () => {
   const f = fixture("virginia");
