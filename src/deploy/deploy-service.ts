@@ -211,8 +211,8 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     await deps.deployStore.setAppliedVersion(id, version);
   };
 
-  const liveEndpoint = async (d: Deployment): Promise<DeployEndpoint> => {
-    if (!deps.provider.resolveEndpoint || d.endpoint == null) return d.endpoint!;
+  const liveEndpoint = async (d: Deployment): Promise<DeployEndpoint | null> => {
+    if (!deps.provider.resolveEndpoint || d.endpoint == null) return d.endpoint;
     const version = currentVersionOf(d);
     if (!version) return d.endpoint;
     const resolved = await deps.provider.resolveEndpoint(d, version);
@@ -221,7 +221,8 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       return resolved;
     }
     return withDeployLock(d.id, async () => {
-      const cur = (await deps.deployStore.get(d.id)) ?? d;
+      const cur = await deps.deployStore.get(d.id);
+      if (cur?.status !== "running") return null;
       const v = currentVersionOf(cur) ?? version;
       const again = await deps.provider.resolveEndpoint!(cur, v);
       if (again) {
@@ -576,8 +577,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           try {
             const cur = await deps.deployStore.get(d.id);
             if (!cur?.alwaysOn || cur.status !== "running") continue;
-            await liveEndpoint(cur);
-            warmed++;
+            if (await liveEndpoint(cur)) warmed++;
           } catch (e) {
             console.error("%s", `[deploy] keep-warm failed for ${d.name ?? d.id}:`, errMessage(e));
           }
@@ -592,6 +592,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       if (!d || d.status !== "running" || d.endpoint == null) return { status: "not_found" };
       if (!opts.bypassAcl && !(await reachAllowed(d, principalId))) return { status: "denied" };
       const endpoint = await liveEndpoint(d);
+      if (!endpoint) return { status: "not_found" };
       await deps.deployStore.touch(d.id, Date.now()).catch((e) => swallow("deploy reach touch", e));
       return { status: "ok", id: d.id, endpoint };
     },

@@ -474,6 +474,7 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
     backend: "modal",
     writablePersistence: usesNativeSnapshots() ? "provider_managed" : "snapshot_to_workspace",
     processSessions: true,
+    concurrentUse: true,
     egressEnforcement: opts.egressProxyUrl ? "domain" : "none",
     spec: {
       os: "Debian 12 — Modal sandbox (24h max lifetime; home checkpoints have limited retention; publish durable work to git or Files)",

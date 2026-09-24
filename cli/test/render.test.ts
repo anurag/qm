@@ -1,0 +1,1922 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test, type TestContext } from "node:test";
+import { hostingProvider, type DeployContext } from "../src/backends/registry.ts";
+import { renderConfigErrors, renderDeploymentLayerTransport, renderInternalUrl } from "../src/backends/render.ts";
+import { loadConfigAt, parseConfigJson } from "../src/config.ts";
+import { renderScaffold } from "../src/provider-scaffold.ts";
+import { computedSecrets } from "../src/secrets.ts";
+import { renderMinioCommand } from "../src/render-minio.ts";
+
+function deployment(t: TestContext, portal = false) {
+  const dir = mkdtempSync(join(tmpdir(), "qm-render-api-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "git"),
+    `#!/bin/sh\ncommit=$(cat '${join(dir, "commit")}' 2>/dev/null || printf '%s' '${"a".repeat(40)}')\nprintf '%s\t%s\n' "$commit" "$4"\n`,
+  );
+  chmodSync(join(bin, "git"), 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${bin}:${originalPath}`;
+  t.after(() => {
+    process.env.PATH = originalPath;
+  });
+  const raw = parseConfigJson(renderScaffold.renderConfig("acme", "anthropic", "resend")) as Record<string, any>;
+  raw.render.workspaceId = "tea-acme";
+  raw.services = portal ? ["core", "web-ui", "portal", "auth", "admin"] : ["core", "web-ui"];
+  raw.env = {
+    ...(portal ? { auth: { ...raw.env.auth, AUTH_ALLOWED_EMAIL_DOMAIN: "example.com" } } : {}),
+    core: { ...raw.env.core, HARNESS: "mock" },
+  };
+  delete raw.modelProvider;
+  delete raw.secretEnv;
+  const configPath = join(dir, "qm.config.jsonc");
+  writeFileSync(configPath, JSON.stringify(raw));
+  const config = loadConfigAt(configPath).config;
+  writeFileSync(
+    join(dir, ".env"),
+    computedSecrets(config)
+      .filter((secret) => secret.managedBy === "operator" && secret.required)
+      .map((secret) => `${secret.name}=${"e".repeat(64)}`)
+      .join("\n"),
+  );
+  const ctx: DeployContext = { config, configPath, configDir: dir, sandboxDir: join(dir, "sandbox"), target: "render" };
+  return {
+    ctx,
+    backend: hostingProvider("render").createBackend(ctx),
+    saved: () => JSON.parse(readFileSync(join(dir, "render.resources.json"), "utf8")),
+    setCommit: (commit: string) => writeFileSync(join(dir, "commit"), commit),
+  };
+}
+type Deployment = ReturnType<typeof deployment>;
+interface Service {
+  id: string;
+  name: string;
+  type: string;
+  ownerId: string;
+  environmentId: string;
+  slug: string;
+  imagePath?: string;
+  repo?: string;
+  branch?: string;
+  rootDir?: string;
+  autoDeploy: string;
+  suspended: string;
+  serviceDetails: {
+    url?: string;
+    region: string;
+    plan: string;
+    runtime: string;
+    numInstances: number;
+    envSpecificDetails: { dockerCommand: string; dockerfilePath?: string; dockerContext?: string };
+    healthCheckPath?: string;
+    maxShutdownDelaySeconds?: number;
+    disk?: { id: string; name: string; mountPath: string; sizeGB: number };
+  };
+}
+interface Database {
+  id: string;
+  name: string;
+  owner: { id: string };
+  environmentId: string;
+  region: string;
+  plan: string;
+  diskSizeGB: number;
+  status: string;
+  suspended: string;
+}
+interface Project {
+  id: string;
+  name: string;
+  owner: { id: string };
+  environmentIds: string[];
+}
+interface CustomDomainRecord {
+  id: string;
+  name: string;
+  domainType: "apex" | "subdomain";
+  publicSuffix: string;
+  verificationStatus: "verified" | "unverified";
+  redirectForName: string;
+  createdAt: string;
+  server: { id: string; name: string };
+}
+interface Call {
+  path: string;
+  method: string;
+  body: unknown;
+  url: URL;
+}
+function cloud(t: TestContext, d: Deployment) {
+  const state = {
+    calls: [] as Call[],
+    services: new Map<string, Service>(),
+    envs: new Map<string, Record<string, string>>(),
+    deploys: new Map<string, { id: string; status: string; commit?: { id: string } }>(),
+    deploysById: new Map<string, { id: string; status: string; commit?: { id: string } }>(),
+    projects: new Map<string, Project>(),
+    customDomains: new Map<string, CustomDomainRecord[]>(),
+    database: undefined as Database | undefined,
+    intercept: undefined as ((call: Call) => Response | undefined | Promise<Response | undefined>) | undefined,
+    nextDeployStatus: "live",
+    automaticDeployStatus: "build_in_progress",
+    nextJobStatus: "succeeded",
+    next: 0,
+  };
+  const empty = () => new Response(null, { status: 204 });
+  const missing = () => new Response(null, { status: 404 });
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const path = url.origin === "https://api.render.com" ? url.pathname.slice(3) : url.pathname;
+    const method = init?.method ?? "GET";
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+    const call = { path, method, body, url };
+    state.calls.push(call);
+    const intercepted = await state.intercept?.(call);
+    if (intercepted) return intercepted;
+    if (url.origin !== "https://api.render.com") {
+      if (path === "/healthz") return new Response("ok");
+      if (path === "/v1/deployment-layer") {
+        assert.ok([state.services.get("srv-acme-core")!.serviceDetails.url, d.ctx.config.apiUrl].includes(url.origin));
+        return Response.json({ status: "applied", durable: true, version: 1 });
+      }
+      throw new Error(`Unexpected application request ${path}`);
+    }
+    assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${"e".repeat(64)}`);
+    if (path === "/owners/tea-acme") return Response.json({ id: "tea-acme" });
+    if (path === "/projects") {
+      if (method === "GET")
+        return Response.json(
+          [...state.projects.values()]
+            .filter((item) => !url.searchParams.has("name") || item.name === url.searchParams.get("name"))
+            .map((project) => ({ project, cursor: project.id })),
+        );
+      assert.deepEqual(body, { name: "acme-qm", ownerId: "tea-acme", environments: [{ name: "production" }] });
+      assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+      const project = { id: "prj-acme", name: body.name, owner: { id: body.ownerId }, environmentIds: ["evm-acme"] };
+      state.projects.set(project.id, project);
+      return Response.json(project);
+    }
+    if (path === "/projects/prj-acme")
+      return state.projects.has("prj-acme") ? Response.json(state.projects.get("prj-acme")) : missing();
+    if (path === "/environments/evm-acme")
+      return Response.json({ id: "evm-acme", name: "production", projectId: "prj-acme" });
+    if (path === "/postgres") {
+      if (method === "GET") return Response.json(state.database ? [{ postgres: state.database, cursor: "pg" }] : []);
+      assert.equal(body.environmentId, "evm-acme");
+      assert.equal(body.ownerId, "tea-acme");
+      assert.equal(body.version, "18");
+      assert.deepEqual(body.ipAllowList, []);
+      state.database = {
+        id: "dpg-acme",
+        name: body.name,
+        owner: { id: body.ownerId },
+        environmentId: body.environmentId,
+        region: body.region,
+        plan: body.plan,
+        diskSizeGB: body.diskSizeGB,
+        status: "available",
+        suspended: "not_suspended",
+      };
+      return Response.json(state.database);
+    }
+    if (path === "/postgres/dpg-acme/connection-info")
+      return Response.json({
+        internalConnectionString: "postgresql://qm:private-password@pg/qm",
+        externalConnectionString:
+          "postgresql://qm:private-password@pg.oregon-postgres.render.com:5432/qm?sslmode=require&application_name=qm#discard",
+      });
+    if (path === "/postgres/dpg-acme") {
+      if (!state.database) return missing();
+      if (method === "DELETE") {
+        state.database = undefined;
+        return empty();
+      }
+      if (method === "PATCH") Object.assign(state.database, body);
+      return Response.json(state.database);
+    }
+    if (path === "/services") {
+      if (method === "GET")
+        return Response.json(
+          [...state.services.values()]
+            .filter((item) => !url.searchParams.has("name") || item.name === url.searchParams.get("name"))
+            .map((service) => ({ service, cursor: service.id })),
+        );
+      assert.equal(body.environmentId, "evm-acme");
+      if (body.repo) {
+        assert.equal(body.image, undefined);
+        assert.equal(body.serviceDetails.runtime, "docker");
+        assert.equal(body.rootDir, "");
+        assert.equal(body.serviceDetails.envSpecificDetails.dockerContext, ".");
+        assert.match(body.serviceDetails.envSpecificDetails.dockerfilePath, /^(deploy|plugins)\/.+\/Dockerfile$/);
+      } else {
+        assert.equal(body.image.ownerId, "tea-acme");
+        assert.equal(body.serviceDetails.runtime, "image");
+      }
+      if (body.serviceDetails.disk && body.serviceDetails.maxShutdownDelaySeconds !== undefined)
+        return Response.json({ message: "Disk services cannot set maxShutdownDelaySeconds" }, { status: 400 });
+      assert.equal(body.autoDeploy, "no");
+      assert.ok(d.saved().pendingCreate);
+      const id = `srv-${body.name}`;
+      const service: Service = {
+        ...body,
+        id,
+        slug: `${body.name}-assigned`,
+        imagePath: body.image?.imagePath,
+        suspended: "not_suspended",
+        serviceDetails: {
+          ...body.serviceDetails,
+          url:
+            body.type === "private_service"
+              ? `${body.name}-assigned:10000`
+              : `https://${body.name}-assigned.onrender.com`,
+          ...(body.serviceDetails.disk ? { disk: { ...body.serviceDetails.disk, id: "dsk-minio" } } : {}),
+        },
+      };
+      state.services.set(id, service);
+      state.envs.set(
+        id,
+        Object.fromEntries(body.envVars.map((env: { key: string; value: string }) => [env.key, env.value])),
+      );
+      const deploy = { id: `dep-${++state.next}`, status: state.automaticDeployStatus, commit: { id: "b".repeat(40) } };
+      state.deploys.set(id, deploy);
+      state.deploysById.set(deploy.id, deploy);
+      return Response.json({ service, deployId: deploy.id });
+    }
+    const id = path.split("/")[2]!;
+    if (path.startsWith("/services/")) {
+      const service = state.services.get(id);
+      if (!service) return missing();
+      if (path === `/services/${id}`) {
+        if (method === "DELETE") {
+          state.services.delete(id);
+          return empty();
+        }
+        if (method === "PATCH") {
+          assert.equal(body.environmentId, undefined);
+          assert.equal(body.serviceDetails.numInstances, undefined);
+          if (service.serviceDetails.disk && body.serviceDetails.maxShutdownDelaySeconds !== undefined)
+            return Response.json({ message: "Disk services cannot set maxShutdownDelaySeconds" }, { status: 400 });
+          service.autoDeploy = body.autoDeploy;
+          if (body.repo) {
+            assert.equal(body.image, undefined);
+            assert.equal(body.serviceDetails.runtime, "docker");
+            service.repo = body.repo;
+            service.branch = body.branch;
+            service.rootDir = body.rootDir;
+            delete service.imagePath;
+          } else {
+            assert.equal(body.serviceDetails.runtime, "image");
+            service.imagePath = body.image.imagePath;
+            delete service.repo;
+            delete service.branch;
+          }
+          Object.assign(service.serviceDetails, body.serviceDetails);
+        }
+        return Response.json(service);
+      }
+      if (path === `/services/${id}/env-vars`) {
+        if (method === "GET")
+          return Response.json(
+            Object.entries(state.envs.get(id)!).map(([key, value]) => ({ envVar: { key, value }, cursor: key })),
+          );
+        state.envs.set(
+          id,
+          Object.fromEntries(body.map((item: { key: string; value: string }) => [item.key, item.value])),
+        );
+        return empty();
+      }
+      if (path === `/services/${id}/secret-files`) return empty();
+      if (path === `/services/${id}/custom-domains`) {
+        const domains = state.customDomains.get(id) ?? [];
+        if (method === "GET")
+          return Response.json(domains.map((customDomain) => ({ customDomain, cursor: customDomain.id })));
+        const record = (name: string, redirectForName: string): CustomDomainRecord => ({
+          id: `cd-${++state.next}`,
+          name,
+          domainType: name.split(".").length > 2 ? "subdomain" : "apex",
+          publicSuffix: name.split(".").at(-1)!,
+          verificationStatus: "unverified",
+          redirectForName,
+          createdAt: "2026-09-21T00:00:00Z",
+          server: { id, name: service.name },
+        });
+        const domain = record(body.name, "");
+        const created = domain.domainType === "apex" ? [domain, record(`www.${domain.name}`, domain.name)] : [domain];
+        state.customDomains.set(id, [...domains, ...created]);
+        return Response.json(created, { status: 201 });
+      }
+      if (path.startsWith(`/services/${id}/custom-domains/`)) {
+        const key = decodeURIComponent(path.split("/")[4]!);
+        const domain = (state.customDomains.get(id) ?? []).find((item) => item.id === key || item.name === key);
+        if (!domain) return missing();
+        if (path.endsWith("/verify")) return new Response("Custom domain verification triggered", { status: 202 });
+        return Response.json(domain);
+      }
+      if (path.startsWith(`/services/${id}/env-vars/`)) {
+        state.envs.get(id)![decodeURIComponent(path.split("/").at(-1)!)] = body.value;
+        return empty();
+      }
+      if (path === `/services/${id}/rollback`) {
+        const source = state.deploysById.get(body.deployId);
+        if (!source) return missing();
+        const deploy = { id: `dep-${++state.next}`, status: "live", commit: source.commit };
+        state.deploys.set(id, deploy);
+        state.deploysById.set(deploy.id, deploy);
+        return Response.json(deploy);
+      }
+      if (path === `/services/${id}/deploys`) {
+        if (method === "GET") return Response.json([{ deploy: state.deploys.get(id) }]);
+        const deploy = { id: `dep-${++state.next}`, status: state.nextDeployStatus, commit: { id: body.commitId } };
+        state.deploys.set(id, deploy);
+        state.deploysById.set(deploy.id, deploy);
+        return Response.json(deploy);
+      }
+      if (path.endsWith("/cancel") && path.includes("/deploys/")) {
+        state.deploys.get(id)!.status = "canceled";
+        return empty();
+      }
+      if (path.startsWith(`/services/${id}/deploys/`)) {
+        const deploy = state.deploysById.get(path.split("/").at(-1)!);
+        return deploy ? Response.json(deploy) : missing();
+      }
+      if (path === `/services/${id}/jobs` && method === "POST")
+        return Response.json({ id: "job-acmecanary", serviceId: id, status: "pending" }, { status: 201 });
+      if (path === `/services/${id}/jobs/job-acmecanary`)
+        return Response.json({ id: "job-acmecanary", serviceId: id, status: state.nextJobStatus });
+      if (path === `/services/${id}/jobs/job-acmecanary/cancel` && method === "POST")
+        return Response.json({ id: "job-acmecanary", serviceId: id, status: "canceled" });
+      if (path.endsWith("/suspend") || path.endsWith("/resume")) {
+        service.suspended = path.endsWith("/suspend") ? "suspended" : "not_suspended";
+        if (service.suspended === "not_suspended") {
+          const deploy = {
+            id: `dep-${++state.next}`,
+            status: state.automaticDeployStatus,
+            commit: { id: "b".repeat(40) },
+          };
+          state.deploys.set(id, deploy);
+          state.deploysById.set(deploy.id, deploy);
+        }
+        return empty();
+      }
+    }
+    if (path === "/disks/dsk-minio" && method === "PATCH") {
+      state.services.get("srv-acme-minio")!.serviceDetails.disk!.sizeGB = body.sizeGB;
+      return empty();
+    }
+    if (path === "/logs")
+      return Response.json({
+        logs: [{ id: "log-a", timestamp: "2026-09-12T00:00:00Z", message: "ready" }],
+        hasMore: false,
+      });
+    throw new Error(`Unexpected Render request ${method} ${path}`);
+  });
+  return state;
+}
+
+test("Render accepts null empty lists for projects, Postgres, and services", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  const resources = new Set(["/projects", "/postgres", "/services"]);
+  const received = new Set<string>();
+  c.intercept = ({ path, method }) => {
+    if (method !== "GET" || !resources.has(path)) return undefined;
+    received.add(path);
+    return Response.json(null);
+  };
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(received, resources);
+  assert.equal(c.projects.size, 1);
+  assert.ok(c.database);
+  assert.equal(c.services.size, 3);
+});
+
+test("Render appRegion changes the app creation default without moving deployment resources", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const resources = { ...d.saved().services };
+  d.ctx.config.render!.appRegion = "virginia";
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(d.saved().services, resources);
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_APP_REGION, "virginia");
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_REGION, "oregon");
+  assert.equal(c.database?.region, "oregon");
+  for (const service of c.services.values()) assert.equal(service.serviceDetails.region, "oregon");
+  d.ctx.config.env.core = { ...d.ctx.config.env.core, RENDER_APP_REGION: "ohio" };
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /RENDER_APP_REGION=virginia/.test(error.message)));
+  delete d.ctx.config.env.core.RENDER_APP_REGION;
+  d.ctx.config.secretEnv = { core: { RENDER_APP_REGION: "CUSTOM_APP_REGION" } };
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /RENDER_APP_REGION.*secretEnv/.test(error.message)));
+});
+
+for (const path of ["/projects", "/postgres", "/services"]) {
+  test(`Render rejects a non-array ${path} list with a clear error`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    c.intercept = (call) =>
+      call.path === path && call.method === "GET" ? Response.json({ unexpected: true }) : undefined;
+    await assert.rejects(d.backend.up({ dryRun: false }), {
+      message: `Render GET ${path} returned an invalid list response`,
+    });
+  });
+}
+
+const writes = (calls: Call[]) =>
+  calls.filter((call) => call.url.origin === "https://api.render.com" && call.method !== "GET");
+
+test("Render creates one project and wires MinIO credentials, URLs, Postgres, and repeat deployments", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.services.size, 3);
+  assert.equal(c.services.get("srv-acme-core")!.serviceDetails.healthCheckPath, "/healthz");
+  assert.equal(d.saved().environmentId, "evm-acme");
+  const minio = c.envs.get("srv-acme-minio")!;
+  const core = c.envs.get("srv-acme-core")!;
+  assert.equal(core.AWS_SECRET_ACCESS_KEY, minio.QM_STORAGE_SECRET_KEY);
+  assert.notEqual(minio.MINIO_ROOT_PASSWORD, core.AWS_SECRET_ACCESS_KEY);
+  assert.equal(core.AWS_ACCESS_KEY_ID, "qm-storage");
+  assert.equal(core.AWS_ENDPOINT_URL_S3, "https://acme-minio-assigned.onrender.com");
+  assert.equal(core.RENDER_PROJECT_ID, "prj-acme");
+  assert.equal(core.RENDER_POSTGRES_ID, "dpg-acme");
+  assert.equal(
+    core.RENDER_APP_DATABASE_ENDPOINT,
+    "postgresql://pg.oregon-postgres.render.com:5432/?sslmode=verify-full",
+  );
+  assert.equal(core.RENDER_ENVIRONMENT_ID, "evm-acme");
+  assert.equal(core.DATABASE_URL, "postgresql://qm:private-password@pg/qm");
+  assert.equal(core.PUBLIC_API_URL, "https://acme-core-assigned.onrender.com");
+  assert.equal(minio.MINIO_API_CORS_ALLOW_ORIGIN, "https://acme-web-ui-assigned.onrender.com");
+  assert.equal(minio.MINIO_BROWSER, "off");
+  assert.equal(
+    c.services.get("srv-acme-minio")!.serviceDetails.envSpecificDetails.dockerfilePath,
+    "deploy/render-minio/Dockerfile",
+  );
+  assert.equal(c.services.get("srv-acme-minio")!.serviceDetails.envSpecificDetails.dockerCommand, renderMinioCommand);
+  for (const [id, env] of c.envs)
+    if (id !== "srv-acme-minio") {
+      assert.equal(env.MINIO_ROOT_PASSWORD, undefined);
+      assert.equal(env.QM_STORAGE_SECRET_KEY, undefined);
+    }
+  const disk = readFileSync(join(d.ctx.configDir, "render.resources.json"), "utf8");
+  for (const secret of [minio.MINIO_ROOT_PASSWORD!, minio.QM_STORAGE_SECRET_KEY!, "private-password", "e".repeat(64)])
+    assert.equal(disk.includes(secret), false);
+  const first = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.ok(writes(c.calls.slice(first)).some((call) => call.path === "/services/srv-acme-core/deploys"));
+  assert.ok(!writes(c.calls.slice(first)).some((call) => call.path === "/services/srv-acme-minio/deploys"));
+  assert.equal(core.WORKERS, undefined);
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, minio.MINIO_ROOT_PASSWORD);
+});
+
+test("Render plan needs no API calls, Git repository, or state file", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: true });
+  assert.equal(c.calls.length, 0);
+  assert.equal(existsSync(join(d.ctx.configDir, "render.resources.json")), false);
+});
+
+for (const pid of [undefined, "invalid", "0"]) {
+  test(`Render recovers an old lock with PID ${pid ?? "missing"}`, async (t) => {
+    const d = deployment(t);
+    const path = join(d.ctx.configDir, ".render.lock");
+    mkdirSync(path);
+    if (pid !== undefined) writeFileSync(join(path, "pid"), pid);
+    const expired = new Date(Date.now() - 10_000);
+    utimesSync(path, expired, expired);
+    await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+    assert.equal(existsSync(path), false);
+  });
+}
+
+function hurryLockClock(t: TestContext): void {
+  let now = Date.now();
+  t.mock.method(Date, "now", () => (now += 1_000));
+}
+
+test("Render waits for a lock whose owner recorded no PID and reclaims it once it is stale", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  writeFileSync(join(path, "owner-unknown"), "not a pid");
+  let waited = 0;
+  const now = Date.now;
+  t.mock.method(Date, "now", () => now() + 1_000 * waited++);
+  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+  assert.ok(waited > 5);
+  assert.equal(existsSync(path), false);
+});
+
+test("Render keeps waiting when a lock owner disappears during the probe", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  symlinkSync(join(path, "missing"), join(path, "owner-releasing"));
+  hurryLockClock(t);
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
+  assert.deepEqual(readdirSync(path), ["owner-releasing"]);
+});
+
+test("Render waits for a lock holder that releases normally", { timeout: 10_000 }, async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { withRenderLock } from ${JSON.stringify(new URL("../src/render-lock.ts", import.meta.url).href)};
+await withRenderLock(${JSON.stringify(path)}, async () => {
+  process.send("locked");
+  await new Promise((resolve) => setTimeout(resolve, 400));
+});`,
+    ],
+    { stdio: ["ignore", "ignore", "inherit", "ipc"] },
+  );
+  const exited = once(child, "exit");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+  });
+  const [message] = await once(child, "message");
+  assert.equal(message, "locked");
+  assert.match(readdirSync(path)[0]!, /^owner-/);
+  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+  assert.equal(existsSync(path), false);
+  assert.deepEqual(await exited, [0, null]);
+});
+
+test("Render config normalizes legacy compute plan names to plan IDs", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-render-plans-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const raw = parseConfigJson(renderScaffold.renderConfig("acme", "anthropic", "resend")) as Record<string, any>;
+  raw.render.workspaceId = "tea-acme";
+  raw.render.corePlan = "standard";
+  raw.render.servicePlan = "starter";
+  raw.render.postgresPlan = "standard";
+  raw.render.storage = { plan: "pro" };
+  delete raw.modelProvider;
+  delete raw.secretEnv;
+  const configPath = join(dir, "qm.config.jsonc");
+  writeFileSync(configPath, JSON.stringify(raw));
+  const render = loadConfigAt(configPath).config.render!;
+  assert.equal(render.corePlan, "1c-2g");
+  assert.equal(render.servicePlan, "0.5c-512mb");
+  assert.equal(render.storage.plan, "2c-4g");
+  assert.equal(render.postgresPlan, "standard");
+});
+
+test("Render keeps a lock when its owner cannot be probed", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  writeFileSync(join(path, "pid"), String(process.pid));
+  t.mock.method(process, "kill", () => {
+    throw Object.assign(new Error("Operation not permitted"), { code: "EPERM" });
+  });
+  hurryLockClock(t);
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
+  assert.equal(readFileSync(join(path, "pid"), "utf8"), String(process.pid));
+});
+
+test("Render stale recovery preserves a replacement lock owner", async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  mkdirSync(path);
+  hurryLockClock(t);
+  const stalePid = process.pid + 1;
+  writeFileSync(join(path, "pid"), String(stalePid));
+  const replacement = `owner-${randomUUID()}`;
+  const kill = process.kill;
+  t.mock.method(process, "kill", (pid: number, signal?: number | NodeJS.Signals) => {
+    if (pid !== stalePid) return kill(pid, signal);
+    rmSync(path, { recursive: true });
+    mkdirSync(path);
+    writeFileSync(join(path, replacement), String(process.pid));
+    throw Object.assign(new Error("No such process"), { code: "ESRCH" });
+  });
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
+  assert.deepEqual(readdirSync(path), [replacement]);
+  assert.equal(readFileSync(join(path, replacement), "utf8"), String(process.pid));
+});
+
+test("Render protects a live owner and recovers its lock after SIGKILL", { timeout: 10_000 }, async (t) => {
+  const d = deployment(t);
+  const path = join(d.ctx.configDir, ".render.lock");
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { createRenderBackend } from ${JSON.stringify(new URL("../src/backends/render.ts", import.meta.url).href)};
+process.on("message", () => {});
+globalThis.fetch = async () => {
+  process.send("locked");
+  return new Promise(() => {});
+};
+await createRenderBackend(${JSON.stringify(d.ctx)}).up({ dryRun: false });`,
+    ],
+    { stdio: ["ignore", "ignore", "pipe", "ipc"] },
+  );
+  let stderr = "";
+  child.stderr!.on("data", (data: Buffer) => {
+    stderr += data.toString();
+  });
+  const exited = once(child, "exit");
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await exited;
+  });
+  const [message] = await Promise.race([
+    once(child, "message"),
+    exited.then(() => {
+      throw new Error(`Render lock owner exited before the API call: ${stderr}`);
+    }),
+  ]);
+  assert.equal(message, "locked");
+  const owner = readdirSync(path)[0]!;
+  assert.match(owner, /^owner-/);
+  assert.equal(readFileSync(join(path, owner), "utf8"), String(child.pid));
+  const expired = new Date(Date.now() - 10_000);
+  utimesSync(path, expired, expired);
+  hurryLockClock(t);
+  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
+  assert.equal(readFileSync(join(path, owner), "utf8"), String(child.pid));
+  child.kill("SIGKILL");
+  await exited;
+  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
+  assert.equal(existsSync(path), false);
+});
+
+test("Render waits for MinIO initialization before deploying core and retries a failed job", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.nextJobStatus = "failed";
+  await assert.rejects(d.backend.up({ dryRun: false }), /MinIO initialization job.*failed/);
+  assert.equal(
+    c.calls.some((call) => call.method === "POST" && call.path === "/services/srv-acme-core/deploys"),
+    false,
+  );
+  const before = c.calls.length;
+  c.nextJobStatus = "succeeded";
+  await d.backend.up({ dryRun: false });
+  const writesAfter = writes(c.calls.slice(before));
+  assert.equal(
+    writesAfter.some((call) => call.path === "/services"),
+    false,
+  );
+  const initialized = writesAfter.findIndex((call) => call.path === "/services/srv-acme-minio/jobs");
+  const coreDeploy = writesAfter.findIndex((call) => call.path === "/services/srv-acme-core/deploys");
+  assert.ok(initialized >= 0 && coreDeploy > initialized);
+  const command = (writesAfter[initialized]!.body as { startCommand: string }).startCommand;
+  const env = c.envs.get("srv-acme-minio")!;
+  for (const secret of [env.MINIO_ROOT_PASSWORD!, env.QM_STORAGE_SECRET_KEY!])
+    assert.equal(command.includes(secret), false);
+});
+
+test("Render builds QM services and MinIO from Git", async (t) => {
+  const d = deployment(t, true);
+  d.ctx.config.render!.source = { repo: "https://github.com/acme/qm", branch: "render-test" };
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const saved = d.saved();
+  assert.equal(c.services.size, 4);
+  for (const service of c.services.values()) {
+    if (service.id === "srv-acme-minio") continue;
+    assert.equal(service.repo, "https://github.com/acme/qm");
+    assert.equal(service.branch, "render-test");
+    assert.equal(service.imagePath, undefined);
+    assert.equal(service.serviceDetails.runtime, "docker");
+    assert.equal(service.autoDeploy, "no");
+  }
+  assert.equal(
+    c.services.get("srv-acme-minio")!.serviceDetails.envSpecificDetails.dockerfilePath,
+    "deploy/render-minio/Dockerfile",
+  );
+  assert.equal(c.services.get("srv-acme-minio")!.serviceDetails.runtime, "docker");
+  assert.equal(c.services.get("srv-acme-minio")!.repo, "https://github.com/acme/qm");
+  assert.equal(
+    c.services.get("srv-acme-portal")!.serviceDetails.envSpecificDetails.dockerfilePath,
+    "deploy/portal/Dockerfile",
+  );
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_REPO, "https://github.com/acme/qm");
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_BRANCH, "render-test");
+  c.services.get("srv-acme-minio")!.serviceDetails.plan = "starter";
+  c.services.get("srv-acme-core")!.serviceDetails.plan = "pro";
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(d.saved().services, saved.services);
+  const changes = writes(c.calls.slice(mark));
+  assert.ok(changes.some((call) => call.path === "/services/srv-acme-core/deploys" && call.method === "POST"));
+  assert.ok(!changes.some((call) => call.path === "/services/srv-acme-minio/deploys"));
+  assert.ok(!changes.some((call) => call.path === "/services/srv-acme-minio" && call.method === "PATCH"));
+  assert.ok(!changes.some((call) => call.path === "/services/srv-acme-core" && call.method === "PATCH"));
+});
+
+for (const [status, plan] of [
+  ["build_failed", undefined],
+  ["update_failed", "4c-8g"],
+] as const)
+  test(`Render recovers from ${status} without new services`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    if (plan) {
+      await d.backend.up({ dryRun: false });
+      d.ctx.config.render!.corePlan = plan;
+    }
+    c.nextDeployStatus = status;
+    await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(status));
+    if (plan) assert.equal(c.services.get("srv-acme-core")!.serviceDetails.plan, plan);
+    const mark = c.calls.length;
+    c.nextDeployStatus = "live";
+    await d.backend.up({ dryRun: false });
+    assert.ok(
+      c.calls.slice(mark).some((call) => call.path === "/services/srv-acme-core/deploys" && call.method === "POST"),
+    );
+    assert.equal(c.services.size, 3);
+    assert.equal(c.calls.filter((call) => call.path === "/services" && call.method === "POST").length, 3);
+  });
+
+test("Render retries after env write failure after a preceding service update succeeds", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.ctx.config.render!.corePlan = "4c-8g";
+  d.ctx.config.env.core!.FEATURE = "new";
+  c.intercept = (call) =>
+    call.path === "/services/srv-acme-core/env-vars" && call.method === "PUT"
+      ? new Response(null, { status: 500, headers: { "retry-after": "0" } })
+      : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.envs.get("srv-acme-core")!.FEATURE, "new");
+});
+
+test("Render retains completed resource IDs after a later create fails", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = (call) =>
+    call.path === "/services" && call.method === "POST" && (call.body as { name: string }).name === "acme-core"
+      ? Response.json(
+          { message: "plan is not available" },
+          { status: 400, headers: { "render-request-id": "req-core" } },
+        )
+      : undefined;
+  await assert.rejects(
+    d.backend.up({ dryRun: false }),
+    /POST \/services failed \(HTTP 400\): \{"message":"plan is not available"\} \[request id req-core\]/,
+  );
+  assert.equal(Object.keys(d.saved().services).length, 1);
+  assert.equal(d.saved().pendingCreate, undefined);
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.services.size, 3);
+});
+
+for (const status of ["live", "update_failed"]) {
+  test(`Render follows an empty accepted deploy response until the new deploy is ${status}`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    await d.backend.up({ dryRun: false });
+    const previous = c.deploys.get("srv-acme-core")!;
+    const mark = c.calls.length;
+    let queued = false;
+    let listReads = 0;
+    c.intercept = ({ path, method }) => {
+      if (path === "/services/srv-acme-core/deploys" && method === "POST") {
+        queued = true;
+        return new Response(null, { status: 202 });
+      }
+      if (path === "/services/srv-acme-core/deploys" && queued) {
+        const deploy =
+          ++listReads === 1
+            ? previous
+            : { id: "dep-queued", status: listReads === 2 ? "queued" : status, commit: { id: "a".repeat(40) } };
+        return Response.json([{ deploy }]);
+      }
+      if (path === "/services/srv-acme-core/deploys/dep-queued")
+        return Response.json({ id: "dep-queued", status, commit: { id: "a".repeat(40) } });
+      return undefined;
+    };
+    d.ctx.config.render!.corePlan = "4c-8g";
+    if (status === "live") {
+      await d.backend.up({ dryRun: false });
+    } else {
+      await assert.rejects(d.backend.up({ dryRun: false }), /dep-queued ended with update_failed/);
+    }
+    assert.equal(listReads, status === "live" ? 3 : 2);
+    assert.equal(
+      c.calls.slice(mark).filter((call) => call.path === "/services/srv-acme-core/deploys" && call.method === "POST")
+        .length,
+      1,
+    );
+    assert.equal(
+      c.calls.slice(mark).some((call) => call.path === `/services/srv-acme-core/deploys/${previous.id}`),
+      false,
+    );
+  });
+}
+
+test("Render cancels an active deploy before it submits an update", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const previous = c.deploys.get("srv-acme-core")!;
+  let canceled = false;
+  let triggered = false;
+  let readsAfterCancel = 0;
+  c.intercept = ({ path, method }) => {
+    if (path === "/services/srv-acme-core/deploys" && method === "GET" && !triggered)
+      return Response.json([
+        { deploy: previous },
+        {
+          deploy: { id: "dep-active", status: canceled && ++readsAfterCancel > 1 ? "canceled" : "update_in_progress" },
+        },
+      ]);
+    if (path === "/services/srv-acme-core/deploys/dep-active/cancel" && method === "POST") {
+      canceled = true;
+      return new Response(null, { status: 204 });
+    }
+    if (path === "/services/srv-acme-core/deploys" && method === "POST") {
+      assert.equal(canceled, true);
+      triggered = true;
+    }
+    return undefined;
+  };
+  d.ctx.config.render!.corePlan = "4c-8g";
+  await d.backend.up({ dryRun: false });
+  assert.equal(triggered, true);
+  assert.ok(readsAfterCancel >= 2);
+});
+
+for (const failure of ["connection closed", "HTTP 503"]) {
+  for (const path of ["/projects", "/postgres", "/services"]) {
+    test(`Render retries ${path} after ${failure} before creation`, async (t) => {
+      const d = deployment(t);
+      const c = cloud(t, d);
+      c.intercept = (call) => {
+        if (call.path !== path || call.method !== "POST") return undefined;
+        if (failure === "connection closed") throw new TypeError(failure);
+        return new Response(null, { status: 503 });
+      };
+      await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
+      assert.ok(d.saved().pendingCreate.startsWith(`${path}: `));
+      c.intercept = undefined;
+      const backend = hostingProvider("render").createBackend(d.ctx);
+      await backend.up({ dryRun: false });
+      assert.equal(d.saved().pendingCreate, undefined);
+      assert.equal(c.projects.size, 1);
+      assert.equal(c.services.size, 3);
+      assert.ok(c.database);
+      await backend.down({ purge: true });
+      assert.equal(c.services.size, 0);
+      assert.equal(c.database, undefined);
+    });
+  }
+
+  test(`Render permits cleanup after ${failure} before creation`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    c.intercept = ({ path, method }) => {
+      if (path !== "/services" || method !== "POST") return undefined;
+      if (failure === "connection closed") throw new TypeError(failure);
+      return new Response(null, { status: 503 });
+    };
+    await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
+    c.intercept = undefined;
+    await hostingProvider("render").createBackend(d.ctx).down({ purge: true });
+    assert.equal(d.saved().pendingCreate, undefined);
+    assert.equal(c.services.size, 0);
+    assert.equal(c.database, undefined);
+    writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"b".repeat(40)}' "$4"\n`);
+    await hostingProvider("render").createBackend(d.ctx).up({ dryRun: false });
+    assert.equal(d.saved().releases[0].commit, "b".repeat(40));
+  });
+}
+
+test("Render retains the creation request when its recovery lookup fails", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path === "/projects" && method === "POST") throw new TypeError("connection closed");
+    return undefined;
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
+  c.intercept = ({ path, method }) =>
+    path === "/projects" && method === "GET" ? new Response(null, { status: 503 }) : undefined;
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(d.saved().pendingCreate, undefined);
+});
+
+test("Render retains the creation request when its recovery lookup returns an empty body", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path === "/projects" && method === "POST") throw new TypeError("connection closed");
+    return undefined;
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
+  c.intercept = ({ path, method }) =>
+    path === "/projects" && method === "GET" ? new Response(null, { status: 200 }) : undefined;
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /invalid list response/);
+  await assert.rejects(async () => d.backend.down({ purge: true }), /invalid list response/);
+  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
+});
+
+test("Render records a resource after its accepted creation response is lost", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path !== "/projects" || method !== "POST") return undefined;
+    c.projects.set("prj-acme", {
+      id: "prj-acme",
+      name: "acme-qm",
+      owner: { id: "tea-acme" },
+      environmentIds: ["evm-acme"],
+    });
+    throw new TypeError("connection closed");
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
+  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  c.intercept = undefined;
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.equal(d.saved().pendingCreate, undefined);
+  assert.equal(d.saved().projectId, "prj-acme");
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/projects").length, 0);
+});
+
+test("Render retries a resource creation rejected by rate limiting", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = (call) =>
+    call.path === "/services" && call.method === "POST" ? new Response(null, { status: 429 }) : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 429/);
+  assert.equal(d.saved().pendingCreate, undefined);
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.services.size, 3);
+});
+
+test("Render retries transient API failures for idempotent requests and only rate limits for creations", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  const injected = new Set<string>();
+  const once = (key: string, fail: () => Response) => {
+    if (injected.has(key)) return undefined;
+    injected.add(key);
+    return fail();
+  };
+  const transient = (status: number) => () => new Response(null, { status, headers: { "retry-after": "0" } });
+  c.intercept = ({ path, method }) => {
+    if (method === "GET" && path === "/owners/tea-acme") return once("owner", transient(503));
+    if (method === "POST" && path === "/projects") return once("project", transient(429));
+    if (method === "PUT" && path === "/services/srv-acme-core/env-vars")
+      return once("env", () => {
+        throw new TypeError("connection reset");
+      });
+    return undefined;
+  };
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual([...injected], ["owner", "project", "env"]);
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.calls.filter((call) => call.method === "POST" && call.path === "/projects").length, 2);
+  c.intercept = ({ path, method }) =>
+    method === "POST" && path === "/services/srv-acme-core/deploys"
+      ? new Response(null, { status: 503, headers: { "retry-after": "0" } })
+      : undefined;
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+  assert.equal(
+    c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/services/srv-acme-core/deploys")
+      .length,
+    1,
+  );
+  c.intercept = ({ path, method }) => {
+    if (method !== "DELETE" || path !== "/services/srv-acme-core") return undefined;
+    return once("delete", () => {
+      c.services.delete("srv-acme-core");
+      return new Response(null, { status: 502, headers: { "retry-after": "0" } });
+    });
+  };
+  await d.backend.down({ purge: true });
+  assert.ok(injected.has("delete"));
+  assert.equal(c.services.size, 0);
+  assert.deepEqual(d.saved().services, {});
+});
+
+test("Render rejects unrecorded same-name resources and changed ownership before mutations", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.projects.set("prj-existing", {
+    id: "prj-existing",
+    name: "acme-qm",
+    owner: { id: "tea-acme" },
+    environmentIds: [],
+  });
+  await assert.rejects(d.backend.up({ dryRun: false }), /Refusing to adopt/);
+  assert.deepEqual(writes(c.calls), []);
+  c.projects.clear();
+  await d.backend.up({ dryRun: false });
+  c.services.get("srv-acme-web-ui")!.environmentId = "evm-other";
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /does not match/);
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
+  await assert.rejects(async () => d.backend.down({ purge: true }), /does not match/);
+  assert.equal(c.services.size, 3);
+});
+
+test("Render stops services and resumes them while retaining database and disk", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  await d.backend.down({});
+  assert.equal(c.services.get("srv-acme-minio")!.suspended, "suspended");
+  assert.ok(c.database);
+  assert.equal(c.services.size, 3);
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.ok([...c.services.values()].every((service) => service.suspended === "not_suspended"));
+  assert.equal(
+    c.calls.slice(mark).some((call) => call.path.endsWith("/deploys") && call.method === "POST"),
+    true,
+  );
+});
+
+for (const [name, externalConnectionString] of [
+  ["missing", undefined],
+  ["malformed", "private-password"],
+  ["wrong protocol", "https://qm:private-password@pg.oregon-postgres.render.com/qm"],
+] as const)
+  test(`Render rejects ${name} external database connection details before service creation`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    c.intercept = (call) =>
+      call.path === "/postgres/dpg-acme/connection-info"
+        ? Response.json({
+            internalConnectionString: "postgresql://qm:private-password@pg/qm",
+            externalConnectionString,
+          })
+        : undefined;
+    await assert.rejects(d.backend.up({ dryRun: false }), (error: Error) => {
+      assert.match(error.message, /no valid external Postgres connection string/);
+      assert.doesNotMatch(error.message, /private-password/);
+      return true;
+    });
+    assert.equal(c.services.size, 0);
+    assert.equal(
+      writes(c.calls).some((call) => call.path === "/postgres/dpg-acme" && call.method === "PATCH"),
+      false,
+    );
+  });
+
+test("Render shutdown ignores app services outside the saved project", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const app = {
+    ...c.services.get("srv-acme-web-ui")!,
+    id: "srv-other-project-app",
+    name: "qm-app-other",
+    type: "private_service",
+    environmentId: "evm-other-project",
+  };
+  c.services.set(app.id, app);
+  c.envs.set(app.id, { QM_DEPLOYMENT_ID: "00000000-0000-4000-8000-000000000002" });
+  const mark = c.calls.length;
+  await d.backend.down({});
+  assert.equal(app.suspended, "not_suspended");
+  assert.ok(c.calls.slice(mark).every((call) => !call.path.startsWith(`/services/${app.id}`)));
+});
+
+for (const serviceType of ["web_service", "private_service"])
+  test(`Render protects published ${serviceType} apps in owner environments before shutdown or purge`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    await d.backend.up({ dryRun: false });
+    const app = {
+      ...c.services.get("srv-acme-web-ui")!,
+      id: "srv-published-app",
+      name: "qm-app-a1",
+      environmentId: "evm-owner",
+      type: serviceType,
+    };
+    c.projects.get("prj-acme")!.environmentIds.push("evm-owner");
+    c.services.set(app.id, app);
+    c.envs.set(app.id, { QM_DEPLOYMENT_ID: "00000000-0000-4000-8000-000000000001" });
+    for (const environmentId of ["evm-acme", "evm-owner"]) {
+      app.environmentId = environmentId;
+      for (const purge of [false, true]) {
+        const mark = c.calls.length;
+        await assert.rejects(async () => d.backend.down({ purge }), /Published apps still use this deployment/);
+        assert.deepEqual(writes(c.calls.slice(mark)), []);
+        assert.equal(d.saved().pendingPurge, undefined);
+      }
+    }
+    app.suspended = "suspended";
+    await assert.rejects(async () => d.backend.down({ purge: true }), /Published apps still use this deployment/);
+    await d.backend.down({});
+    assert.ok(c.database);
+  });
+
+test("Render purge resumes partial deletion and retains the project", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  c.intercept = (call) =>
+    call.path === "/services/srv-acme-core" && call.method === "DELETE"
+      ? new Response(null, { status: 500 })
+      : undefined;
+  await assert.rejects(async () => d.backend.down({ purge: true }), /HTTP 500/);
+  assert.equal(d.saved().pendingPurge, true);
+  assert.ok(c.database);
+  await assert.rejects(d.backend.up({ dryRun: false }), /cleanup is incomplete/);
+  c.intercept = undefined;
+  await d.backend.down({ purge: true });
+  assert.equal(c.services.size, 0);
+  assert.equal(c.database, undefined);
+  assert.equal(c.projects.size, 1);
+  assert.deepEqual(d.saved().services, {});
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.services.size, 3);
+});
+
+test("Render secret push targets consumers and keeps managed MinIO credentials", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  c.envs.get("srv-acme-core")!.AWS_SESSION_TOKEN = "old-session";
+  writeFileSync(
+    join(d.ctx.configDir, ".env"),
+    `${readFileSync(join(d.ctx.configDir, ".env"), "utf8")}\nAWS_SESSION_TOKEN=\n`,
+  );
+  await d.backend.secretsPush();
+  assert.equal(c.envs.get("srv-acme-core")!.AWS_SESSION_TOKEN, "old-session");
+  assert.equal(c.envs.get("srv-acme-web-ui")!.AWS_SECRET_ACCESS_KEY, undefined);
+  await d.backend.up({ dryRun: false });
+});
+
+test("Render updates retain stored operator secrets for the core", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  c.envs.get("srv-acme-core")!.RESEND_API_KEY = "re_stored_only";
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.envs.get("srv-acme-core")!.RESEND_API_KEY, "re_stored_only");
+  assert.equal(c.envs.get("srv-acme-web-ui")!.RESEND_API_KEY, undefined);
+});
+
+test("Render rejects disk shrink, plain HTTP URLs, and a shared hostname", async (t) => {
+  const d = deployment(t);
+  cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  if (d.ctx.config.render!.storage.type === "minio") d.ctx.config.render!.storage.diskSizeGB = 1;
+  await assert.rejects(d.backend.up({ dryRun: false }), /cannot shrink/);
+  for (const publicUrl of ["http://qm.example.com", "https://qm.example.com:8443"]) {
+    d.ctx.config.publicUrl = publicUrl;
+    assert.ok(
+      renderConfigErrors(d.ctx.config, []).some((error) => /HTTPS origin URLs on port 443/.test(error.message)),
+    );
+  }
+  d.ctx.config.publicUrl = "https://qm.example.com";
+  d.ctx.config.apiUrl = "https://qm.example.com/";
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /different hostnames/.test(error.message)));
+  d.ctx.config.apiUrl = "https://www.qm.example.com";
+  assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /www subdomain/.test(error.message)));
+  d.ctx.config.apiUrl = "https://api.qm.example.com";
+  assert.deepEqual(renderConfigErrors(d.ctx.config, []), []);
+});
+
+test("Render binds operator custom domains and checks their verification live", async (t) => {
+  const d = deployment(t, true);
+  mkdirSync(d.ctx.sandboxDir);
+  const c = cloud(t, d);
+  const raw = JSON.parse(readFileSync(d.ctx.configPath, "utf8"));
+  Object.assign(raw, { publicUrl: "https://acme.example", apiUrl: "https://api.acme.example" });
+  writeFileSync(d.ctx.configPath, JSON.stringify(raw));
+  Object.assign(d.ctx.config, { publicUrl: raw.publicUrl, apiUrl: raw.apiUrl });
+  const domainWrites = (calls: Call[]) =>
+    writes(calls)
+      .filter((call) => call.path.includes("/custom-domains"))
+      .map((call) => [call.method, call.path.replace(/cd-\d+/, "cd"), call.body]);
+  const application = (calls: Call[], path: string) =>
+    calls
+      .filter((call) => call.url.origin !== "https://api.render.com" && call.path === path)
+      .map((call) => call.url.origin);
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls), [
+    ["POST", "/services/srv-acme-core/custom-domains", { name: "api.acme.example" }],
+    ["POST", "/services/srv-acme-portal/custom-domains", { name: "acme.example" }],
+  ]);
+  assert.equal(readFileSync(d.ctx.configPath, "utf8"), JSON.stringify(raw));
+  assert.equal(d.ctx.config.apiUrl, "https://api.acme.example");
+  assert.equal(c.envs.get("srv-acme-core")!.PUBLIC_API_URL, "https://api.acme.example");
+  assert.equal(c.envs.get("srv-acme-core")!.PUBLIC_WEB_URL, "https://acme.example");
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_API_CORS_ALLOW_ORIGIN, "https://acme.example");
+  assert.deepEqual([...new Set(application(c.calls, "/healthz"))], ["https://acme-core-assigned.onrender.com"]);
+  assert.deepEqual(application(c.calls, "/v1/deployment-layer"), ["https://acme-core-assigned.onrender.com"]);
+  assert.deepEqual(
+    c.customDomains.get("srv-acme-portal")!.map((domain) => [domain.name, domain.redirectForName]),
+    [
+      ["acme.example", ""],
+      ["www.acme.example", "acme.example"],
+    ],
+  );
+  let mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls.slice(mark)), [
+    ["POST", "/services/srv-acme-core/custom-domains/cd/verify", undefined],
+    ["POST", "/services/srv-acme-portal/custom-domains/cd/verify", undefined],
+  ]);
+  d.ctx.config.publicUrl = "https://www.acme.example";
+  const redirected =
+    /acme-portal: www\.acme\.example redirects to acme\.example on Render; configure https:\/\/acme\.example/;
+  await assert.rejects(d.backend.up({ dryRun: false }), redirected);
+  d.ctx.config.publicUrl = "https://acme.example";
+  await assert.rejects(
+    async () => d.backend.checkLive!(),
+    /acme-core: custom domain api\.acme\.example is unverified; point api\.acme\.example at acme-core-assigned\.onrender\.com with a CNAME record/,
+  );
+  c.customDomains.get("srv-acme-core")![0]!.verificationStatus = "verified";
+  d.ctx.config.publicUrl = "https://www.acme.example";
+  await assert.rejects(async () => d.backend.checkLive!(), redirected);
+  d.ctx.config.publicUrl = "https://acme.example";
+  await assert.rejects(
+    async () => d.backend.checkLive!(),
+    /acme-portal: custom domain acme\.example is unverified; point acme\.example at acme-portal-assigned\.onrender\.com with an ALIAS or ANAME record/,
+  );
+  c.customDomains.get("srv-acme-portal")![0]!.verificationStatus = "verified";
+  mark = c.calls.length;
+  await d.backend.checkLive!();
+  assert.deepEqual(application(c.calls.slice(mark), "/healthz"), ["https://api.acme.example", "https://acme.example"]);
+  assert.deepEqual(application(c.calls.slice(mark), "/v1/deployment-layer"), ["https://api.acme.example"]);
+  await d.backend.status();
+  c.customDomains.set("srv-acme-portal", []);
+  await assert.rejects(async () => d.backend.checkLive!(), /acme-portal has no custom domain acme\.example; run qm up/);
+  mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls.slice(mark)), [
+    ["POST", "/services/srv-acme-portal/custom-domains", { name: "acme.example" }],
+  ]);
+  Object.assign(raw, { publicUrl: "https://acme-portal.onrender.com", apiUrl: "https://acme-core.onrender.com" });
+  writeFileSync(d.ctx.configPath, JSON.stringify(raw));
+  Object.assign(d.ctx.config, { publicUrl: raw.publicUrl, apiUrl: raw.apiUrl });
+  mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual(domainWrites(c.calls.slice(mark)), []);
+  assert.equal(d.ctx.config.publicUrl, "https://acme-portal-assigned.onrender.com");
+  assert.equal(loadConfigAt(d.ctx.configPath).config.apiUrl, "https://acme-core-assigned.onrender.com");
+});
+
+test("Render reports status, logs, and signed layer health from saved IDs", async (t) => {
+  const d = deployment(t, true);
+  mkdirSync(d.ctx.sandboxDir);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  await d.backend.status();
+  await d.backend.logs("core", { follow: false, tail: 10 });
+  await d.backend.checkLive!();
+  const layerCalls = c.calls.filter((call) => call.path === "/v1/deployment-layer");
+  assert.deepEqual(
+    layerCalls.map((call) => call.method),
+    ["PUT", "GET"],
+  );
+  assert.ok(layerCalls.every((call) => call.url.origin === "https://acme-core-assigned.onrender.com"));
+  assert.equal(d.ctx.config.publicUrl, "https://acme-portal-assigned.onrender.com");
+  const logCalls = c.calls.filter((call) => call.path === "/logs");
+  assert.ok(logCalls.some((call) => call.url.searchParams.get("resource") === "srv-acme-core"));
+  for (const call of logCalls) {
+    const startTime = call.url.searchParams.get("startTime");
+    assert.ok(
+      startTime === null || Date.parse(startTime) >= Date.now() - 30 * 24 * 60 * 60_000,
+      `Render rejects log queries that start more than 30 days ago: ${call.url.search}`,
+    );
+  }
+  assert.deepEqual(c.calls.find((call) => call.path === "/services/srv-acme-core/jobs")?.body, {
+    startCommand:
+      "timeout -s TERM -k 30 1200 node src/deployment/postdeploy-smoke.ts session http://acme-core-assigned:8080",
+  });
+});
+
+test("Render layer transport rejects missing or invalid core URLs before sending a request", async (t) => {
+  const d = deployment(t);
+  let requests = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    requests++;
+    return new Response("ok");
+  });
+  for (const apiUrl of [
+    undefined,
+    "http://core.onrender.com",
+    "https://user:password@core.onrender.com",
+    "https://core.onrender.com:8443",
+    "https://core.onrender.com/path",
+    "https://core.onrender.com?query=value",
+    "https://core.onrender.com#fragment",
+  ]) {
+    d.ctx.config.apiUrl = apiUrl;
+    await assert.rejects(
+      () =>
+        renderDeploymentLayerTransport({
+          config: d.ctx.config,
+          configDir: d.ctx.configDir,
+          method: "GET",
+          body: "",
+        }),
+      /Render requires apiUrl|Render deployment-layer URL must be/,
+    );
+  }
+  assert.equal(requests, 0);
+});
+
+test("Render live checks reject foreign resources and stale URLs before starting a canary", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const core = c.services.get("srv-acme-core")!;
+  core.ownerId = "tea-other";
+  await assert.rejects(async () => d.backend.checkLive!(), /does not match/);
+  core.ownerId = "tea-acme";
+  d.ctx.config.apiUrl = "https://other-core.onrender.com";
+  await assert.rejects(async () => d.backend.checkLive!(), /URLs do not match/);
+  d.ctx.config.apiUrl = core.serviceDetails.url;
+  core.slug = "core; unexpected-command";
+  await assert.rejects(async () => d.backend.checkLive!(), /invalid private hostname/);
+  assert.equal(
+    c.calls.some((call) => call.path === "/services/srv-acme-core/jobs"),
+    false,
+  );
+});
+
+test("Render live checks fail on failed and canceled canaries and identify their logs", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  for (const status of ["failed", "canceled"]) {
+    c.nextJobStatus = status;
+    await assert.rejects(
+      async () => d.backend.checkLive!({ report: false }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, new RegExp(`job-acmecanary ended with ${status}`));
+        assert.match(error.message, /GET \/v1\/logs\?ownerId=tea-acme&resource=job-acmecanary/);
+        return true;
+      },
+    );
+  }
+  assert.equal(
+    c.calls.some((call) => call.path.includes("/jobs/") && call.path.endsWith("/cancel")),
+    false,
+  );
+});
+
+test("Render live checks cancel a job that exceeds the deadline", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  c.nextJobStatus = "running";
+  c.intercept = (call) => {
+    if (call.path === "/services/srv-acme-core/jobs/job-acmecanary") now += 21 * 60_000;
+    return undefined;
+  };
+  await assert.rejects(
+    async () => d.backend.checkLive!({ report: false }),
+    /job-acmecanary did not finish within 20 minutes/,
+  );
+  assert.equal(
+    c.calls.filter((call) => call.path.includes("/jobs/") && call.path.endsWith("/cancel") && call.method === "POST")
+      .length,
+    1,
+  );
+});
+
+test("Render live checks cancel after a polling failure and report cleanup failures", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  c.intercept = (call) =>
+    call.path === "/services/srv-acme-core/jobs/job-acmecanary" || call.path.endsWith("/cancel")
+      ? new Response(null, { status: 503 })
+      : undefined;
+  await assert.rejects(
+    async () => d.backend.checkLive!({ report: false }),
+    /job-acmecanary.*HTTP 503.*cancellation failed/,
+  );
+  assert.equal(
+    c.calls.filter((call) => call.path.includes("/jobs/") && call.path.endsWith("/cancel") && call.method === "POST")
+      .length,
+    1,
+  );
+});
+
+test("private Render addresses use the workload port", () => {
+  assert.equal(
+    renderInternalUrl({
+      name: "web-ui",
+      slug: "qm-web-abcd",
+    }),
+    "http://qm-web-abcd:8080",
+  );
+  for (const slug of ["", "web.onrender.com", "web:8080", "web/path", "web; command"])
+    assert.throws(() => renderInternalUrl({ name: "web-ui", slug }), /invalid private hostname/);
+});
+
+test("Render connects a private web UI to the public portal and copies shared auth secrets", async (t) => {
+  const d = deployment(t, true);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const portal = c.envs.get("srv-acme-portal")!;
+  const core = c.envs.get("srv-acme-core")!;
+  assert.equal(portal.CORE_API_URL, "http://acme-core-assigned:8080");
+  assert.equal(c.envs.get("srv-acme-web-ui")!.CORE_API_URL, "http://acme-core-assigned:8080");
+  assert.equal(core.PUBLIC_API_URL, "https://acme-core-assigned.onrender.com");
+  assert.equal(c.services.get("srv-acme-web-ui")!.type, "private_service");
+  assert.equal(portal.WEB_UI_UPSTREAM, "http://acme-web-ui-assigned:8080");
+  assert.equal(portal.ADMIN_UPSTREAM, "http://acme-web-ui-assigned:8080/admin");
+  assert.equal(d.ctx.config.publicUrl, "https://acme-portal-assigned.onrender.com");
+  assert.equal(portal.AUTH_CLIENT_SECRET, portal.OIDC_CLIENT_SECRET);
+  assert.equal(portal.CORE_SIGNING_SECRET, core.CORE_SIGNING_SECRET);
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_BROWSER, "off");
+});
+
+test("Render restores remote drift and grows storage without replacing resources", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const root = c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD;
+  c.services.get("srv-acme-core")!.imagePath = "example.com/wrong:latest";
+  c.envs.get("srv-acme-core")!.DEPLOY_PROVIDER = "fly";
+  if (d.ctx.config.render!.storage.type === "minio") d.ctx.config.render!.storage.diskSizeGB = 20;
+  d.ctx.config.render!.postgresDiskSizeGB = 20;
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.envs.get("srv-acme-core")!.DEPLOY_PROVIDER, "render");
+  assert.equal(c.services.get("srv-acme-minio")!.serviceDetails.disk!.sizeGB, 20);
+  assert.equal(c.database!.diskSizeGB, 20);
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, root);
+  assert.equal(
+    c.calls.slice(mark).some((call) => call.path === "/services" && call.method === "POST"),
+    false,
+  );
+});
+
+test("Render rollback restores the previous service builds without changing stored data", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const release = d.saved().releases[0].services;
+  await d.backend.up({ dryRun: false });
+  const mark = c.calls.length;
+  const secret = c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY;
+  await d.backend.rollback();
+  assert.deepEqual(
+    writes(c.calls.slice(mark))
+      .filter((call) => call.path.endsWith("/rollback"))
+      .map((call) => [call.path, call.body]),
+    [
+      ["/services/srv-acme-core/rollback", { deployId: release.core }],
+      ["/services/srv-acme-web-ui/rollback", { deployId: release["web-ui"] }],
+    ],
+  );
+  assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, secret);
+  assert.equal(c.database?.id, "dpg-acme");
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, d.saved().releases[0].commit);
+  assert.equal(c.envs.get("srv-acme-core")!.GIT_SHA, d.saved().releases[0].commit);
+});
+
+test("Render rejects a live service built from a different source commit", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path !== "/services/srv-acme-core/deploys" || method !== "POST") return undefined;
+    const deploy = { id: "dep-wrong", status: "live", commit: { id: "b".repeat(40) } };
+    c.deploys.set("srv-acme-core", deploy);
+    c.deploysById.set(deploy.id, deploy);
+    return Response.json(deploy);
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /deployed commit b+.*expected a+/);
+  assert.equal(d.saved().releases, undefined);
+  assert.equal(d.saved().updateInProgress, true);
+});
+
+test("Render resumes rollback to the last good release after a partial update", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const successful = d.saved();
+  c.intercept = ({ path, method }) =>
+    path === "/services/srv-acme-web-ui/deploys" && method === "POST" ? new Response(null, { status: 500 }) : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
+  assert.equal(d.saved().updateInProgress, true);
+  assert.equal(d.saved().releases.length, 1);
+  c.intercept = ({ path, method }) =>
+    path === "/services/srv-acme-web-ui/rollback" && method === "POST"
+      ? new Response(null, { status: 500 })
+      : undefined;
+  await assert.rejects(async () => d.backend.rollback(), /HTTP 500/);
+  assert.ok(d.saved().rollbackProgress.restored.core);
+  const mark = c.calls.length;
+  c.intercept = undefined;
+  await d.backend.rollback();
+  assert.deepEqual(
+    writes(c.calls.slice(mark))
+      .filter((call) => call.path.endsWith("/rollback"))
+      .map((call) => [call.path, call.body]),
+    [["/services/srv-acme-web-ui/rollback", { deployId: successful.releases[0].services["web-ui"] }]],
+  );
+  assert.equal(d.saved().rollbackProgress, undefined);
+  assert.equal(d.saved().updateInProgress, undefined);
+});
+
+test("Render creates services with a no-op command and cancels the automatic build before pinning", async (t) => {
+  const d = deployment(t);
+  mkdirSync(join(d.ctx.configDir, "plugins", "reports"), { recursive: true });
+  writeFileSync(join(d.ctx.configDir, "plugins", "reports", "Dockerfile"), "FROM node:24\n");
+  const c = cloud(t, d);
+  const canceled = new Set<string>();
+  c.intercept = ({ path, method, body }) => {
+    if (method === "POST" && path === "/services") {
+      const create = body as {
+        envVars: Array<{ key: string }>;
+        secretFiles: unknown[];
+        serviceDetails: { envSpecificDetails: { dockerCommand: string } };
+      };
+      assert.ok(create.envVars.some((pair) => pair.key === "PORT"));
+      assert.deepEqual(create.secretFiles, []);
+      assert.equal(create.serviceDetails.envSpecificDetails.dockerCommand, "/bin/sh -c exit 0");
+    }
+    const serviceId = path.split("/")[2]!;
+    if (path.includes("/deploys/") && path.endsWith("/cancel")) {
+      canceled.add(serviceId);
+      assert.equal(c.deploys.get(serviceId)!.commit?.id, "b".repeat(40));
+    }
+    if (method === "POST" && path.endsWith("/deploys")) {
+      assert.ok(canceled.has(serviceId));
+      assert.equal((body as { commitId: string }).commitId, "a".repeat(40));
+      assert.notEqual(c.services.get(serviceId)!.serviceDetails.envSpecificDetails.dockerCommand, "/bin/sh -c exit 0");
+    }
+    return undefined;
+  };
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.services.size, 4);
+  assert.equal(canceled.size, 4);
+});
+
+test("Render resumes a suspended service with a no-op command and keeps its credentials across an interrupted resume", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const storage = { ...c.envs.get("srv-acme-minio")! };
+  await d.backend.down({});
+  let interrupted = false;
+  c.intercept = ({ path, method }) => {
+    if (path === "/services/srv-acme-minio/resume" && method === "POST") {
+      assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
+      assert.equal(
+        c.services.get("srv-acme-minio")!.serviceDetails.envSpecificDetails.dockerCommand,
+        "/bin/sh -c exit 0",
+      );
+    }
+    if (path.startsWith("/services/srv-acme-minio/deploys/") && path.endsWith("/cancel") && !interrupted) {
+      interrupted = true;
+      return new Response(null, { status: 500 });
+    }
+    return undefined;
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
+  const recorded = readFileSync(join(d.ctx.configDir, "render.resources.json"), "utf8");
+  for (const value of [storage.MINIO_ROOT_PASSWORD!, storage.QM_STORAGE_SECRET_KEY!, "e".repeat(64)])
+    assert.ok(!recorded.includes(value));
+  const mark = c.calls.length;
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.calls.slice(mark).filter((call) => call.path === "/services/srv-acme-minio/resume").length, 0);
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
+  assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, storage.QM_STORAGE_SECRET_KEY);
+});
+
+test("Render deploys the current branch commit when an interrupted bootstrap retries after the branch moves", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path }) =>
+    path.includes("/deploys/") && path.endsWith("/cancel") ? new Response(null, { status: 500 }) : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
+  writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${"c".repeat(40)}' "$4"\n`);
+  c.intercept = undefined;
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  const pinned = c.calls.slice(mark).filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
+  assert.equal(pinned.length, 3);
+  for (const call of pinned) assert.equal((call.body as { commitId: string }).commitId, "c".repeat(40));
+  assert.equal(d.saved().releases[0].commit, "c".repeat(40));
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "c".repeat(40));
+});
+
+for (const resource of ["retained", "deleted", "not created"]) {
+  test(`Render ignores an interrupted plugin bootstrap after the plugin is removed and its service is ${resource}`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    await d.backend.up({ dryRun: false });
+    const pluginDir = join(d.ctx.configDir, "plugins", "reports");
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, "Dockerfile"), "FROM node:24\n");
+    c.intercept = ({ path, method, body }) => {
+      if (resource === "not created")
+        return path === "/services" && method === "POST" && (body as { name: string }).name === "acme-reports"
+          ? new Response(null, { status: 503 })
+          : undefined;
+      return path.startsWith("/services/srv-acme-reports/deploys/") && path.endsWith("/cancel")
+        ? new Response(null, { status: 503 })
+        : undefined;
+    };
+    await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+    if (resource === "deleted") {
+      c.services.delete("srv-acme-reports");
+      c.envs.delete("srv-acme-reports");
+      c.deploys.delete("srv-acme-reports");
+    }
+    rmSync(pluginDir, { recursive: true });
+    c.intercept = undefined;
+    for (const commit of ["c".repeat(40), "d".repeat(40)]) {
+      writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${commit}' "$4"\n`);
+      const mark = c.calls.length;
+      await hostingProvider("render").createBackend(d.ctx).up({ dryRun: false });
+      const calls = c.calls.slice(mark);
+      const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
+      assert.deepEqual(
+        deploys.map((call) => (call.body as { commitId: string }).commitId),
+        [commit, commit],
+      );
+      assert.equal(d.saved().releases[0].commit, commit);
+      assert.equal(d.saved().pendingCreate, undefined);
+      assert.equal(Boolean(d.saved().services.reports), resource === "retained");
+      assert.equal(
+        calls.some((call) => call.method !== "GET" && call.path.includes("srv-acme-reports")),
+        false,
+      );
+    }
+    mkdirSync(pluginDir, { recursive: true });
+    writeFileSync(join(pluginDir, "Dockerfile"), "FROM node:24\n");
+    const commit = "e".repeat(40);
+    writeFileSync(join(d.ctx.configDir, "bin", "git"), `#!/bin/sh\nprintf '%s\t%s\n' '${commit}' "$4"\n`);
+    const mark = c.calls.length;
+    await d.backend.up({ dryRun: false });
+    const calls = c.calls.slice(mark);
+    assert.equal(d.saved().releases[0].commit, commit);
+    const deploys = calls.filter((call) => call.method === "POST" && call.path.endsWith("/deploys"));
+    assert.deepEqual(
+      deploys.map((call) => (call.body as { commitId: string }).commitId),
+      [commit, commit, commit],
+    );
+    assert.equal(
+      calls.filter((call) => call.method === "POST" && call.path === "/services").length,
+      resource === "retained" ? 0 : 1,
+    );
+    assert.equal(c.deploys.get("srv-acme-reports")!.status, "live");
+  });
+}
+
+test("Render retries a rejected resume without losing retained storage credentials", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const password = c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD;
+  await d.backend.down({});
+  c.intercept = ({ path }) =>
+    path === "/services/srv-acme-minio/resume" ? new Response(null, { status: 429 }) : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 429/);
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, password);
+});
+
+for (const failure of ["connection closed", "HTTP 503"]) {
+  test(`Render retries ${failure} before resume and retains storage credentials`, async (t) => {
+    const d = deployment(t);
+    const c = cloud(t, d);
+    await d.backend.up({ dryRun: false });
+    const storage = { ...c.envs.get("srv-acme-minio")! };
+    await d.backend.down({});
+    c.intercept = ({ path, method }) => {
+      if (path !== "/services/srv-acme-minio/resume" || method !== "POST") return undefined;
+      if (failure === "connection closed") throw new TypeError(failure);
+      return new Response(null, { status: 503 });
+    };
+    await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
+    assert.equal(c.services.get("srv-acme-minio")!.suspended, "suspended");
+    c.intercept = undefined;
+    const backend = hostingProvider("render").createBackend(d.ctx);
+    await backend.up({ dryRun: false });
+    assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
+    assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, storage.QM_STORAGE_SECRET_KEY);
+    assert.equal(c.calls.filter((call) => call.path === "/services/srv-acme-minio/resume").length, 2);
+    await backend.down({ purge: true });
+    assert.equal(c.services.size, 0);
+    assert.equal(c.database, undefined);
+  });
+}
+
+test("Render records a service after its creation reply is lost and ignores same-named services elsewhere", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const core = c.services.get("srv-acme-core")!;
+  c.services.set("srv-elsewhere", { ...core, id: "srv-elsewhere", environmentId: "evm-other" });
+  const state = d.saved();
+  delete state.services.core;
+  state.pendingCreate = "/services: acme-core";
+  writeFileSync(join(d.ctx.configDir, "render.resources.json"), JSON.stringify(state));
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.equal(d.saved().pendingCreate, undefined);
+  assert.deepEqual(d.saved().services.core, { id: "srv-acme-core", name: "acme-core", type: "web_service" });
+  assert.equal(c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/services").length, 0);
+});
+
+test("Render rollback --to restores a retained release by label, commit prefix, or deploy ID", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.setCommit("c".repeat(40));
+  await d.backend.up({ dryRun: false });
+  d.setCommit("d".repeat(40));
+  await d.backend.up({ dryRun: false });
+  const [third, second, first] = d.saved().releases as Array<{
+    label: string;
+    commit: string;
+    services: Record<string, string>;
+  }>;
+  assert.deepEqual(
+    [first!, second!, third!].map((release) => [release.label, release.commit[0]]),
+    [
+      ["r1", "a"],
+      ["r2", "c"],
+      ["r3", "d"],
+    ],
+  );
+  const restores = (mark: number) =>
+    writes(c.calls.slice(mark))
+      .filter((call) => call.path.endsWith("/rollback"))
+      .map((call) => [call.path, (call.body as { deployId: string }).deployId]);
+  let mark = c.calls.length;
+  await d.backend.rollback("r1");
+  assert.deepEqual(restores(mark), [
+    ["/services/srv-acme-core/rollback", first!.services.core],
+    ["/services/srv-acme-web-ui/rollback", first!.services["web-ui"]],
+  ]);
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "a".repeat(40));
+  assert.equal(d.saved().releases[0].label, "r4");
+  assert.equal(d.saved().releases[0].commit, "a".repeat(40));
+  mark = c.calls.length;
+  await d.backend.rollback("c".repeat(7));
+  assert.deepEqual(restores(mark)[0], ["/services/srv-acme-core/rollback", second!.services.core]);
+  assert.equal(d.saved().releases[0].label, "r5");
+  mark = c.calls.length;
+  await d.backend.rollback(third!.services["web-ui"]!);
+  assert.deepEqual(restores(mark)[0], ["/services/srv-acme-core/rollback", third!.services.core]);
+  assert.equal(c.envs.get("srv-acme-core")!.GIT_SHA, "d".repeat(40));
+  assert.equal(d.saved().releases.length, 6);
+});
+
+test("Render rollback --to rejects unknown, ambiguous, and short targets and lists the releases", async (t) => {
+  const d = deployment(t);
+  cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  await d.backend.up({ dryRun: false });
+  await assert.rejects(
+    async () => d.backend.rollback("r9"),
+    /not a release label, commit, or deploy ID\. Retained releases: r2 \(aaaaaaa, .*\), r1/,
+  );
+  await assert.rejects(
+    async () => d.backend.rollback("dep-nope"),
+    /No retained Render release contains deploy dep-nope/,
+  );
+  await assert.rejects(
+    async () => d.backend.rollback("a".repeat(7)),
+    /matches several retained releases; use a release label/,
+  );
+  await assert.rejects(async () => d.backend.rollback("f".repeat(7)), /give the full 40-character commit to build it/);
+  assert.equal(d.saved().rollbackProgress, undefined);
+});
+
+test("Render rollback --to builds a full commit that no retained release recorded", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const mark = c.calls.length;
+  await d.backend.rollback("f".repeat(40));
+  const written = writes(c.calls.slice(mark));
+  assert.equal(
+    written.some((call) => call.path.endsWith("/rollback")),
+    false,
+  );
+  assert.deepEqual(
+    written.filter((call) => call.path.endsWith("/deploys")).map((call) => [call.path, call.body]),
+    ["core", "web-ui"].map((name) => [
+      `/services/srv-acme-${name}/deploys`,
+      { clearCache: "do_not_clear", commitId: "f".repeat(40) },
+    ]),
+  );
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "f".repeat(40));
+  const [latest, previous] = d.saved().releases;
+  assert.equal(latest.label, "r2");
+  assert.equal(latest.commit, "f".repeat(40));
+  assert.deepEqual(Object.keys(latest.services).sort(), ["core", "web-ui"]);
+  assert.equal(previous.label, "r1");
+});
+
+test("Render rollback refuses a release whose build is gone or was made from another commit", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.setCommit("c".repeat(40));
+  await d.backend.up({ dryRun: false });
+  const first = d.saved().releases[1];
+  c.deploysById.delete(first.services["web-ui"]);
+  const mark = c.calls.length;
+  await assert.rejects(
+    async () => d.backend.rollback("r1"),
+    /web-ui build dep-\d+ of release r1 no longer exists on Render/,
+  );
+  assert.equal(
+    writes(c.calls.slice(mark)).some((call) => call.path.endsWith("/rollback") || call.path.includes("/env-vars/")),
+    false,
+  );
+  assert.equal(d.saved().rollbackProgress, undefined);
+  c.deploysById.set(first.services["web-ui"], {
+    id: first.services["web-ui"],
+    status: "live",
+    commit: { id: "e".repeat(40) },
+  });
+  await assert.rejects(async () => d.backend.rollback("r1"), /web-ui build dep-\d+ was made from commit e+, not a+/);
+});
+
+test("Render rollback retains ten releases, lists them in status, and resumes only toward the same target", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  for (let index = 0; index < 12; index++) {
+    d.setCommit(index.toString(16).repeat(40).slice(0, 40));
+    await d.backend.up({ dryRun: false });
+  }
+  const labels = d.saved().releases.map((release: { label: string }) => release.label);
+  assert.deepEqual(labels, ["r12", "r11", "r10", "r9", "r8", "r7", "r6", "r5", "r4", "r3"]);
+  const lines: string[] = [];
+  const log = t.mock.method(console, "log", (message: string) => void lines.push(String(message)));
+  await d.backend.status();
+  log.mock.restore();
+  assert.ok(
+    lines.some((line) => /^release r12 \(bbbbbbb, .*\) latest$/.test(line)),
+    lines.join("\n"),
+  );
+  assert.equal(lines.filter((line) => line.startsWith("release r")).length, 10);
+  c.intercept = ({ path, method }) =>
+    path === "/services/srv-acme-web-ui/rollback" && method === "POST"
+      ? new Response(null, { status: 500 })
+      : undefined;
+  await assert.rejects(async () => d.backend.rollback("r5"), /HTTP 500/);
+  assert.equal(d.saved().rollbackProgress.label, "r5");
+  c.intercept = undefined;
+  await assert.rejects(
+    async () => d.backend.rollback("r4"),
+    /rollback to r5 is incomplete; run qm rollback without --to/,
+  );
+  await d.backend.rollback("r5");
+  assert.equal(d.saved().rollbackProgress, undefined);
+  assert.equal(d.saved().releases[0].label, "r13");
+  assert.equal(d.saved().releases[0].commit, "4".repeat(40));
+});

@@ -5,6 +5,10 @@ import { bytes, normalizeRelPath, posixJoin, readTree } from "./deploy-fs.ts";
 const EXIT_APP_EXITED = 98;
 const READY_EXEC_GRACE_SEC = 30;
 
+export function tcpListening(port: number): string {
+  return `timeout 2 bash -c ${shq(`exec 3<>/dev/tcp/127.0.0.1/${port}`)} 2>/dev/null`;
+}
+
 export interface AppReadyOptions {
   appPort: number;
   windowSec: number;
@@ -20,7 +24,7 @@ export async function waitAppReady(
     `pid=$(cat ${shq(opts.pidPath)} 2>/dev/null || true); died=0; ` +
     `end=$(( $(date +%s) + ${opts.windowSec} )); ` +
     `while [ "$(date +%s)" -lt "$end" ]; do ` +
-    `curl -s --max-time 2 -o /dev/null http://127.0.0.1:${opts.appPort}/ && exit 0; ` +
+    `if ${tcpListening(opts.appPort)}; then exit 0; fi; ` +
     `kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || died=1; ` +
     `sleep 0.5; done; [ "$died" = 1 ] && exit ${EXIT_APP_EXITED}; exit 1`;
   const r = await exec(probe, opts.windowSec + READY_EXEC_GRACE_SEC);

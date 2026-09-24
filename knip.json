@@ -11,7 +11,9 @@
   "workspaces": {
     ".": {
       "entry": [
+        "deploy/render-runner/start.mjs",
         "src/migrate-main.ts",
+        "src/render/start.ts",
         "src/sandbox/local-sandbox.ts",
         "scripts/aws-deploy-smoke.ts",
         "scripts/aws-litestream-smoke.ts",

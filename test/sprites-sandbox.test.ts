@@ -658,6 +658,27 @@ test("control retries share an elapsed-time budget across backoff and SDK reques
   assert.equal(calls, 2);
 });
 
+test("control calls retry a lost connection in either form of the SDK and stop at a programming error", async () => {
+  for (const lost of [new Error("Network error: fetch failed"), new TypeError("fetch failed")]) {
+    let calls = 0;
+    const result = await retrySpritesControl(async () => {
+      if (calls++ === 0) throw lost;
+      return "reconnected";
+    });
+    assert.equal(result, "reconnected");
+    assert.equal(calls, 2);
+  }
+  let calls = 0;
+  await assert.rejects(
+    retrySpritesControl(async () => {
+      calls++;
+      throw new TypeError("raw.map is not a function");
+    }),
+    /raw\.map is not a function/,
+  );
+  assert.equal(calls, 1);
+});
+
 for (const outcome of ["healthy", "unknown", "403", "503"]) {
   test(`refused restart with ${outcome} health observation never rolls back newer files`, async () => {
     const h = await sandbox.provision(layers);

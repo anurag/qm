@@ -838,7 +838,8 @@ test("resource activation honors scope defaults and preserves explicit legacy pr
 
 for (const waiting of ["command", "checkpoint"] as const) {
   test(`Modal ${waiting} allows other tools while restart waits`, { timeout: 10000 }, async () => {
-    const { options, backend, layers, routes } = fixture();
+    const { options, backend: local, layers, routes } = fixture();
+    const backend: Sandbox = { ...local, profile: { ...local.profile, backend: "modal", concurrentUse: true } };
     const resources = createSandboxResources({ ...options, backends: { modal: backend }, defaultBackend: "modal" });
     const router = createSandboxRouter({ routes, backends: { modal: backend }, defaultBackend: "modal", resources });
     const record = await resources.create("alice", "personal:alice", "modal");

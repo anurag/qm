@@ -1,0 +1,487 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  createSdkRenderClient,
+  RENDER_SCRIPT_DIR,
+  RenderCheckpointUnconfirmedError,
+} from "../src/sandbox/render-client.ts";
+import { createFakeRender, serveFakeRenderApi } from "./support/fake-render.ts";
+
+const SPOOLED = new RegExp(`^timeout (\\d+) sh '${RENDER_SCRIPT_DIR.replaceAll(".", "\\.")}/[0-9a-f-]{36}\\.sh'$`);
+const prelude = (path: string): string =>
+  `rm -f '${path}'; find '${RENDER_SCRIPT_DIR}' -type f -mmin +5 -delete 2>/dev/null\n`;
+
+function fakeStream(t: import("node:test").TestContext, stream: string) {
+  const sent: Array<{ path: string; body: string }> = [];
+  t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    const body = await request.text();
+    sent.push({ path: url.pathname, body });
+    if (url.pathname.endsWith("/files/upload/token"))
+      return Response.json({ uri: "https://sandbox.example/files", method: "PUT", token: "file-secret" });
+    if (url.pathname.endsWith("/runs/stream/token"))
+      return Response.json({
+        uri: "https://sandbox.example/stream",
+        method: "POST",
+        token: "stream-secret",
+        executionId: "exe-test",
+      });
+    if (url.pathname === "/files") return new Response(null, { status: 204 });
+    return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+  });
+  return sent;
+}
+
+const sandbox = {
+  id: "sbx-test",
+  status: "running",
+  plan: "standard",
+  networkPolicy: { default: "allow" },
+  region: "oregon",
+  timeoutSeconds: 7200,
+  createdAt: "2026-09-12T00:00:00Z",
+};
+const snapshot = {
+  id: "snp-test",
+  sandboxGroupId: "sbg-test",
+  sourceSandboxId: "sbx-test",
+  kind: "filesystem",
+  status: "available",
+  plan: "standard",
+  requestedAt: "2026-09-12T00:00:00Z",
+  capturedAt: "2026-09-12T00:00:01Z",
+  expiresAt: "2026-10-12T00:00:00Z",
+};
+
+test("Render SDK adapter maps sandbox and snapshot records and forwards the creation settings", async (t) => {
+  const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+  t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    assert.equal(request.headers.get("authorization"), "Bearer secret");
+    const path = new URL(request.url).pathname;
+    requests.push({
+      method: request.method,
+      path,
+      ...(request.method === "POST" ? { body: await request.json() } : {}),
+    });
+    if (request.method === "DELETE") return new Response(null, { status: 204 });
+    return Response.json(path.endsWith("/sandboxes") ? sandbox : snapshot);
+  });
+  const client = createSdkRenderClient({
+    apiKey: "secret",
+    workspaceId: "tea-test",
+    region: "oregon",
+    plan: "standard",
+    ttlSec: 7200,
+  });
+  const info = await client.create("snp-base");
+  assert.deepEqual(requests, [
+    {
+      method: "POST",
+      path: "/v1/sandboxes",
+      body: { ownerId: "tea-test", plan: "standard", timeoutSeconds: 7200, region: "oregon", snapshotId: "snp-base" },
+    },
+  ]);
+  assert.equal(info.id, sandbox.id);
+  assert.equal(info.status, "running");
+  assert.equal(info.expiresAtMs, Date.parse(sandbox.createdAt) + 7200_000);
+  const saved = await client.createSnapshot(info.id);
+  assert.equal(saved.id, snapshot.id);
+  assert.equal(saved.sandboxGroupId, snapshot.sandboxGroupId);
+  assert.equal(saved.status, "available");
+  assert.equal(saved.capturedAtMs, Date.parse(snapshot.capturedAt));
+  assert.equal(saved.expiresAtMs, Date.parse(snapshot.expiresAt));
+  assert.deepEqual(await client.getSnapshot(saved), saved);
+  await client.deleteSnapshot(saved);
+  assert.deepEqual(requests.slice(1), [
+    { method: "POST", path: "/v1/sandboxes/sbx-test/snapshots", body: { kind: "filesystem" } },
+    { method: "GET", path: "/v1/sandbox-groups/sbg-test/snapshots/snp-test" },
+    { method: "DELETE", path: "/v1/sandbox-groups/sbg-test/snapshots/snp-test" },
+  ]);
+});
+
+test("Render SDK adapter keeps stdout, stderr, and nonzero exit status of an uploaded script", async (t) => {
+  const sent = fakeStream(
+    t,
+    'event: output\ndata: {"stream":"stdout","data":"hello\\n"}\n\nevent: output\ndata: {"stream":"stderr","data":"problem\\n"}\n\nevent: exit\ndata: {"exit_code":7}\n\n',
+  );
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  assert.deepEqual(await client.runScript("sbx-test", "example command", 10), {
+    stdout: "hello\n",
+    stderr: "problem\n",
+    exitCode: 7,
+  });
+  assert.deepEqual(
+    sent.map((request) => request.path),
+    ["/v1/sandboxes/sbx-test/files/upload/token", "/files", "/v1/sandboxes/sbx-test/runs/stream/token", "/stream"],
+  );
+  const command = (JSON.parse(sent[2]!.body) as { command: string }).command;
+  assert.match(command, SPOOLED);
+  assert.equal(SPOOLED.exec(command)![1], "10");
+  assert.deepEqual(JSON.parse(sent[3]!.body), { command });
+  const path = command.slice(command.indexOf("'") + 1, -1);
+  assert.equal(sent[1]!.body, `${prelude(path)}example command`);
+});
+
+function scriptedApi(t: import("node:test").TestContext, failures: Map<string, number[]>) {
+  const attempts = new Map<string, number>();
+  t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    const key = `${request.method} ${url.pathname}`;
+    attempts.set(key, (attempts.get(key) ?? 0) + 1);
+    const status = failures.get(key)?.shift();
+    if (status === 0) throw new TypeError("fetch failed");
+    if (status && status < 0) return new Response(null, { status: -status });
+    if (status) return Response.json({ message: `injected ${status}` }, { status });
+    if (url.pathname.endsWith("/files/upload/token"))
+      return Response.json({ uri: "https://sandbox.example/files", method: "PUT", token: "file-token" });
+    if (url.pathname.endsWith("/files/download/token"))
+      return Response.json({ uri: "https://sandbox.example/files", method: "GET", token: "file-token" });
+    if (url.pathname.endsWith("/runs/stream/token"))
+      return Response.json({ uri: "https://sandbox.example/stream", method: "POST", token: "t", executionId: "exe" });
+    if (url.pathname === "/stream")
+      return new Response('event: exit\ndata: {"exit_code":0}\n\n', {
+        headers: { "content-type": "text/event-stream" },
+      });
+    if (url.pathname === "/files")
+      return request.method === "PUT" ? new Response(null, { status: 204 }) : new Response("data");
+    if (url.pathname.endsWith("/terminate") || request.method === "DELETE") return new Response(null, { status: 204 });
+    return Response.json(url.pathname.includes("/snapshots") ? snapshot : sandbox);
+  });
+  return (key: string) => attempts.get(key) ?? 0;
+}
+
+test("Render SDK adapter retries reads, deletes, and file transfers on 429 and 5xx", async (t) => {
+  const attempts = scriptedApi(
+    t,
+    new Map([
+      ["GET /v1/sandboxes/sbx-test", [429, 503]],
+      ["POST /v1/sandboxes/sbx-test/terminate", [502]],
+      ["GET /v1/sandbox-groups/sbg-test/snapshots/snp-test", [500]],
+      ["DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test", [504]],
+      ["POST /v1/sandboxes/sbx-test/files/upload/token", [429]],
+      ["PUT /files", [503]],
+      ["POST /v1/sandboxes/sbx-test/files/download/token", [503]],
+      ["GET /files", [503]],
+    ]),
+  );
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  assert.equal((await client.get("sbx-test"))?.id, "sbx-test");
+  await client.terminate("sbx-test");
+  const checkpoint = { id: "snp-test", sandboxGroupId: "sbg-test", status: "available" as const, expiresAtMs: 0 };
+  assert.equal((await client.getSnapshot(checkpoint)).id, "snp-test");
+  await client.deleteSnapshot(checkpoint);
+  await client.writeFileBytes("sbx-test", "/root/file", Buffer.from("data"));
+  assert.equal(Buffer.from((await client.readFileBytes("sbx-test", "/root/file"))!).toString(), "data");
+  assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 3);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/terminate"), 2);
+  assert.equal(attempts("GET /v1/sandbox-groups/sbg-test/snapshots/snp-test"), 2);
+  assert.equal(attempts("DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test"), 2);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/upload/token"), 3);
+  assert.equal(attempts("PUT /files"), 2);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/download/token"), 3);
+  assert.equal(attempts("GET /files"), 2);
+});
+
+test("Render SDK adapter retries idempotent calls after a connection failure but not creations or commands", async (t) => {
+  const attempts = scriptedApi(
+    t,
+    new Map([
+      ["GET /v1/sandboxes/sbx-test", [0]],
+      ["DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test", [0]],
+      ["PUT /files", [0]],
+      ["POST /v1/sandboxes", [0]],
+      ["POST /v1/sandboxes/sbx-test/snapshots", [0]],
+    ]),
+  );
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  assert.equal((await client.get("sbx-test"))?.id, "sbx-test");
+  await client.deleteSnapshot({ id: "snp-test", sandboxGroupId: "sbg-test", status: "available", expiresAtMs: 0 });
+  await client.writeFileBytes("sbx-test", "/root/file", Buffer.from("data"));
+  await assert.rejects(client.create(), /fetch failed/);
+  await assert.rejects(client.createSnapshot("sbx-test"), /fetch failed/);
+  assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 2);
+  assert.equal(attempts("DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test"), 2);
+  assert.equal(attempts("PUT /files"), 2);
+  assert.equal(attempts("POST /v1/sandboxes"), 1);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/snapshots"), 1);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/runs/stream/token"), 1);
+});
+
+test("Render SDK adapter retries a file transfer after an error response without a body", async (t) => {
+  const attempts = scriptedApi(
+    t,
+    new Map([
+      ["POST /v1/sandboxes/sbx-test/files/upload/token", [-503]],
+      ["POST /v1/sandboxes/sbx-test/files/download/token", [-502]],
+    ]),
+  );
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  await client.writeFileBytes("sbx-test", "/root/file", Buffer.from("data"));
+  assert.equal(Buffer.from((await client.readFileBytes("sbx-test", "/root/file"))!).toString(), "data");
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/upload/token"), 2);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/download/token"), 2);
+});
+
+test("Render SDK adapter reports unconfirmed checkpoints and finds the snapshots of one sandbox in every group", async (t) => {
+  const since = Date.parse("2026-09-12T00:00:00Z");
+  const at = (offsetMs: number) => new Date(since + offsetMs).toISOString();
+  const entry = (id: string, source: string, offsetMs: number) => ({
+    snapshot: {
+      ...snapshot,
+      id,
+      sandboxGroupId: id.startsWith("snp-b") ? "sbg-b" : "sbg-a",
+      sourceSandboxId: source,
+      requestedAt: at(offsetMs),
+    },
+    cursor: id,
+  });
+  const creations = [503, 409];
+  t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/v1/sandboxes/sbx-test/snapshots") {
+      const status = creations.shift()!;
+      return Response.json({ message: `injected ${status}` }, { status });
+    }
+    if (url.pathname === "/v1/sandbox-groups")
+      return Response.json(["sbg-a", "sbg-b"].map((id) => ({ sandboxGroup: { id, ownerId: "tea-test" }, cursor: id })));
+    if (url.pathname === "/v1/sandbox-groups/sbg-a/snapshots") {
+      assert.deepEqual(url.searchParams.getAll("status"), ["creating", "available"]);
+      return Response.json([
+        entry("snp-new", "sbx-test", 10_000),
+        entry("snp-other", "sbx-other", 5_000),
+        entry("snp-old", "sbx-test", -3600_000),
+      ]);
+    }
+    if (url.pathname === "/v1/sandbox-groups/sbg-b/snapshots")
+      return Response.json([entry("snp-b", "sbx-test", 20_000)]);
+    throw new Error(`Unexpected request ${request.method} ${url.pathname}`);
+  });
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  const unconfirmed = await client.createSnapshot("sbx-test").catch((error: unknown) => error);
+  assert.ok(unconfirmed instanceof RenderCheckpointUnconfirmedError);
+  assert.equal(unconfirmed.sandboxId, "sbx-test");
+  assert.match(unconfirmed.message, /injected 503/);
+  const refused = await client.createSnapshot("sbx-test").catch((error: unknown) => error);
+  assert.ok(!(refused instanceof RenderCheckpointUnconfirmedError));
+  assert.match(String(refused), /injected 409/);
+  assert.deepEqual(
+    (await client.findSnapshots("sbx-test", since)).map((found) => [found.id, found.sandboxGroupId]),
+    [
+      ["snp-new", "sbg-a"],
+      ["snp-b", "sbg-b"],
+    ],
+  );
+});
+
+test("Render SDK adapter retries sandbox and checkpoint creation only on 429", async (t) => {
+  const failures = new Map([
+    ["POST /v1/sandboxes", [429]],
+    ["POST /v1/sandboxes/sbx-test/snapshots", [429]],
+  ]);
+  const attempts = scriptedApi(t, failures);
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  assert.equal((await client.create()).id, "sbx-test");
+  assert.equal((await client.createSnapshot("sbx-test")).id, "snp-test");
+  assert.equal(attempts("POST /v1/sandboxes"), 2);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/snapshots"), 2);
+  failures.set("POST /v1/sandboxes", [503]);
+  failures.set("POST /v1/sandboxes/sbx-test/snapshots", [503]);
+  await assert.rejects(client.create(), /injected 503/);
+  await assert.rejects(client.createSnapshot("sbx-test"), /injected 503/);
+  assert.equal(attempts("POST /v1/sandboxes"), 3);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/snapshots"), 3);
+});
+
+test("Render SDK adapter sends an exec once and does not retry a rejected read", async (t) => {
+  const failures = new Map([["POST /v1/sandboxes/sbx-test/runs/stream/token", [503]]]);
+  const attempts = scriptedApi(t, failures);
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  await assert.rejects(client.runScript("sbx-test", "echo once", 30), /injected 503/);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/runs/stream/token"), 2);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/upload/token"), 1);
+  failures.set("GET /v1/sandboxes/sbx-test", [400]);
+  await assert.rejects(client.get("sbx-test"), /injected 400/);
+  assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 1);
+});
+
+test(
+  "Render SDK adapter removes a sandbox or a checkpoint that Render creates after the submit deadline",
+  { timeout: 10_000 },
+  async (t) => {
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    t.mock.method(AbortSignal, "timeout", (ms: number) => timeout(ms === 60_000 ? 50 : ms));
+    let checkpointStatus = "creating";
+    const cleaned = { sandbox: Promise.withResolvers<void>(), checkpoint: Promise.withResolvers<void>() };
+    const deletes: string[] = [];
+    t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (request.method === "POST" && path === "/v1/sandboxes") {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return Response.json({ ...sandbox, id: "sbx-late", status: "creating" }, { status: 201 });
+      }
+      if (path === "/v1/sandboxes/sbx-late/terminate") {
+        cleaned.sandbox.resolve();
+        return new Response(null, { status: 204 });
+      }
+      if (request.method === "POST" && path === "/v1/sandboxes/sbx-test/snapshots") {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        return Response.json({ ...snapshot, id: "snp-late", status: "creating" }, { status: 202 });
+      }
+      if (request.method === "GET" && path === "/v1/sandbox-groups/sbg-test/snapshots/snp-late") {
+        const status = checkpointStatus;
+        checkpointStatus = "available";
+        return Response.json({ ...snapshot, id: "snp-late", status });
+      }
+      if (request.method === "DELETE" && path === "/v1/sandbox-groups/sbg-test/snapshots/snp-late") {
+        deletes.push(checkpointStatus);
+        if (checkpointStatus === "creating")
+          return Response.json({ message: "capture in progress", code: "snapshot_creating" }, { status: 409 });
+        cleaned.checkpoint.resolve();
+        return new Response(null, { status: 204 });
+      }
+      throw new Error(`Unexpected ${request.method} ${path}`);
+    });
+    const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+    await assert.rejects(client.create(), { name: "TimeoutError" });
+    await cleaned.sandbox.promise;
+    await assert.rejects(
+      client.createSnapshot("sbx-test"),
+      (error: unknown) =>
+        error instanceof RenderCheckpointUnconfirmedError && (error.cause as Error).name === "TimeoutError",
+    );
+    await cleaned.checkpoint.promise;
+    assert.deepEqual(deletes, ["available"]);
+  },
+);
+
+test("Render SDK adapter treats only HTTP 404 as a missing sandbox", async (t) => {
+  let status = 404;
+  t.mock.method(globalThis, "fetch", async () => Response.json({ message: "unavailable" }, { status }));
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  assert.equal(await client.get("sbx-test"), null);
+  await client.terminate("sbx-test");
+  status = 401;
+  await assert.rejects(client.get("sbx-test"), /unavailable/);
+  await assert.rejects(client.terminate("sbx-test"), /unavailable/);
+});
+
+test("Render SDK adapter rejects truncated streams and removes the uploaded script", async (t) => {
+  const sent = fakeStream(t, 'event: output\ndata: {"stream":"stdout","data":"partial"}\n\n');
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  await assert.rejects(client.runScript("sbx-test", "side effect", 10), /terminal event/);
+  const commands = sent
+    .filter((request) => request.path.endsWith("/runs/stream/token"))
+    .map((request) => (JSON.parse(request.body) as { command: string }).command);
+  assert.equal(commands.length, 2);
+  assert.match(commands[0]!, SPOOLED);
+  assert.equal(commands[1], `rm -f ${commands[0]!.slice(commands[0]!.indexOf("'"))}`);
+});
+
+test("Render SDK adapter keeps scripts and secrets out of run token requests and runs scripts past the argument limit", async (t) => {
+  const fake = createFakeRender();
+  t.after(() => fake.cleanup());
+  const http = serveFakeRenderApi(t, fake);
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  const { id } = await client.create();
+  const secret = "turn-secret-value-4711";
+  const payload = "x".repeat(200 * 1024);
+  const result = await client.runScript(
+    id,
+    `export QM_TURN_TOKEN='${secret}'\npayload='${payload}'\nprintf '%s:%s' "$QM_TURN_TOKEN" "\${#payload}"`,
+    30,
+  );
+  assert.deepEqual(result, { stdout: `${secret}:${payload.length}`, stderr: "", exitCode: 0 });
+  const runs = http.tokenRequests.filter((request) => request.operation === "stream");
+  assert.equal(runs.length, 1);
+  for (const request of http.tokenRequests) {
+    assert.equal(request.body.includes(secret), false);
+    assert.equal(request.body.includes(payload.slice(0, 64)), false);
+  }
+  assert.match((JSON.parse(runs[0]!.body) as { command: string }).command, SPOOLED);
+  assert.ok(http.proxyCommands.every((command) => command.length < 200 && !command.includes(secret)));
+  assert.equal(http.uploads.length, 1);
+  assert.ok(http.uploads[0]!.path.startsWith(`${RENDER_SCRIPT_DIR}/`));
+  const spoolDir = join(fake.home(id), RENDER_SCRIPT_DIR);
+  assert.ok(!existsSync(spoolDir) || readdirSync(spoolDir).length === 0);
+});
+
+test("Render SDK adapter removes scripts that an earlier run left behind", async (t) => {
+  const fake = createFakeRender();
+  t.after(() => fake.cleanup());
+  serveFakeRenderApi(t, fake);
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  const { id } = await client.create();
+  const spoolDir = join(fake.home(id), RENDER_SCRIPT_DIR);
+  mkdirSync(spoolDir, { recursive: true });
+  const stale = join(spoolDir, "00000000-0000-0000-0000-000000000000.sh");
+  const recent = join(spoolDir, "11111111-1111-1111-1111-111111111111.sh");
+  writeFileSync(stale, "export QM_TURN_TOKEN='left-behind'");
+  writeFileSync(recent, "echo starting");
+  const old = new Date(Date.now() - 10 * 60_000);
+  utimesSync(stale, old, old);
+  assert.equal((await client.runScript(id, "echo ran", 30)).stdout, "ran\n");
+  assert.deepEqual(readdirSync(spoolDir), ["11111111-1111-1111-1111-111111111111.sh"]);
+});
+
+test("Render SDK adapter bounds a stalled run token request by the script deadline and a short cleanup", async (t) => {
+  const commands: string[] = [];
+  t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/files/upload/token"))
+      return Response.json({ uri: "https://sandbox.example/files", method: "PUT", token: "file-token" });
+    if (url.pathname === "/files") return new Response(null, { status: 204 });
+    if (url.pathname.endsWith("/runs/stream/token")) {
+      commands.push(((await request.json()) as { command: string }).command);
+      if (commands.length === 1) return new Promise<Response>(() => undefined);
+      return Response.json({ uri: "https://sandbox.example/stream", method: "POST", token: "t", executionId: "exe" });
+    }
+    return new Response('event: exit\ndata: {"exit_code":0}\n\n', { headers: { "content-type": "text/event-stream" } });
+  });
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  const started = Date.now();
+  await assert.rejects(client.runScript("sbx-test", "sleep 60", 1));
+  assert.ok(Date.now() - started < 5_000);
+  assert.equal(commands.length, 2);
+  assert.match(commands[0]!, SPOOLED);
+  assert.match(commands[1]!, /^rm -f '/);
+});
+
+test("Render SDK adapter removes an uploaded script when the run cannot start", async (t) => {
+  const fake = createFakeRender();
+  t.after(() => fake.cleanup());
+  let refuse = true;
+  const http = serveFakeRenderApi(t, fake, (request) => {
+    if (!refuse || !new URL(request.url).pathname.endsWith("/runs/stream/token")) return undefined;
+    refuse = false;
+    return Response.json({ message: "unavailable" }, { status: 503 });
+  });
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  const { id } = await client.create();
+  await assert.rejects(client.runScript(id, "export QM_TURN_TOKEN='never-run'; echo ran", 30), /unavailable/);
+  assert.equal(http.uploads.length, 1);
+  assert.deepEqual(http.proxyCommands, [`rm -f '${http.uploads[0]!.path}'`]);
+  assert.equal(existsSync(join(fake.home(id), http.uploads[0]!.path)), false);
+});
+
+test("Render SDK adapter accepts an already deleted native checkpoint", async (t) => {
+  let status = 404;
+  t.mock.method(globalThis, "fetch", async () => Response.json({ message: "unavailable" }, { status }));
+  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
+  const checkpoint = {
+    id: "snp-gone",
+    sandboxGroupId: "sbg-test",
+    status: "available" as const,
+    expiresAtMs: Date.now(),
+  };
+  await client.deleteSnapshot(checkpoint);
+  status = 403;
+  await assert.rejects(client.deleteSnapshot(checkpoint), /unavailable/);
+});
