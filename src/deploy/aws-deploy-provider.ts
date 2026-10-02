@@ -4,6 +4,7 @@ import { AssumeRoleCommand, STSClient } from "@aws-sdk/client-sts";
 import type { Deployment, DeploymentVersion } from "./deploy-store.ts";
 import type { DeployEndpoint, DeployProvider, DeployReconcileInput } from "./deploy-provider.ts";
 import { bytes, normalizeRelPath, posixJoin, readTree } from "./deploy-fs.ts";
+import { tcpListening } from "./shared-deploy-provider.ts";
 import { AwsApiError, createMicrovmApi, createMicrovmClient, type AwsMicrovmApi } from "../sandbox/aws-microvm-api.ts";
 import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
@@ -37,8 +38,7 @@ const APP_START_EXEC_TIMEOUT_SEC = 60;
 const EXIT_APP_PORT_HELD = 97;
 const EXIT_APP_EXITED = 98;
 
-const LISTENING_ON_APP_PORT = (port: number): string =>
-  `listening() { curl -s -o /dev/null --max-time 1 http://127.0.0.1:${port}/; [ "$?" != "7" ]; }`;
+const LISTENING_ON_APP_PORT = (port: number): string => `listening() { ${tcpListening(port)}; }`;
 
 const LIVE_REPLICATOR_PIDS = `ls_pids() { for p in /proc/[0-9]*; do c=$(tr '\\0' ' ' < "$p/cmdline" 2>/dev/null); case "\${c%% *}" in litestream|*/litestream) case "$c" in *${LITESTREAM_CONFIG}*) echo "\${p#/proc/}";; esac;; esac; done; }`;
 const ENDPOINT_PORT = 443;
@@ -463,7 +463,7 @@ export function createAwsDeployProvider(opts: AwsDeployProviderOptions): DeployP
       `pid=$(cat ${shq(PID_PATH)} 2>/dev/null || true); died=0; ` +
       `end=$(( $(date +%s) + ${APP_READY_WINDOW_SEC} )); ` +
       `while [ "$(date +%s)" -lt "$end" ]; do ` +
-      `curl -s --max-time 2 -o /dev/null http://127.0.0.1:${appPort}/ && exit 0; ` +
+      `if ${tcpListening(appPort)}; then exit 0; fi; ` +
       `kill -0 -"$pid" 2>/dev/null || died=1; ` +
       `sleep 0.5; done; [ "$died" = 1 ] && exit ${EXIT_APP_EXITED}; exit 1`;
     const r = await execRaw(id, endpoint, probe, APP_READY_EXEC_TIMEOUT_SEC);

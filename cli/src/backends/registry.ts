@@ -5,7 +5,13 @@ import { syncDeploymentLayer, type DeploymentLayerTransport } from "../deploymen
 import { TARGET_ENV_DEFAULTS, type TargetEnvDefaults } from "../target-env-defaults.ts";
 import { renderTerraformVars } from "../terraform.ts";
 import { buildAwsMicrovmImage, deleteAwsMicrovmImage, deleteAwsTaskDefinitions } from "../commands/infra.ts";
-import { awsScaffold, dockerScaffold, flyScaffold, type ProviderScaffold } from "../provider-scaffold.ts";
+import {
+  awsScaffold,
+  dockerScaffold,
+  flyScaffold,
+  renderScaffold,
+  type ProviderScaffold,
+} from "../provider-scaffold.ts";
 import type { ResolvedPlugin } from "../plugins.ts";
 import { runnableServices, serviceHost } from "../services.ts";
 import {
@@ -34,6 +40,7 @@ import {
   flyDeploymentLayerTransport,
 } from "./fly.ts";
 import type { Backend, BackendUpOptions } from "./types.ts";
+import { createRenderBackend, renderConfigErrors, renderDeploymentLayerTransport } from "./render.ts";
 
 export interface DeployContext {
   config: QmConfig;
@@ -340,7 +347,19 @@ const aws: HostingProvider = {
   },
 };
 
-export const HOSTING_PROVIDERS = { docker, fly, aws } satisfies Record<Target, HostingProvider>;
+const render: HostingProvider = {
+  id: "render",
+  deploymentLayerTransport: renderDeploymentLayerTransport,
+  envDefaults: TARGET_ENV_DEFAULTS.render,
+  scaffold: renderScaffold,
+  upFlags: [],
+  upOptions: (_ctx, _flags, dryRun) => ({ dryRun }),
+  createBackend: createRenderBackend,
+  coordinates: (config) => ({ accountOrOrganization: config.render?.workspaceId, region: config.render?.region }),
+  validateConfig: renderConfigErrors,
+};
+
+export const HOSTING_PROVIDERS = { docker, fly, aws, render } satisfies Record<Target, HostingProvider>;
 
 export const hostingProvider = (target: Target): HostingProvider => HOSTING_PROVIDERS[target];
 

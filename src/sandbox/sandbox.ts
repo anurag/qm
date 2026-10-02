@@ -62,6 +62,7 @@ export interface AgentComputerProfile {
   backend: string;
   writablePersistence: WritablePersistence;
   processSessions: boolean;
+  concurrentProvision?: boolean;
   parksOnTeardown?: boolean;
   egressEnforcement?: EgressEnforcement;
   spec?: AgentComputerSpec;

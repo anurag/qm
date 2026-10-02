@@ -491,7 +491,7 @@ test("resolveEndpoint (near the 8h cap): a stale-but-alive body returns null so 
   assert.equal(resolved, null, "a body past the rotate window resolves to null");
 });
 
-const readinessProbe = (cmd: string): boolean => cmd.includes("127.0.0.1:8081") && cmd.includes("exit 1");
+const readinessProbe = (cmd: string): boolean => cmd.includes("/dev/tcp/127.0.0.1/8081") && cmd.includes("exit 1");
 
 test("apply: an app that never binds its port fails the deploy instead of publishing a dead endpoint", async () => {
   const { api } = fakeApi();
