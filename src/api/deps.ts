@@ -1,8 +1,12 @@
+import type { ExternalSlackPolicies } from "../resolution/external-slack.ts";
+import type { ProviderKeys } from "../harness/pi-harness.ts";
+import type { ModelGatewayTransportConfig } from "../model/provider-endpoints.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import type { BackgroundOwnershipStore } from "../runs/background-ownership.ts";
 import type { LoopIngressService } from "../loops/ingress.ts";
 import type { createSuggestedActivityService } from "../suggestions/activities.ts";
 import type { ManagedSlack } from "../surfaces/slack-managed.ts";
+import type { InboxSourceRefresh } from "../loops/inbox-source-refresh.ts";
 import type { BrokerSessionStore } from "../auth/broker-sessions.ts";
 import type { DirectFileUploads } from "../files/direct-file-upload.ts";
 import type { SandboxResources } from "../sandbox/sandbox-resources.ts";
@@ -26,6 +30,7 @@ import type { CredentialUsageSink } from "../admin/credential-usage-sink.ts";
 import type { EgressAuditSink } from "../admin/egress-audit-sink.ts";
 import type { BrokerFetch } from "./credential-broker.ts";
 import type { GitHttpFetch } from "./git-http-broker.ts";
+import type { KeychainApprovals } from "../credentials/keychain-approval.ts";
 import type { AdminService } from "../admin/admin-service.ts";
 import type { InviteMailer } from "../admin/invite-email.ts";
 import type { SessionStore } from "../sessions/session-store.ts";
@@ -77,6 +82,10 @@ import type { SlackInstallationStore, SlackSocketAppIdReader } from "../surfaces
 import type { SlackAccountLink, ComposioReturn } from "./routes/composio.ts";
 
 export interface ServerDeps {
+  externalSlackPolicies?: ExternalSlackPolicies;
+  checkReadiness?: (signal: AbortSignal) => Promise<void>;
+  browserModelGateway?: ModelGatewayTransportConfig;
+  resolveBrowserCompanyKeys?: (includeSubscription?: boolean) => Promise<ProviderKeys>;
   slackAccounts?: DurableMap<SlackAccountLink>;
   composioReturns?: DurableMap<ComposioReturn>;
   composioFetch?: typeof fetch;
@@ -169,6 +178,7 @@ export interface ServerDeps {
   channelPolicy?: ChannelPolicyStore;
   uiState?: UiStateStore;
   loopSourceTokens?: ConnectorTokenSource;
+  inboxSourceRefresh?: InboxSourceRefresh;
   loopSlackClient?: (token: string) => SlackUserClient;
   sessionShares?: SessionShareStore;
   sessionShareBytes?: DurableByteStore;
@@ -192,6 +202,7 @@ export interface ServerDeps {
   keychain?: Keychain;
   serviceCreds?: ServiceCredentialStore;
   deliveries?: DeliveryStore;
+  keychainApprovals?: KeychainApprovals;
   fireAskResolution?: (ask: KeychainAsk, grant?: KeychainGrant) => Promise<unknown>;
   secretDrops?: SecretDropStore;
   fireDropResolution?: (drop: DropResolution) => Promise<unknown>;

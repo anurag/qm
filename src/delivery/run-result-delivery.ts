@@ -1,3 +1,4 @@
+import { isSubagentThreadRef } from "../sessions/session-syscalls.ts";
 import type { DeliveryProvenance, Destination, OutgoingAttachment } from "../types.ts";
 import type { Run, RunStore } from "../runs/run-store.ts";
 import { turnDeliveryProvenance, type DeliveryStore } from "./delivery-store.ts";
@@ -39,7 +40,7 @@ export function runResultDelivery(
   taskList: Task[] = [],
   adminUrlFor?: AdminUrlFor,
 ): RunResultDelivery | null {
-  if (run.request.swarm || run.request.privateSessionMessage) return null;
+  if (isSubagentThreadRef(run.sessionId) || run.request.swarm || run.request.privateSessionMessage) return null;
   const target = run.request.deliveryTarget;
   const surface = run.request.surface;
   if (!target || !surface) return null;
@@ -50,6 +51,12 @@ export function runResultDelivery(
   const destination: Destination = {
     type: surface,
     target,
+    ...(run.request.slackSource
+      ? { slackAccountId: run.request.slackSource.accountId, slackTeamId: run.request.slackSource.teamId }
+      : {}),
+    ...(run.request.slackSource?.externalPolicyNamespace
+      ? { slackPolicyNamespace: run.request.slackSource.externalPolicyNamespace }
+      : {}),
     ...(editRef ? { editRef } : {}),
     ...(taskList.length ? { taskList: taskList.map(({ id, title, status }) => ({ id, title, status })) } : {}),
     ...(webTranscript ? { webTranscript } : {}),

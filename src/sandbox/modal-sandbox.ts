@@ -1,3 +1,4 @@
+import { cleanupFailedProvision } from "./sandbox.ts";
 import { randomUUID } from "node:crypto";
 import type { WorkspaceLayer } from "../types.ts";
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
@@ -405,6 +406,7 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
 
   async function withSessionUnlocked<T>(name: string, action: (session: ModalSession) => Promise<T>): Promise<T> {
     const scratchKey = scratchKeyByName.get(name);
+    if (scratchKey === undefined && !scopeByName.has(name)) throw new Error("sandbox handle has been released");
     const reviveScratch = async (): Promise<ModalSession> => {
       const session = await client.create({ tags: tags("scratch") });
       sessionByName.set(name, session);
@@ -474,7 +476,6 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
     backend: "modal",
     writablePersistence: usesNativeSnapshots() ? "provider_managed" : "snapshot_to_workspace",
     processSessions: true,
-    concurrentUse: true,
     egressEnforcement: opts.egressProxyUrl ? "domain" : "none",
     spec: {
       os: "Debian 12 — Modal sandbox (24h max lifetime; home checkpoints have limited retention; publish durable work to git or Files)",
@@ -745,7 +746,7 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
 
         return handle;
       } catch (err) {
-        await sandbox.teardown(handle).catch(swallowAs("modal-sandbox: teardown after failed provision", undefined));
+        await cleanupFailedProvision(sandbox, handle);
         throw err;
       }
     },
@@ -904,8 +905,12 @@ export function createModalSandbox(workspace: WorkspaceStore, opts: ModalSandbox
           }
           activeScratch.delete(handle.id);
           const session = sessionByName.get(handle.id);
+          if (session) {
+            if (tdOpts?.destroy) await session.terminate();
+            else await session.terminate().catch(swallowAs("modal-sandbox: scratch terminate", undefined));
+          }
           sessionByName.delete(handle.id);
-          if (session) await session.terminate().catch(swallowAs("modal-sandbox: scratch terminate", undefined));
+          scratchKeyByName.delete(handle.id);
         });
       }
       if (tdOpts?.destroy && !scopeByName.has(handle.id)) return;

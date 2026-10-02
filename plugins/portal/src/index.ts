@@ -10,7 +10,7 @@ import { reportBackendError } from "../../chassis/src/error-reporting.ts";
 import "./instrument.ts";
 import { provisionTrustedAdmin } from "./trusted-admin.ts";
 import { createHash } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, METHODS, type IncomingMessage, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 import { ADMIN_LOGIN_SCRIPT, ADMIN_LOGIN_SCRIPT_HASH, openAdminLogin } from "./admin-login.ts";
 import { LRUCache } from "lru-cache";
@@ -56,7 +56,7 @@ import {
 } from "./proxy.ts";
 import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
 import { coreClaimStore, claimOnce, withinRateLimit, ClaimStoreUnavailableError } from "../../chassis/src/claims.ts";
-import { coreEmailAllowed } from "../../chassis/src/external-members.ts";
+import { coreEmailAdmission } from "../../chassis/src/external-members.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 import { errMessage } from "../../chassis/src/errors.ts";
 import {
@@ -207,6 +207,7 @@ export function clientIpOf(req: IncomingMessage): string {
 }
 
 const PRINCIPAL_RULE: PrincipalRule = {
+  requireCoreAdmission: Boolean(AUTH_BROKER_UPSTREAM),
   claim: (process.env.OIDC_PRINCIPAL_CLAIM ?? "email") as PrincipalRule["claim"],
   allowedEmailDomain: process.env.OIDC_ALLOWED_EMAIL_DOMAIN || undefined,
   allowedEmails: process.env.OIDC_ALLOWED_EMAILS?.split(",")
@@ -859,10 +860,7 @@ function sessionCookieSet(value: string, sub: string): string[] {
     secure: SECURE_COOKIES,
     ...(COOKIE_DOMAIN ? { domain: COOKIE_DOMAIN } : {}),
   };
-  return [
-    ...sessionCookieHeaders(value, attrs, process.env.PORTAL_FRAME_SESSION_ENABLED === "1"),
-    ...loginProviderCookie(sub),
-  ];
+  return [...sessionCookieHeaders(value, attrs), ...loginProviderCookie(sub)];
 }
 
 function setSession(res: ServerResponse, headers: string[]): void {
@@ -947,6 +945,7 @@ function renewSessionCookie(req: IncomingMessage, res: ServerResponse): SessionC
     SESSION_MAX_TTL_S,
   );
   if (!session) return null;
+  if (session.appOnly) return session;
   const now = Math.floor(Date.now() / 1000);
   if (now - session.iat < SESSION_RENEW_AFTER_S) return session;
   const authenticatedAt = session.auth ?? session.iat;
@@ -961,7 +960,19 @@ function renewSessionCookie(req: IncomingMessage, res: ServerResponse): SessionC
 }
 
 const server = createServer((req, res) => {
+  const startedAt = performance.now();
+  let errorLogged = false;
+  res.once("finish", () => {
+    if (res.statusCode >= 500 && !errorLogged)
+      console.error(
+        "[portal] %d %s response (%d ms)",
+        res.statusCode,
+        METHODS.includes(req.method ?? "") ? req.method : "?",
+        Math.round(performance.now() - startedAt),
+      );
+  });
   void handle(req, res).catch((err: unknown) => {
+    errorLogged = true;
     reportBackendError(err);
     console.error("[portal] 500 %s %s: %s", req.method ?? "?", (req.url ?? "?").split("?")[0], String(err));
     if (!res.headersSent) json(res, 500, { error: "internal_error" });
@@ -988,6 +999,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return proxyToAppHost(req, res, CORE);
   }
 
+  const brokerPath = brokerRouteFor(method, pathname);
+  const reauthentication =
+    (method === "GET" &&
+      ["/auth/login", "/auth/callback", "/auth/trusted/login", "/auth/trusted/callback"].includes(pathname)) ||
+    (method === "POST" && pathname === "/auth/logout") ||
+    brokerPath !== null;
+  if (currentSession(req)?.appOnly && !reauthentication) {
+    return json(res, 403, { error: "app_only_session", message: "this sign-in only permits access to shared apps" });
+  }
+
   void refreshSurfaceConfig();
 
   if (method === "GET" && pathname === "/healthz") return json(res, 200, { ok: true });
@@ -1009,6 +1030,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (pathname === "/auth/desktop" || pathname === "/auth/desktop/redeem") return desktopLogin(req, res, url);
   if (pathname === "/auth/invite") return inviteLogin(req, res);
   if (pathname === "/auth/admin-login") return adminLogin(req, res);
+  if (pathname === "/auth/signed-out" && method === "GET") {
+    if (currentSession(req))
+      return sendHtml(
+        res,
+        409,
+        connectPage({
+          title: "Still signed in",
+          body: "Use Sign out from the account menu to end this session.",
+          action: `<a class="btn" href="/">Back to the portal</a>`,
+        }),
+      );
+    return sendHtml(
+      res,
+      200,
+      connectPage({
+        title: "Signed out",
+        body: "You have signed out of this portal.",
+        action: `<a class="btn" href="/auth/login">Sign in</a>`,
+      }),
+    );
+  }
   if (pathname === "/auth/logout" && method === "POST") {
     if (!sameOriginRequest(req)) return json(res, 403, { error: "forbidden" });
     if (AUTH_BROKER_UPSTREAM && url.searchParams.get("everywhere") === "1") {
@@ -1036,8 +1078,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
     }
     const signedOutSession = currentSession(req);
+    const redirectTo = !AUTH_BROKER_UPSTREAM && signedOutSession && !signedOutSession.anon ? "/auth/signed-out" : "/";
     setSession(res, [
       ...(signedOutSession ? loginProviderCookie(signedOutSession.sub) : []),
+      clearCookie("portal_impersonate", "/", SECURE_COOKIES),
+      clearCookie("portal_trusted_tmp", "/auth/trusted", SECURE_COOKIES),
       clearCookie("portal_session", "/", SECURE_COOKIES, COOKIE_DOMAIN),
       clearCookie(FRAME_SESSION_COOKIE, "/", SECURE_COOKIES, COOKIE_DOMAIN),
       ...(COOKIE_DOMAIN
@@ -1050,13 +1095,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         : []),
     ]);
     if (wantsHtml(req)) {
-      res.writeHead(303, { location: "/", "cache-control": "no-store" });
+      res.writeHead(303, { location: redirectTo, "cache-control": "no-store" });
       return void res.end();
     }
-    return json(res, 200, { ok: true });
+    return json(res, 200, { ok: true, redirectTo });
   }
 
-  const brokerPath = brokerRouteFor(method, pathname);
   if (brokerPath) {
     if (method !== "GET" && !sameOriginRequest(req))
       return json(res, 403, { error: "forbidden", message: "cross-origin request refused" });
@@ -1591,7 +1635,7 @@ async function trustedAuth(req: IncomingMessage, res: ServerResponse, url: URL):
   }
 }
 
-function setAuthenticatedSession(res: ServerResponse, sub: string, name = ""): void {
+function setAuthenticatedSession(res: ServerResponse, sub: string, name = "", appOnly = false): void {
   const now = Math.floor(Date.now() / 1000);
   const session: SessionClaims = {
     k: "session",
@@ -1601,6 +1645,7 @@ function setAuthenticatedSession(res: ServerResponse, sub: string, name = ""): v
     iat: now,
     exp: now + SESSION_TTL_S,
     ...(name ? { name } : {}),
+    ...(appOnly ? { appOnly: true } : {}),
   };
   setSession(res, [
     ...sessionCookieSet(seal(session, sessionKey), session.sub),
@@ -1664,7 +1709,7 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
   if (!code || !stateParam || !safeEqual(stateParam, tmp.state)) return fail("invalid login state");
   if (!consumeState(tmp.state)) return fail("login already used, please try again");
 
-  let sub: string;
+  let principal: { sub: string; appOnly?: true };
   let name = "";
   try {
     const { accessToken, idToken } = await exchangeCode(OIDC, { code, codeVerifier: tmp.pkceVerifier });
@@ -1677,8 +1722,8 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
     const infoSub = typeof info.sub === "string" ? info.sub : "";
     if (!infoSub) throw new Error("userinfo missing sub");
     if (typeof claims.sub === "string" && claims.sub !== infoSub) throw new Error("subject mismatch");
-    sub = await resolvePrincipal(PRINCIPAL_RULE, { sub: infoSub, claims, userinfo: info }, (email) =>
-      coreEmailAllowed(CORE, CORE_SIGNING_SECRET, email, "portal"),
+    principal = await resolvePrincipal(PRINCIPAL_RULE, { sub: infoSub, claims, userinfo: info }, (email) =>
+      coreEmailAdmission(CORE, CORE_SIGNING_SECRET, email, "portal"),
     );
     const rawName = info.name ?? claims.name;
     if (typeof rawName === "string") name = rawName.trim().slice(0, 200);
@@ -1686,7 +1731,7 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
     return fail(errMessage(e, "sign-in failed"));
   }
 
-  setAuthenticatedSession(res, sub, name);
+  setAuthenticatedSession(res, principal.sub, name, principal.appOnly);
   res.writeHead(302, {
     location: sanitizeReturnTo(tmp.returnTo, PUBLIC_URL, APPS_DOMAIN),
     "cache-control": "no-store",

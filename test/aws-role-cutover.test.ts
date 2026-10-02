@@ -114,6 +114,7 @@ test("shared ACMECLI cutover isolates brokered STS without shrinking the existin
     kind: "channel" as const,
     threadRef: "ch:C-owner-auth:cron",
     channelRef: "C-owner-auth",
+    isPrivate: true,
     audience: [bob, alice],
   };
   const npm = await built.keychain!.save({ ownerId: "BOB", service: "npm", secret: "npm_BOB", envKey: "NPM_TOKEN" });
@@ -347,7 +348,12 @@ test("shared ACMECLI cutover isolates brokered STS without shrinking the existin
       triggered: true,
       ownerKeychainUnion: true,
     }),
-    /persistent control-plane deletion failure/,
+    (error: Error) => {
+      assert.equal(error.message, "Disposable sandbox destruction failed");
+      assert.equal(error.cause, undefined);
+      assert.ok(!error.stack?.includes("persistent control-plane deletion failure"));
+      return true;
+    },
   );
   built.sandbox.teardown = realTeardown;
   assert.ok(stranded);
@@ -423,6 +429,7 @@ test("cutover policy retains legacy files only in prefer-ephemeral mode", async 
   const conversation = {
     kind: "channel" as const,
     channelRef: "C-acmecli-fallback",
+    isPrivate: true,
     audience: [actor],
   };
 

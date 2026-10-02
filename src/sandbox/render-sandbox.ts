@@ -525,7 +525,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       backend: "render",
       writablePersistence: "provider_managed",
       processSessions: true,
-      concurrentUse: true,
       concurrentProvision: true,
       egressEnforcement: "none",
       spec: {

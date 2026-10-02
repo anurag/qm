@@ -1,5 +1,7 @@
+import { unsafeSVG } from "lit/directives/unsafe-svg.js";
 import { html, nothing, type TemplateResult } from "lit";
 import { live } from "lit/directives/live.js";
+import { tip } from "./tooltip.ts";
 import { Check, ChevronDown, Download, createElement, type IconNode } from "lucide";
 
 export function brandName(): string {
@@ -20,20 +22,34 @@ export function waveLoader(
   o: { width?: number; height?: number; viewBox?: string; label?: string; cls?: string } = {},
 ): TemplateResult {
   const width = o.width ?? 24.5;
-  return html`<svg
+  const height = o.height ?? width * 1.25;
+  const viewBox = o.viewBox ?? SWELL_VIEWBOX;
+  const [, , viewWidth, viewHeight] = viewBox.split(/\s+/).map(Number);
+  const shift = -24 * Math.min(width / viewWidth!, height / viewHeight!);
+  return html`<span
     class="wl wl-swell ${o.cls ?? ""}"
-    width=${width}
-    height=${o.height ?? width * 1.25}
-    viewBox=${o.viewBox ?? SWELL_VIEWBOX}
-    fill="none"
+    style=${`width:${width}px;height:${height}px;--wl-shift:${shift}px`}
     role="img"
     aria-label=${o.label ?? "Loading"}
-    xmlns="http://www.w3.org/2000/svg"
   >
-    <g class="wl-row">
+    <svg
+      class="wl-row"
+      width=${width}
+      height=${height}
+      viewBox=${viewBox}
+      fill="none"
+      aria-hidden="true"
+      xmlns="http://www.w3.org/2000/svg"
+    >
       <path d=${SWELL_PATH} fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="2.6" />
-    </g>
-  </svg>`;
+    </svg>
+  </span>`;
+}
+
+export function sheenLabel(label: string, active: boolean): TemplateResult {
+  return html`<span class="sheen-label ${active ? "thinking-sheen" : ""}" data-sheen=${active ? label : ""}
+    >${label}</span
+  >`;
 }
 
 export function workingWave(): TemplateResult {
@@ -196,8 +212,20 @@ export function modelMark(key: string, size = 16): TemplateResult | null {
   </svg>`;
 }
 
-export function icon(node: IconNode, size = 18): SVGElement {
-  const el = createElement(node, {
+const iconTemplates = new WeakMap<IconNode, Map<number, TemplateResult>>();
+
+export function icon(node: IconNode, size = 18): TemplateResult {
+  let sizes = iconTemplates.get(node);
+  if (!sizes) iconTemplates.set(node, (sizes = new Map()));
+  const cached = sizes.get(size);
+  if (cached) return cached;
+  const template = html`${unsafeSVG(iconElement(node, size).outerHTML)}`;
+  sizes.set(size, template);
+  return template;
+}
+
+function iconElement(node: IconNode, size: number): SVGElement {
+  return createElement(node, {
     class: "icon",
     width: size,
     height: size,
@@ -205,7 +233,6 @@ export function icon(node: IconNode, size = 18): SVGElement {
     focusable: "false",
     "stroke-width": 1.9,
   });
-  return el;
 }
 
 export function fieldSelect(props: {
@@ -214,6 +241,7 @@ export function fieldSelect(props: {
   value?: string;
   id?: string;
   ariaLabel?: string;
+  ariaDescription?: string;
   describedBy?: string;
   focusKey?: string;
   disabled?: boolean;
@@ -226,6 +254,7 @@ export function fieldSelect(props: {
     <select
       id=${props.id ?? nothing}
       aria-label=${props.ariaLabel ?? nothing}
+      aria-description=${props.ariaDescription ?? nothing}
       aria-describedby=${props.describedBy ?? nothing}
       data-focus-key=${props.focusKey ?? nothing}
       .value=${props.value === undefined ? nothing : live(props.value)}
@@ -242,6 +271,7 @@ export interface MenuSelectOption {
   value: string | null;
   label: string;
   glyph?: IconNode;
+  disabledHint?: string;
 }
 
 export function menuSelect(props: {
@@ -262,8 +292,12 @@ export function menuSelect(props: {
         type="button"
         role="menuitemradio"
         aria-checked=${active ? "true" : "false"}
+        aria-disabled=${o.disabledHint ? "true" : nothing}
+        aria-description=${o.disabledHint || nothing}
+        ${tip(o.disabledHint ?? "")}
         @click=${(e: Event) => {
           e.stopPropagation();
+          if (o.disabledHint) return;
           closeFormMenus();
           props.onSelect(o.value ?? null);
         }}
@@ -436,7 +470,7 @@ export function setFormMenuValue(control: HTMLElement | null, value: string, lab
   const activeOption = Array.from(control.querySelectorAll<HTMLButtonElement>(".menu-option")).find((option) =>
     option.classList.contains("active"),
   );
-  if (activeOption) activeOption.append(icon(Check, 15));
+  if (activeOption) activeOption.append(iconElement(Check, 15));
 }
 
 export function chipBadge(

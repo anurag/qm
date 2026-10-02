@@ -15,6 +15,7 @@ export function mintDesktopLogin(
   challenge: string,
   state: string,
 ) {
+  if (session.appOnly) throw new Error("app-only sessions cannot sign in to the desktop");
   const now = Math.floor(Date.now() / 1000);
   return seal(
     {
@@ -51,6 +52,7 @@ export function openDesktopLogin(
   if (
     !p ||
     p.k !== "desktop-login" ||
+    p.appOnly !== undefined ||
     p.aud !== origin ||
     p.org !== org ||
     typeof p.sub !== "string" ||

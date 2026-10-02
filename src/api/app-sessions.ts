@@ -1,5 +1,12 @@
+import { createCurrentScopeMembers } from "../resolution/scope-membership.ts";
 import { notifyDeploymentShared } from "../deploy/share-notice.ts";
-import { sessionTreeRoot, sessionTreeRunCount, SUBAGENT_TREE_RUN_CAP } from "../sessions/session-syscalls.ts";
+import { deploymentShareScope } from "../deploy/email-access.ts";
+import {
+  sessionTreeRoot,
+  sessionTreeRunCount,
+  SUBAGENT_TREE_RUN_CAP,
+  workingSessionThreadRefs,
+} from "../sessions/session-syscalls.ts";
 import { isSessionStatus } from "../sessions/session-status.ts";
 import type { PendingApprovalRecord } from "../types.ts";
 import { orgId as orgIdOf } from "../config.ts";
@@ -9,14 +16,17 @@ import { entryWithinTenure, transcriptEntries, windowedTranscript } from "../ses
 import { createTranscriptSource } from "../harness/tape-projection.ts";
 import { appendCoverageImport } from "../harness/replay.ts";
 import { swallowAs } from "../util/errors.ts";
+import { latestGoalRecord } from "../harness/goal.ts";
 import { SEARCH_HIT_LIMIT, entrySearchText, searchSnippet, searchTerms } from "../sessions/entry-search.ts";
 import { supportsProcessSessions } from "../sandbox/sandbox.ts";
 import { processIsGone } from "../sandbox/process-poll.ts";
+import { cronIsActive, cronTiedTo } from "../cron/cron-store.ts";
 import { cronRef, deployRef, encodeRef, fileRef, parseRef, skillRef } from "../acl/resource-ref.ts";
 import { samePerson } from "../directory/person.ts";
 import { AdminError } from "../admin/admin-service.ts";
 import { type ArtifactHome } from "./artifact-share.ts";
 import { randomUUID } from "node:crypto";
+import { isOpenScopeMember } from "../resolution/sharing-access.ts";
 import { MAX_ATTACHMENT_BYTES, mimeFromName, safeAttachmentName } from "../core/attachments.ts";
 import { projectIdFromGroupRef, projectScopeId } from "../projects/project-store.ts";
 
@@ -44,6 +54,8 @@ function tailWindowLimit(window?: TranscriptWindow): number | undefined {
 function coversTailWindow(entries: readonly { type: string }[], tailTurns: number): boolean {
   return entries.filter((e) => e.type === "user").length >= tailTurns;
 }
+
+const GOAL_LOOKBACK_ENTRIES = 2000;
 
 export function createSessionMethods(
   deps: AppDeps,
@@ -73,6 +85,9 @@ export function createSessionMethods(
   | "setProjectSlackChannel"
   | "listScopeResources"
   | "managesScope"
+  | "isOpenScopeMember"
+  | "isCurrentSharedScopeMember"
+  | "currentScopeMembers"
   | "membershipControlsScope"
   | "authorizesCapabilityScope"
   | "updateSession"
@@ -208,7 +223,7 @@ export function createSessionMethods(
       if (!session) return null;
       let limit = tailWindowLimit(window);
       const [initialRead, pinRecords] = await Promise.all([
-        transcripts.forRender(sessionId, { limit, beforeSeq: window?.beforeSeq }),
+        transcripts.forRender(sessionId, { limit, beforeSeq: window?.beforeSeq, sinceSeq: window?.sinceSeq }),
         deps.sessions.listPins(sessionId),
       ]);
       let read = initialRead;
@@ -253,7 +268,11 @@ export function createSessionMethods(
       if (!session) return null;
       let limit = tailWindowLimit(window);
       const [initialRead, pinRecords] = await Promise.all([
-        transcripts.forViewer(sessionId, principalId, { limit, beforeSeq: window?.beforeSeq }),
+        transcripts.forViewer(sessionId, principalId, {
+          limit,
+          beforeSeq: window?.beforeSeq,
+          sinceSeq: window?.sinceSeq,
+        }),
         deps.sessions.listPins(sessionId),
       ]);
       let read = initialRead;
@@ -388,7 +407,6 @@ export function createSessionMethods(
     },
 
     async listSessions(principalId) {
-      const workingThreadRefs = new Set(await deps.runs.activeSessionIds());
       const all = await sessionsForViewer(principalId);
       const visibleById = new Map(all.map((session) => [session.id, session]));
       const approvalRows: PendingApprovalRecord[] = [];
@@ -397,6 +415,7 @@ export function createSessionMethods(
         if (session && (await approvalRecordIsCurrent(record, session))) approvalRows.push(record);
       }
       const waiting = new Set(approvalRows.filter((r) => r.blocksInput !== false).map((r) => r.sessionId));
+      const workingThreadRefs = await workingSessionThreadRefs(deps.sessions, deps.runs, waiting);
       const sessions = all.filter(
         (s) =>
           s.hasEntries !== false || Boolean(s.title?.trim()) || workingThreadRefs.has(s.threadRef) || waiting.has(s.id),
@@ -414,12 +433,39 @@ export function createSessionMethods(
       }
       const cronCounts = new Map<string, number>();
       for (const c of await deps.crons.list()) {
-        if (!c.enabled || c.archived || !c.destination) continue;
-        cronCounts.set(c.destination.target, (cronCounts.get(c.destination.target) ?? 0) + 1);
+        if (!cronIsActive(c)) continue;
+        for (const ref of new Set([c.destination?.target, c.sessionRef])) {
+          if (ref) cronCounts.set(ref, (cronCounts.get(ref) ?? 0) + 1);
+        }
+      }
+      const failedChildren = new Set<string>();
+      for (const s of sessions) {
+        if (!s.parentSessionId || workingThreadRefs.has(s.threadRef) || waiting.has(s.id)) continue;
+        const run = await deps.runs.latestForThread(s.threadRef);
+        if (run?.status === "failed" || run?.result?.status === "failed") failedChildren.add(s.id);
+      }
+      const goals = new Map<
+        string,
+        { objective: string; activeMs: number; runningSince?: number; floor?: Record<string, number> }
+      >();
+      for (const s of sessions) {
+        if (!workingThreadRefs.has(s.threadRef)) continue;
+        const since = Math.max(0, (await deps.sessions.latestEntrySeq(s.id)) - GOAL_LOOKBACK_ENTRIES);
+        const goal = latestGoalRecord(await deps.sessions.getEntries(s.id, { sinceSeq: since }));
+        if (!goal) continue;
+        const runningSince = (await deps.runs.latestForThread(s.threadRef))?.startedAt ?? undefined;
+        if (goal.status === "active")
+          goals.set(s.id, {
+            objective: goal.objective,
+            activeMs: goal.activeMs ?? 0,
+            ...(runningSince ? { runningSince: Math.max(runningSince, goal.createdAt) } : {}),
+            ...(goal.floor ? { floor: { ...goal.floor } } : {}),
+          });
       }
       if (
         workingThreadRefs.size === 0 &&
         waiting.size === 0 &&
+        failedChildren.size === 0 &&
         jobCounts.size === 0 &&
         watchCounts.size === 0 &&
         cronCounts.size === 0
@@ -429,9 +475,11 @@ export function createSessionMethods(
         ...s,
         ...(workingThreadRefs.has(s.threadRef) ? { working: true } : {}),
         ...(waiting.has(s.id) ? { awaitingInput: true } : {}),
+        ...(failedChildren.has(s.id) ? { lastTurnFailed: true } : {}),
         ...(jobCounts.has(s.threadRef) ? { backgroundJobs: jobCounts.get(s.threadRef)! } : {}),
         ...(watchCounts.has(s.threadRef) ? { watches: watchCounts.get(s.threadRef)! } : {}),
         ...(cronCounts.has(s.threadRef) ? { crons: cronCounts.get(s.threadRef)! } : {}),
+        ...(goals.has(s.id) ? { goal: goals.get(s.id)! } : {}),
       }));
     },
 
@@ -489,14 +537,20 @@ export function createSessionMethods(
           expiresAt: m.expiresAt,
           ...(m.lastFiredAt !== undefined ? { lastFiredAt: m.lastFiredAt } : {}),
         }));
-      const crons = (await deps.crons.list())
-        .filter((c) => c.enabled && !c.archived && c.destination?.target === session.threadRef)
-        .sort((a, b) => b.createdAt - a.createdAt)
-        .map((c) => ({
-          id: c.id,
-          ...(c.title !== undefined ? { title: c.title } : {}),
-          ...(c.nextFireAt !== undefined ? { nextFireAt: c.nextFireAt } : {}),
-        }));
+      const crons = await Promise.all(
+        (await deps.crons.list())
+          .filter((c) => cronIsActive(c) && cronTiedTo(c, session.threadRef))
+          .sort((a, b) => b.createdAt - a.createdAt)
+          .map(async (c) => {
+            const last = (await deps.crons.listFires(c.id, { limit: 1 })).runs[0];
+            return {
+              id: c.id,
+              ...(c.title !== undefined ? { title: c.title } : {}),
+              ...(c.nextFireAt !== undefined ? { nextFireAt: c.nextFireAt } : {}),
+              ...(last ? { lastFire: { firedAt: last.firedAt, ...(last.status ? { status: last.status } : {}) } } : {}),
+            };
+          }),
+      );
       return { jobs, watches, crons };
     },
 
@@ -728,6 +782,30 @@ export function createSessionMethods(
       return principalCanManageScope(principalId, scope);
     },
 
+    currentScopeMembers: createCurrentScopeMembers(
+      {
+        managedGroups: deps.projects,
+        directory: deps.directory,
+        identity: deps.identity,
+      },
+      true,
+    ),
+    isCurrentSharedScopeMember(principalId, scope) {
+      const { kind } = parseScopeId(scope);
+      return kind === "channel" || kind === "group"
+        ? principalCanWriteScope(principalId, scope)
+        : Promise.resolve(false);
+    },
+
+    isOpenScopeMember(principalId, scope) {
+      return isOpenScopeMember({
+        actorId: principalId,
+        scope,
+        config: deps.config,
+        isCurrentSharedScopeMember: principalCanWriteScope,
+      });
+    },
+
     membershipControlsScope(scope) {
       return membershipControlsScope(scope);
     },
@@ -956,6 +1034,19 @@ export function createSessionMethods(
     },
 
     async grant(g) {
+      if (parseRef(g.ref).kind === "deploy") {
+        g = {
+          ...g,
+          granteeScopeId: await deploymentShareScope(
+            g.granteeScopeId,
+            g.permission,
+            async (email) =>
+              deps.identity.isInternal(deps.identity.classify(email)) &&
+              (await h.directoryMember(email))?.type === "internal",
+          ),
+        };
+        await deps.deploy.assertShareAllowed(g.ownerScopeId, g.granteeScopeId, g.permission);
+      }
       await deps.acl.grant(g, await artifactAuthor(g.ownerScopeId, g.ref));
       deps.auditLog.record({
         at: Date.now(),
@@ -1094,7 +1185,11 @@ export function createSessionMethods(
         try {
           await deps.config.refreshScope(scopeIdValue);
           snapshot = await deps.config.captureSoulSnapshot(scopeIdValue);
-          const version = await deps.config.setSoulLatest(scopeIdValue, content, actorId);
+          const version =
+            opts?.expectedVersion === undefined
+              ? await deps.config.setSoulLatest(scopeIdValue, content, actorId)
+              : await deps.config.setSoulIfVersion(scopeIdValue, opts.expectedVersion, content, actorId);
+          if (version === null) throw new Error("Guidance changed; read it and retry the edit.");
           deps.auditLog.record({
             at: Date.now(),
             principalId: actorId,
@@ -1105,6 +1200,7 @@ export function createSessionMethods(
           return version;
         } catch (error) {
           if (snapshot !== undefined) deps.config.restoreSoulCacheSnapshot(scopeIdValue, snapshot);
+          if (opts?.expectedVersion !== undefined) await deps.config.refreshScope(scopeIdValue);
           throw error;
         }
       };
