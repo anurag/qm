@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRenderSandbox, type StoredRenderSandbox } from "../src/sandbox/render-sandbox.ts";
+import {
+  createRenderSandbox,
+  type StoredRenderSandbox,
+  type StoredRenderScratch,
+} from "../src/sandbox/render-sandbox.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { createMemoryAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
@@ -39,6 +43,7 @@ function setup(
   const workspace = createLocalWorkspaceStore(dir);
   const blobTransfer = createLocalBlobTransferStore(join(dir, "blobs"));
   const store = createMemoryMap<StoredRenderSandbox>();
+  const scratchStore = createMemoryMap<StoredRenderScratch>();
   const advisoryLock = createMemoryAdvisoryLock();
   const snapshots = createMemorySnapshotStore();
   const errors: Array<{ code: string; message: string }> = [];
@@ -46,6 +51,7 @@ function setup(
     createRenderSandbox(workspace, {
       client,
       store,
+      scratchStore,
       advisoryLock,
       blobTransfer,
       snapshots: snapshotStore,
@@ -58,7 +64,21 @@ function setup(
     fake.cleanup();
     rmSync(dir, { recursive: true, force: true });
   });
-  return { fake, http, store, make, scope, layers, blobTransfer, snapshots, dir, workspace, advisoryLock, errors };
+  return {
+    fake,
+    http,
+    store,
+    scratchStore,
+    make,
+    scope,
+    layers,
+    blobTransfer,
+    snapshots,
+    dir,
+    workspace,
+    advisoryLock,
+    errors,
+  };
 }
 
 const processPath = "/root/.agent-proc/11111111-1111-1111-1111-111111111111";
@@ -1093,47 +1113,51 @@ test("Render checkpoints background changes before TTL even when idle reaping is
 });
 
 for (const operation of ["file import", "provision preparation"] as const) {
-  test(`Render completes ${operation} before another core checkpoints and expires its sandbox`, async (t) => {
-    const { make, fake, layers, store, scope, workspace, advisoryLock } = setup(t);
-    const sandbox = make();
-    const other = make();
-    const handle = await sandbox.provision(layers);
-    const stored = (await store.get(scope))!;
-    const layerScope = scopeId("personal", "reference");
-    await workspace.write(layerScope, "latest", "completed operation");
-    const uploading = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    const archivePath = operation === "file import" ? "/.extract.tar" : "/.ro-layers.tar";
-    const write = fake.client.writeFileBytes;
-    fake.client.writeFileBytes = async (id, path, data) => {
-      await write(id, path, data);
-      if (path.endsWith(archivePath)) {
-        uploading.resolve();
-        await release.promise;
+  test(
+    `Render completes ${operation} before another core checkpoints and expires its sandbox`,
+    { timeout: 60_000 },
+    async (t) => {
+      const { make, fake, layers, store, scope, workspace, advisoryLock } = setup(t);
+      const sandbox = make();
+      const other = make();
+      const handle = await sandbox.provision(layers);
+      const stored = (await store.get(scope))!;
+      const layerScope = scopeId("personal", "reference");
+      await workspace.write(layerScope, "latest", "completed operation");
+      const uploading = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const archivePath = operation === "file import" ? /\/\.extract-[^/]+\.tar$/ : /\/\.ro-layers\.tar$/;
+      const write = fake.client.writeFileBytes;
+      fake.client.writeFileBytes = async (id, path, data) => {
+        await write(id, path, data);
+        if (archivePath.test(path)) {
+          uploading.resolve();
+          await release.promise;
+        }
+      };
+      const pending =
+        operation === "file import"
+          ? sandbox.importFiles!(handle, [{ path: "latest", data: Buffer.from("completed operation") }])
+          : sandbox.provision([...layers, { scopeId: layerScope, mountPath: "", mode: "ro" }]);
+      await uploading.promise;
+      const expiresAtMs = Date.now() + 60_000;
+      fake.sandboxes.get(stored.sandboxId)!.expiresAtMs = expiresAtMs;
+      await store.merge(scope, { expiresAtMs });
+      try {
+        const key = operation === "file import" ? `render-sandbox-use:${handle.id}` : `render-sandbox:${handle.id}`;
+        assert.equal(await advisoryLock.tryWithLock!(key, async () => true), null);
+        assert.deepEqual(await other.reapDeepIdle!(0), { reaped: 0 });
+        assert.equal(fake.sandboxes.get(stored.sandboxId)?.status, "running");
+      } finally {
+        release.resolve();
+        await pending;
       }
-    };
-    const pending =
-      operation === "file import"
-        ? sandbox.importFiles!(handle, [{ path: "latest", data: Buffer.from("completed operation") }])
-        : sandbox.provision([...layers, { scopeId: layerScope, mountPath: "", mode: "ro" }]);
-    await uploading.promise;
-    const expiresAtMs = Date.now() + 60_000;
-    fake.sandboxes.get(stored.sandboxId)!.expiresAtMs = expiresAtMs;
-    await store.merge(scope, { expiresAtMs });
-    try {
-      const key = operation === "file import" ? `render-sandbox-use:${handle.id}` : `render-sandbox:${handle.id}`;
-      assert.equal(await advisoryLock.tryWithLock!(key, async () => true), null);
-      assert.deepEqual(await other.reapDeepIdle!(0), { reaped: 0 });
-      assert.equal(fake.sandboxes.get(stored.sandboxId)?.status, "running");
-    } finally {
-      release.resolve();
-      await pending;
-    }
-    assert.deepEqual(await other.reapDeepIdle!(0), { reaped: 1 });
-    assert.equal(fake.sandboxes.get(stored.sandboxId)?.status, "terminated");
-    const restored = await other.provision(layers);
-    assert.equal(await other.readFile(restored, "latest"), "completed operation");
-  });
+      assert.deepEqual(await other.reapDeepIdle!(0), { reaped: 1 });
+      assert.equal(fake.sandboxes.get(stored.sandboxId)?.status, "terminated");
+      const restored = await other.provision(layers);
+      assert.equal(await other.readFile(restored, "latest"), "completed operation");
+    },
+  );
 }
 
 test("Render skips remote probes and checkpoints for a recently used sandbox", async (t) => {

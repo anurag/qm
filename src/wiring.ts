@@ -8,7 +8,7 @@ import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/re
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { S3Client } from "@aws-sdk/client-s3";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
-import { createRenderSandbox, type StoredRenderSandbox } from "./sandbox/render-sandbox.ts";
+import { createRenderSandbox, type StoredRenderSandbox, type StoredRenderScratch } from "./sandbox/render-sandbox.ts";
 import { createSdkRenderClient } from "./sandbox/render-client.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { asObject } from "./harness/codex-auth-file.ts";
@@ -932,6 +932,7 @@ export function buildApp(
   const modalBodies = artifactMap<StoredModalSandbox>("modal_sandbox_bodies");
   const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
   const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
+  const renderScratch = artifactMap<StoredRenderScratch>("render_scratch_bodies");
   const buildE2b = (): Sandbox => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey) throw new Error("SANDBOX_BACKEND=e2b requires E2B_API_KEY");
@@ -1122,6 +1123,7 @@ export function buildApp(
       }),
       ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
       store: renderBodies,
+      scratchStore: renderScratch,
       snapshots: createS3SnapshotStore({
         bucket: config.s3Bucket,
         prefix: `${config.s3Prefix ?? ""}render-home`,

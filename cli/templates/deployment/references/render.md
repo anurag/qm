@@ -177,6 +177,36 @@ service, database, and objects. Restore the app with the same tools. Verify
 retained records and file contents after restore. Direct Render service deletion
 is part of permanent cleanup below; it does not run the QM archive flow.
 
+## Shared features
+
+Render builds the same core, portal, web UI, and admin sources as the other
+targets. Use the current CLI and run `qm up` from a deployment directory whose
+`render.source` selects the updated repository and branch. The CLI applies
+registered database migrations and builds the services at one source commit.
+
+For swarms, set `env.core.SANDBOX_RESOURCES_ENABLED` to `"true"` and enable the
+`swarms` feature flag for the required people in Admin. Workers and the shared
+board use native Render Sandboxes when Render is the selected backend. Each
+worker starts with a blank computer. Verify worker creation, shared board access,
+pause, resume, and retirement before enabling it for more people.
+
+Enable `app_annotations` for the required people to add app screenshots, selected
+text, and comments to chat. Test the published app through QM's app URL so the
+core serves the app shell and annotation assets. Inbox Loops and Loop triage use
+the `inbox_loops` and `loop_triage` feature flags. External app sharing requires
+the separate `external_app_sharing` flag.
+
+Use `securityScreen.mode` with `"off"`, `"observe"`, or `"enforce"`. Remove retired
+screening settings before updating. For chat access from another first-party
+app, set `env.portal.PORTAL_API_ALLOWED_ORIGINS` to a comma-separated list of exact
+HTTPS origins. The app must be on the same site as the portal for the browser to
+send its session cookie. Do not list published user apps.
+
+Temporary sandbox IDs and pending cleanup are stored in Postgres. A later core
+can retry deletion. The cleanup sweep deletes expired temporary sandboxes and
+retries failed cleanup. Temporary sandboxes have no home checkpoints. Regular
+agent computers retain the existing native and portable checkpoint behavior.
+
 ## Agent-computer proof
 
 Native Render Sandboxes have no operator shell, so read the proof file from the

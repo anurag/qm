@@ -25,7 +25,14 @@ import {
   createBackendBlobStaging,
   type BlobStagingOptions,
 } from "./exec-file-ops.ts";
-import { visibleTools, type ComputerStatus, type ExecResult, type Sandbox, type SandboxHandle } from "./sandbox.ts";
+import {
+  SandboxProvisionCleanupError,
+  visibleTools,
+  type ComputerStatus,
+  type ExecResult,
+  type Sandbox,
+  type SandboxHandle,
+} from "./sandbox.ts";
 import {
   RenderCheckpointUnconfirmedError,
   RenderSnapshotGoneError,
@@ -58,9 +65,14 @@ export interface StoredRenderSandbox extends RenderSandboxResources {
   recoveryError?: string;
 }
 
+export interface StoredRenderScratch extends RenderSandboxInfo {
+  cleanupPending?: boolean;
+}
+
 export interface RenderSandboxOptions extends BlobStagingOptions {
   client: RenderClient;
   store: DurableMap<StoredRenderSandbox>;
+  scratchStore: DurableMap<StoredRenderScratch>;
   advisoryLock: AdvisoryLock;
   snapshots: HomeSnapshotStore;
   namePrefix?: string;
@@ -74,7 +86,7 @@ export interface RenderSandboxOptions extends BlobStagingOptions {
 }
 
 export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandboxOptions): Sandbox {
-  const { client, store, advisoryLock } = opts;
+  const { client, store, scratchStore, advisoryLock } = opts;
   const prefix = opts.namePrefix ?? "qm";
   const homeDir = opts.homeDir ?? "/root";
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
@@ -96,7 +108,14 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       operation: (handle: SandboxHandle, ...args: Args) => Promise<Result>,
     ): ((handle: SandboxHandle, ...args: Args) => Promise<Result>) =>
     (handle, ...args) =>
-      shared(useKey(handle.id), () => operation(handle, ...args));
+      shared(useKey(handle.id), async () => {
+        if (handle.scratch && handle.providerSandboxId) {
+          const temporary = await scratchStore.get(handle.id);
+          if (temporary?.id !== handle.providerSandboxId || temporary.cleanupPending)
+            throw new Error("Render disposable sandbox has been released");
+        }
+        return operation(handle, ...args);
+      });
   const reportError = (code: string, error: unknown, scopeLabel?: string): void =>
     opts.onError?.({
       category: "sandbox_snapshot",
@@ -113,8 +132,12 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   const recentlySaved = (stored: StoredRenderSandbox): boolean =>
     stored.savedAtMs !== undefined && Date.now() - stored.savedAtMs < checkpointIntervalMs;
   const idFor = async (name: string): Promise<string> => {
-    const temporary = scratch.get(name);
-    if (temporary) return temporary.id;
+    if (!base.scopeFor(name)) {
+      const temporary = await scratchStore.get(name);
+      if (!temporary) throw new Error("Render disposable sandbox has been released");
+      if (temporary.cleanupPending) throw new Error("Render disposable sandbox cleanup is pending");
+      return temporary.id;
+    }
     const scope = scopeFor(name);
     const stored = await store.get(scope);
     if (!stored || cleanupOnly(stored)) throw new Error(`Render sandbox is not provisioned: ${name}`);
@@ -478,6 +501,17 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     );
   }
 
+  async function destroyScratch(name: string): Promise<void> {
+    const temporary = (await scratchStore.get(name)) ?? scratch.get(name);
+    if (!temporary) return;
+    await withUse(name, async () => {
+      await scratchStore.put(name, { ...temporary, cleanupPending: true });
+      await client.terminate(temporary.id);
+      await scratchStore.delete(name);
+      scratch.delete(name);
+    });
+  }
+
   const base = createExecSandboxBase({
     workspace,
     label: "render",
@@ -493,16 +527,25 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     ensureResident,
     isProvisioned: (name) => scratch.has(name),
     async recreateScratch(name) {
-      scratch.set(name, await client.create());
+      const temporary = await client.create();
+      scratch.set(name, temporary);
+      try {
+        await scratchStore.put(name, temporary);
+      } catch (error) {
+        try {
+          await client.terminate(temporary.id);
+          scratch.delete(name);
+        } catch (cleanupError) {
+          await scratchStore.put(name, { ...temporary, cleanupPending: true });
+          reportError("scratch_cleanup_failed", cleanupError);
+        }
+        throw error;
+      }
     },
     async deleteInstance(name) {
-      const temporary = scratch.get(name);
-      if (temporary) {
-        await withUse(name, () => client.terminate(temporary.id));
-        scratch.delete(name);
-      } else {
-        await destroyScope(scopeFor(name));
-      }
+      const scope = base.scopeFor(name);
+      if (scope) await destroyScope(scope);
+      else await destroyScratch(name);
     },
     ...(opts.layerToolFiles ? { installLayerTools: createLayerToolInstaller(opts.layerToolFiles) } : {}),
   });
@@ -542,8 +585,25 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
         ? sandboxScopeName(`${prefix}-scratch`, options.scratch.key)
         : nameFor(writable?.scopeId ?? "default");
       return withLifecycle(name, async () => {
-        const handle = await base.provision(layers, options);
-        if (!handle.scratch) {
+        if (options?.scratch) {
+          const temporary = await scratchStore.get(name);
+          if (temporary?.cleanupPending) await destroyScratch(name);
+          else if (temporary && scratch.get(name)?.id !== temporary.id)
+            throw new Error("Render disposable sandbox is in use by another core");
+          else if (!temporary) scratch.delete(name);
+        }
+        let handle: SandboxHandle;
+        try {
+          handle = await base.provision(layers, options);
+        } catch (error) {
+          const temporary = scratch.get(name);
+          if (error instanceof SandboxProvisionCleanupError && temporary)
+            throw new SandboxProvisionCleanupError({ ...error.handle, providerSandboxId: temporary.id });
+          throw error;
+        }
+        if (handle.scratch) {
+          handle.providerSandboxId = scratch.get(handle.id)?.id;
+        } else {
           const scope = scopeFor(handle.id);
           const stored = await store.get(scope);
           if (stored && stored.homeCheckpointAtMs === undefined && !recentlySaved(stored))
@@ -659,7 +719,12 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       });
     },
     async teardown(handle, options) {
-      if (handle.scratch) return withLifecycle(handle.id, () => base.teardown(handle, options));
+      if (handle.scratch)
+        return withLifecycle(handle.id, async () => {
+          const temporary = await scratchStore.get(handle.id);
+          if (handle.providerSandboxId && temporary?.id !== handle.providerSandboxId) return;
+          await base.teardown(handle, options);
+        });
       const scope = scopeFor(handle.id);
       if (options?.destroy) return destroyScope(scope);
       await withLifecycle(handle.id, async () => {
@@ -691,6 +756,15 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     },
     async reapDeepIdle(idleMs) {
       let reaped = 0;
+      for (const [name, candidate] of await scratchStore.entries()) {
+        if (!candidate.cleanupPending && candidate.expiresAtMs > Date.now()) continue;
+        await tryLock(lifecycleKey(name), async () => {
+          const temporary = await scratchStore.get(name);
+          if (!temporary || (!temporary.cleanupPending && temporary.expiresAtMs > Date.now())) return;
+          await destroyScratch(name);
+          reaped++;
+        }).catch((error) => reportError("scratch_cleanup_failed", error));
+      }
       const cutoff = idleMs > 0 ? Date.now() - idleMs : -Infinity;
       const stale = (stored: StoredRenderSandbox): boolean => stored.homeDirty !== false && !recentlySaved(stored);
       const due = (stored: StoredRenderSandbox): boolean =>
