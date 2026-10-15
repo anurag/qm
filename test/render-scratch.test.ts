@@ -165,6 +165,7 @@ test("Render retries failed preparation cleanup from another core", async (t) =>
     handle = error.handle;
     return true;
   });
+  assert.equal(handle!.providerSandboxId, "sbx-1");
   assert.equal((await scratchStore.get(handle!.id))?.cleanupPending, true);
   const other = make();
   assert.deepEqual(await other.reapDeepIdle!(0), { reaped: 0 });

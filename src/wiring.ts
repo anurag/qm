@@ -1254,7 +1254,9 @@ export function buildApp(
             ...e2b.map(([scopeId, body]) => ({ scopeId, backend: "e2b" as const, machineId: body.sandboxId })),
             ...modal.map(([scopeId, body]) => ({ scopeId, backend: "modal" as const, machineId: body.sandboxId })),
             ...aws.map(([scopeId, body]) => ({ scopeId, backend: "aws" as const, machineId: body.microvmId })),
-            ...render.map(([scopeId, body]) => ({ scopeId, backend: "render" as const, machineId: body.sandboxId })),
+            ...render
+              .filter(([, body]) => !body.discarded)
+              .map(([scopeId, body]) => ({ scopeId, backend: "render" as const, machineId: body.sandboxId })),
             ...superserve.map(([scopeId, body]) => ({
               scopeId,
               backend: "superserve" as const,
