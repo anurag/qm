@@ -1,5 +1,6 @@
 import { externalSlackCapabilityAllowed } from "./external-slack-capability.ts";
 import { MemoryDisclosureDenied } from "../memory/disclosure.ts";
+import { MemoryFactsMissing } from "../memory/facts.ts";
 import { reportBackendError, startTiming } from "../../plugins/chassis/src/error-reporting.ts";
 import { traceStatus } from "../../plugins/chassis/src/timing.ts";
 import {
@@ -99,7 +100,7 @@ function unattendedAdminReadAllowed(method: string, pathname: string, claims: Ca
 }
 
 function isAdminContentRead(pathname: string): boolean {
-  if (pathname === "/v1/admin/memory") return true;
+  if (pathname === "/v1/admin/memory" || pathname === "/v1/admin/scopes") return true;
   if (pathname === "/v1/admin/keychain") return true;
   if (pathname === "/v1/admin/volumes") return true;
   if (pathname.startsWith("/v1/admin/scopes/")) return true;
@@ -130,7 +131,6 @@ function strictPostAllowed(pathname: string, body: unknown): boolean {
     pathname === "/v1/projects" ||
     pathname === "/v1/memory/search" ||
     pathname === "/v1/search" ||
-    pathname === "/v1/memory/restore" ||
     pathname.startsWith("/v1/run-signals/")
   )
     return true;
@@ -233,7 +233,10 @@ async function verifyCapability(
           ...(capability.members ? { members: capability.members } : {}),
         }))
   ) {
-    sendJson(res, 403, { error: "forbidden", message: "capability scope membership has been revoked" });
+    sendJson(res, 403, {
+      error: "forbidden",
+      message: "the acting user is not currently authorized for this conversation",
+    });
     return null;
   }
   if (requiredAud && capability.aud !== requiredAud) {
@@ -373,8 +376,10 @@ function baseCtx(req: IncomingMessage, res: ServerResponse, wiring: Wiring): Bas
 }
 
 function respondError(req: IncomingMessage, res: ServerResponse, err: unknown): void {
-  if (err instanceof MemoryDisclosureDenied) {
-    if (!res.headersSent) sendJson(res, 403, { error: "forbidden", message: err.message });
+  if (err instanceof MemoryDisclosureDenied || err instanceof MemoryFactsMissing) {
+    const status = err instanceof MemoryFactsMissing ? 404 : 403;
+    if (!res.headersSent)
+      sendJson(res, status, { error: status === 404 ? "not_found" : "forbidden", message: err.message });
     else res.destroy();
     return;
   }
@@ -384,7 +389,7 @@ function respondError(req: IncomingMessage, res: ServerResponse, err: unknown): 
     return;
   }
   reportBackendError(err);
-  console.error("[server] 500 %s %s: %s", req.method ?? "?", req.url ?? "?", errMessage(err));
+  console.error("[server] 500 %s %s: %s", req.method ?? "?", loggablePath(req.url), errMessage(err));
   if (!res.headersSent) sendJson(res, 500, { error: "internal_error", message: "internal server error" });
   else res.destroy();
 }
@@ -454,7 +459,7 @@ function buildFastify(wiring: Wiring, server: Server): { fastify: FastifyInstanc
 
   fastify.setErrorHandler((err, request, reply) => {
     reportBackendError(err);
-    console.error("%s", `[server] 500 ${request.raw.method ?? "?"} ${request.raw.url ?? "?"}:`, errMessage(err));
+    console.error("%s", `[server] 500 ${request.raw.method ?? "?"} ${loggablePath(request.raw.url)}:`, errMessage(err));
     return reply.code(500).send({ error: "internal_error", message: "internal server error" });
   });
 
@@ -541,7 +546,7 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
         finishTiming({
           name: `${req.method ?? "GET"} ${requestNames.get(req) ?? "/*"}`,
           status: res.writableFinished ? traceStatus(res.statusCode) : "cancelled",
-          data: { http_status: res.writableFinished ? String(res.statusCode) : undefined },
+          data: { url: req.url, http_status: res.writableFinished ? String(res.statusCode) : undefined },
         }),
       );
     req.on("error", () => res.destroy());
@@ -594,6 +599,12 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
     routing(req, res);
   }
   return server;
+}
+
+export function loggablePath(url: string | undefined): string {
+  if (!url) return "?";
+  const query = url.indexOf("?");
+  return query < 0 ? url : `${url.slice(0, query)}?<query omitted>`;
 }
 
 export function createServer(app: App, deps: ServerOptions = {}): Server {

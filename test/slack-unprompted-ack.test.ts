@@ -5,7 +5,7 @@ import { createConversationSerializer } from "../src/slack/conversation-view.ts"
 import { createThreadTracker, createDeduper } from "../src/slack/lib.ts";
 import type { BotIdentity, Directory } from "../src/slack/directory.ts";
 
-const ids = { botUserId: "UBOT", ownBotId: "BBOT" } as BotIdentity;
+const ids = { botUserId: "UBOT", ownBotId: "BBOT", botHandle: "qm" } as BotIdentity;
 const actor = { externalId: "U1", displayName: "Teammate" };
 const directory = {
   classifyUserCached: async () => ({ actor }),
@@ -14,6 +14,7 @@ const directory = {
 function harness(run: (hooks: any) => Promise<unknown>) {
   const reactions: string[] = [];
   const posts: string[] = [];
+  const postArgs: Array<Record<string, unknown>> = [];
   const turns: any[] = [];
   const client = {
     reactions: {
@@ -25,14 +26,21 @@ function harness(run: (hooks: any) => Promise<unknown>) {
       },
     },
     chat: {
-      postMessage: async ({ text }: { text: string }) => {
-        posts.push(text);
+      postMessage: async (args: Record<string, unknown>) => {
+        posts.push(args.text as string);
+        postArgs.push(args);
         return { ts: `9${posts.length}.0` };
       },
+      update: async () => ({}),
+      delete: async () => ({}),
     },
   };
   const handler = createTurnHandler({
-    core: { stageBlob: async () => ({ blobId: "b", sizeBytes: 0 }) },
+    core: {
+      stageBlob: async () => ({ blobId: "b", sizeBytes: 0 }),
+      reportRunEditRef: async () => {},
+      reportTurnMetrics: async () => {},
+    },
     flow: {
       inFlightRuns: { add() {}, delete() {}, has: () => false },
       inFlightRunByThread: { get() {}, set() {}, clear() {} },
@@ -74,7 +82,7 @@ function harness(run: (hooks: any) => Promise<unknown>) {
     unprompted: true,
     prefetched: { actor, info: { id: "C1", name: "eng" } as any, audience: [actor] },
   };
-  return { handler, client, followup, reactions, posts, turns };
+  return { handler, client, followup, reactions, posts, postArgs, turns };
 }
 
 test("an unmentioned thread followup QM answers gets the ack reaction added then cleared", async () => {
@@ -156,7 +164,6 @@ test("waitRun signals replying only once the run has passed detection and begun 
         return { id: "r1", status: polls >= 4 ? "done" : "running", attempts: 1 };
       },
     },
-    tasks: { list: async () => [] },
     app: { getRun: async () => ({ result: { status: "ok", reply: "done" } }) },
   } as any);
   await client.waitRun("r1", {
@@ -166,4 +173,18 @@ test("waitRun signals replying only once the run has passed detection and begun 
     },
   });
   assert.equal(replying, 1);
+});
+
+test("a mention-only thread reply starts a turn with the tag intact", async () => {
+  const h = harness(async () => ({ status: "ok", reply: "On it." }));
+  await h.handler.handleIncoming({ ...h.followup, unprompted: false, rawText: "<@UBOT>" }, h.client);
+  assert.equal(h.turns.length, 1);
+  assert.equal(h.turns[0].text, "@qm");
+  assert.deepEqual(h.posts, ["On it."]);
+});
+
+test("the bot's own mention reaches the agent instead of being stripped", async () => {
+  const h = harness(async () => ({ status: "ok", reply: "Done." }));
+  await h.handler.handleIncoming({ ...h.followup, unprompted: false, rawText: "<@UBOT> check &amp; report" }, h.client);
+  assert.equal(h.turns[0].text, "@qm check & report");
 });

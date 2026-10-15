@@ -91,3 +91,50 @@ test("listSessions flags a subagent whose latest turn failed, and only while it 
   await runs.complete(retry!.id, retry!.leaseToken ?? "", { status: "ok", reply: "fine" });
   assert.ok(!(await app.listSessions("U1")).find((s) => s.id === child.sessionId)?.lastTurnFailed);
 });
+
+test("sidebar batches visible goals from the session rows and drops inactive ones", async () => {
+  const { app, sessions, runs } = freshApp();
+  const visible: string[] = [];
+  const refs: string[] = [];
+  for (const [index, owner] of ["U1", "U1", "hidden"].entries()) {
+    const ref = `web:${owner}:batch:${index}`;
+    const session = await sessions.getOrCreateByThread(ref, "dm", `personal:${owner}`);
+    await sessions.addParticipant(session.id, owner);
+    const { lease } = await sessions.acquireLease(session.id);
+    assert.ok(lease);
+    await sessions.setGoal(lease, {
+      objective: `goal ${index}`,
+      status: index === 1 ? "complete" : "active",
+      tokensUsed: 0,
+      createdAt: 1,
+      updatedAt: 1,
+      activeMs: 123,
+    });
+    await sessions.releaseLease(lease);
+    await runs.enqueue({ sessionId: ref, request: enqueueRequest() });
+    if (owner === "U1") {
+      visible.push(session.id);
+      refs.push(ref);
+    }
+  }
+  const goals = sessions.goals.bind(sessions);
+  const latest = runs.latestForThreads.bind(runs);
+  let reads = 0;
+  let runReads = 0;
+  sessions.goals = async (ids) => {
+    reads++;
+    assert.deepEqual(new Set(ids), new Set(visible));
+    return goals(ids);
+  };
+  runs.latestForThreads = async (ids, opts) => {
+    runReads++;
+    assert.deepEqual(new Set(ids), new Set(refs));
+    return latest(ids, opts);
+  };
+  const list = await app.listSessions("U1");
+  assert.deepEqual({ reads, runReads }, { reads: 1, runReads: 1 });
+  assert.equal(list.length, 2);
+  assert.equal(list.find((row) => row.id === visible[0])?.goal?.objective, "goal 0");
+  assert.equal(list.find((row) => row.id === visible[0])?.goal?.activeMs, 123);
+  assert.equal(list.find((row) => row.id === visible[1])?.goal, undefined);
+});

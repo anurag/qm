@@ -15,16 +15,17 @@ available until the new revision has passed operational checks.
 - `SANDBOX_SECONDARY_BACKEND` is retired. `SANDBOX_BACKEND` selects the primary
   backend; additional configured backends become available through their
   credentials and backend settings. Remove the old secondary setting.
-- `SANDBOX_SCOPE_BACKENDS` optionally maps scope kinds to their default providers,
-  for example `{"personal":"modal","channel":"sprites"}`. Unlisted kinds use
-  `SANDBOX_BACKEND`. Explicit per-scope routes and selected sandbox resources
-  retain precedence. Configure credentials for every selected backend; the CLI
-  includes them in deployment secret requirements. Use distinct provider app/name
-  prefixes for deployments sharing a provider account.
-  Changing this setting does not migrate existing workspaces. Record existing
-  providers as explicit routes before changing defaults, then migrate and verify
-  each workspace through the sandbox migration workflow. Retain its original
-  provider until migration completes.
+- The `sandbox_routing` table, `SANDBOX_RESOURCES_ENABLED`, and the sandbox
+  migration endpoints and agent action are retired. Sandbox resources are always
+  on; scoped execution uses the selected sandbox resource. Disposable computers use
+  that resource's provider, or the installation provider when no resource is selected. On upgrade,
+  existing routes and `SANDBOX_SCOPE_BACKENDS` mappings are imported once as
+  sandbox records so existing computers are preserved; afterwards
+  `SANDBOX_SCOPE_BACKENDS` has no runtime effect. To move a scope to another
+  provider, create a sandbox there, copy durable work via git or Files, and set
+  it as the default. Keep credentials and provider settings for all legacy mappings
+  until the import completes; an unconfigured provider needed by the import stops
+  startup before any adoption state is written.
 - Reach-denied Slack notifications are retired. Consult the audit log for denied
   requests.
 
@@ -41,6 +42,17 @@ continues importing writes from older workers during a rolling upgrade. History
 retention also removes expired entries from the legacy table, preventing a later
 restart from importing them again. The legacy table remains available for older
 binaries.
+
+Upgrading from a release that still writes `session_tape` copies its step metadata
+into `legacy_tape_steps` during startup migrations, then drops the tape. Stop every
+older core and worker before starting the new release: a tape write after the copy
+starts makes the drop refuse, and that startup fails with the reset to run. The copy
+runs on the direct migration connection without a statement timeout and resumes
+after an interrupted startup. It walks every session at roughly 30 sessions per
+second, so a few thousand sessions take a couple of minutes; above that, run
+`node src/migrate-main.ts` with the release's configuration before starting the
+servers so readiness checks do not time out. Instances that start meanwhile wait for the copy on
+the migration lock, so a database or role `statement_timeout` must allow that wait.
 
 Rolling back the runtime restores code and configuration, not database contents.
 Older binaries do not display cron history written only to the new journal; those

@@ -71,6 +71,7 @@ export interface PersistedScopedFlag {
 }
 export interface PersistedBaseModel {
   scopeId: ScopeId;
+  embeddingModelId?: string;
   modelId?: string;
   cronRuntime?: RuntimeSelection;
   subagentRuntime?: RuntimeSelection;
@@ -145,10 +146,6 @@ interface AutoFlaggerConfig {
 }
 export interface PersistedAutoFlaggerConfig extends AutoFlaggerConfig {
   scopeId: ScopeId;
-}
-export interface PersistedTurnWallClock {
-  scopeId: ScopeId;
-  sec: number;
 }
 interface ScopeConfigPresence {
   soul: boolean;
@@ -261,10 +258,10 @@ export interface ScopedConfigStore {
   setBrowseMaxSteps(id: ScopeId, steps: number | null): void;
   getBrowseModel(id: ScopeId): string | null;
   setBrowseModel(id: ScopeId, modelId: string | null): void;
+  getEmbeddingModelDurable(): Promise<string | null>;
+  setEmbeddingModel(modelId: string | null): Promise<void>;
   getAutoFlaggerConfig(): AutoFlaggerConfig | null;
   setAutoFlaggerConfig(config: AutoFlaggerConfig | null): void;
-  getTurnWallClockSecDurable(id: ScopeId): Promise<number | null>;
-  setTurnWallClockSec(id: ScopeId, sec: number | null): Promise<void>;
   setConnectorClient(id: ScopeId, provider: string, input: ConnectorClientInput): Promise<void>;
   listConnectorClients(id: ScopeId): Promise<PublicConnectorClient[]>;
   deleteConnectorClient(id: ScopeId, provider: string): Promise<void>;
@@ -303,7 +300,6 @@ export function createMemoryConfigStore(
     browseMaxSteps?: DurableMap<PersistedBrowseMaxSteps>;
     browseModels?: DurableMap<PersistedBrowseModel>;
     autoFlaggerConfigs?: DurableMap<PersistedAutoFlaggerConfig>;
-    turnWallClocks?: DurableMap<PersistedTurnWallClock>;
     deploymentIdentity?: DurableMap<PersistedDeploymentIdentity>;
     connectorSecretKey?: Buffer | string;
     defaultSecurityPosture?: SecurityPosture;
@@ -334,7 +330,6 @@ export function createMemoryConfigStore(
   const browseMaxSteps = new Map<ScopeId, number>();
   const browseModels = new Map<ScopeId, string>();
   let autoFlaggerConfig: AutoFlaggerConfig | null = null;
-  const turnWallClocks = new Map<ScopeId, number>();
   const soulStore = opts.souls ?? createMemoryMap<PersistedSoul>();
   const soulHistoryStore = opts.soulHistory ?? createMemoryMap<PersistedSoulRevision>();
   const commandPolicyStore = opts.commandPolicies ?? createMemoryMap<PersistedCommandPolicy>();
@@ -360,7 +355,6 @@ export function createMemoryConfigStore(
   const browseMaxStepsStore = opts.browseMaxSteps ?? createMemoryMap<PersistedBrowseMaxSteps>();
   const browseModelStore = opts.browseModels ?? createMemoryMap<PersistedBrowseModel>();
   const autoFlaggerStore = opts.autoFlaggerConfigs ?? createMemoryMap<PersistedAutoFlaggerConfig>();
-  const turnWallClockStore = opts.turnWallClocks ?? createMemoryMap<PersistedTurnWallClock>();
   const deploymentIdentity = opts.deploymentIdentity ?? createMemoryMap<PersistedDeploymentIdentity>();
   const persistWarn = (what: string) => reportFailureAs(`config: persist ${what}`, undefined);
   const writeQueue = createKeyedQueue();
@@ -402,34 +396,49 @@ export function createMemoryConfigStore(
   const purposeFields = (id: ScopeId, row?: PersistedBaseModel | null) =>
     id === org
       ? {
+          ...(row?.embeddingModelId ? { embeddingModelId: row.embeddingModelId } : {}),
           ...(row?.cronRuntime ? { cronRuntime: row.cronRuntime } : {}),
           ...(row?.subagentRuntime ? { subagentRuntime: row.subagentRuntime } : {}),
           ...(row?.fallbackRuntime ? { fallbackRuntime: row.fallbackRuntime } : {}),
         }
       : {};
-  const clearRuntime = async (id: ScopeId, row?: PersistedBaseModel | null) => {
-    const purposes = purposeFields(id, row);
-    if (Object.keys(purposes).length) {
-      const next = { scopeId: id, ...purposes };
-      await baseModelStore.put(id, next);
-      return next;
+  const withoutRuntime = (id: ScopeId, row: PersistedBaseModel | null): PersistedBaseModel => ({
+    scopeId: id,
+    ...purposeFields(id, row),
+  });
+  const updateBaseModelRow = async (
+    id: ScopeId,
+    fn: (row: PersistedBaseModel | null) => PersistedBaseModel,
+  ): Promise<PersistedBaseModel | null> => {
+    if (!baseModelStore.update || !baseModelStore.insertIfAbsent || !baseModelStore.deleteIf)
+      throw new Error("base model store does not support atomic updates");
+    for (;;) {
+      let saved = await baseModelStore.update(id, fn);
+      if (!saved) {
+        const fresh = fn(null);
+        if (Object.keys(fresh).length <= 1) return null;
+        if (!(await baseModelStore.insertIfAbsent(id, fresh))) continue;
+        saved = fresh;
+      }
+      if (Object.keys(saved).length > 1) return saved;
+      await baseModelStore.deleteIf(id, (row) => Object.keys(row).length <= 1);
+      return null;
     }
-    await baseModelStore.delete(id);
-    return null;
+  };
+  const cacheBaseModel = (id: ScopeId, row: PersistedBaseModel | null): void => {
+    if (row) baseModels.set(id, row);
+    else baseModels.delete(id);
   };
   const setPurposeRuntime = async (purpose: RuntimePurpose, selection?: RuntimeSelection) => {
     await writeQueue(`model:${org}`, async () => {
-      const row = { ...(await baseModelStore.get(org)), scopeId: org };
       const key = `${purpose}Runtime` as const;
-      if (selection) row[key] = { ...selection };
-      else delete row[key];
-      if (Object.keys(row).length === 1) {
-        await baseModelStore.delete(org);
-        baseModels.delete(org);
-      } else {
-        await baseModelStore.put(org, row);
-        baseModels.set(org, row);
-      }
+      const saved = await updateBaseModelRow(org, (current) => {
+        const row: PersistedBaseModel = { ...current, scopeId: org };
+        if (selection) row[key] = { ...selection };
+        else delete row[key];
+        return row;
+      });
+      cacheBaseModel(org, saved);
     });
   };
   const defaultSecurityPosture = opts.defaultSecurityPosture ?? "auto";
@@ -561,7 +570,6 @@ export function createMemoryConfigStore(
                 rubric: storedAutoFlagger.rubric,
               }
             : null;
-          for (const r of await turnWallClockStore.all()) turnWallClocks.set(r.scopeId, r.sec);
         })();
       }
       return hydrated;
@@ -856,14 +864,16 @@ export function createMemoryConfigStore(
         const purposes = purposeFields(id, baseModels.get(id));
         if (Object.keys(purposes).length) baseModels.set(id, { scopeId: id, ...purposes });
         else baseModels.delete(id);
-        persist(`model:${id}`, "base model", async () => clearRuntime(id, await baseModelStore.get(id)));
+        persist(`model:${id}`, "base model", () => updateBaseModelRow(id, (row) => withoutRuntime(id, row)));
       } else {
         const prior = baseModels.get(id);
         if (prior?.harnessId && isHarnessId(prior.harnessId) && !modelSupportedByHarness(modelId, prior.harnessId))
           return;
         const row: PersistedBaseModel = { ...prior, scopeId: id, modelId };
         baseModels.set(id, row);
-        persist(`model:${id}`, "base model", () => baseModelStore.put(id, row));
+        persist(`model:${id}`, "base model", () =>
+          updateBaseModelRow(id, (current) => ({ ...current, scopeId: id, modelId })),
+        );
       }
       noteRuntimeSelectionChanged(id);
     },
@@ -884,7 +894,7 @@ export function createMemoryConfigStore(
         const purposes = purposeFields(id, baseModels.get(id));
         if (Object.keys(purposes).length) baseModels.set(id, { scopeId: id, ...purposes });
         else baseModels.delete(id);
-        persist(`model:${id}`, "runtime selection", async () => clearRuntime(id, await baseModelStore.get(id)));
+        persist(`model:${id}`, "runtime selection", () => updateBaseModelRow(id, (row) => withoutRuntime(id, row)));
         noteRuntimeSelectionChanged(id);
         return;
       }
@@ -895,25 +905,28 @@ export function createMemoryConfigStore(
           ? { scopeId: id, ...purposeFields(id, orgRow), ...selection, revision, orgRevision: revision }
           : { scopeId: id, ...selection, orgRevision: orgRow?.revision ?? 0 };
       baseModels.set(id, row);
-      persist(`model:${id}`, "runtime selection", () => baseModelStore.put(id, row));
+      persist(`model:${id}`, "runtime selection", () =>
+        updateBaseModelRow(id, (current) => {
+          if (id !== org) return row;
+          const next = Math.max(revision, (current?.revision ?? 0) + 1);
+          return { scopeId: id, ...purposeFields(id, current), ...selection, revision: next, orgRevision: next };
+        }),
+      );
       noteRuntimeSelectionChanged(id);
     },
     async setRuntimeSelectionLatest(id, selection) {
       await writeQueue(`model:${id}`, async () => {
         if (selection === null) {
-          const row = await clearRuntime(id, await baseModelStore.get(id));
-          if (row) baseModels.set(id, row);
-          else baseModels.delete(id);
+          cacheBaseModel(id, await updateBaseModelRow(id, (row) => withoutRuntime(id, row)));
           return;
         }
-        const orgRow = await baseModelStore.get(org);
-        const revision = (orgRow?.revision ?? 0) + 1;
-        const row: PersistedBaseModel =
-          id === org
-            ? { scopeId: id, ...purposeFields(id, orgRow), ...selection, revision, orgRevision: revision }
-            : { scopeId: id, ...selection, orgRevision: orgRow?.revision ?? 0 };
-        await baseModelStore.put(id, row);
-        baseModels.set(id, row);
+        const orgRevision = id === org ? 0 : ((await baseModelStore.get(org))?.revision ?? 0);
+        const saved = await updateBaseModelRow(id, (row) => {
+          if (id !== org) return { scopeId: id, ...selection, orgRevision };
+          const revision = (row?.revision ?? 0) + 1;
+          return { scopeId: id, ...purposeFields(id, row), ...selection, revision, orgRevision: revision };
+        });
+        cacheBaseModel(id, saved);
       });
       noteRuntimeSelectionChanged(id);
     },
@@ -922,17 +935,16 @@ export function createMemoryConfigStore(
       if (!row || id === org) return;
       const next = { ...row, orgRevision: baseModels.get(org)?.revision ?? 0 };
       baseModels.set(id, next);
-      persist(`model:${id}`, "runtime selection acknowledgment", () => baseModelStore.put(id, next));
+      persist(`model:${id}`, "runtime selection acknowledgment", () =>
+        baseModelStore.merge(id, { orgRevision: next.orgRevision }),
+      );
     },
     async acknowledgeRuntimeSelectionLatest(id) {
       if (id === org) return;
       await writeQueue(`model:${id}`, async () => {
-        const row = await baseModelStore.get(id);
-        if (!row) return;
-        const orgRow = await baseModelStore.get(org);
-        const next = { ...row, orgRevision: orgRow?.revision ?? 0 };
-        await baseModelStore.put(id, next);
-        baseModels.set(id, next);
+        const orgRevision = (await baseModelStore.get(org))?.revision ?? 0;
+        const saved = await baseModelStore.merge(id, { orgRevision });
+        if (saved) baseModels.set(id, saved);
       });
     },
     onRuntimeSelectionChanged(listener) {
@@ -1088,6 +1100,18 @@ export function createMemoryConfigStore(
         persist(`browseModel:${id}`, "browse model", () => browseModelStore.put(id, { scopeId: id, modelId }));
       }
     },
+    getEmbeddingModelDurable: async () => (await baseModelStore.get(org))?.embeddingModelId ?? null,
+    setEmbeddingModel: async (modelId) => {
+      await writeQueue(`model:${org}`, async () => {
+        const saved = await updateBaseModelRow(org, (current) => {
+          const row: PersistedBaseModel = { ...current, scopeId: org };
+          if (modelId) row.embeddingModelId = modelId;
+          else delete row.embeddingModelId;
+          return row;
+        });
+        cacheBaseModel(org, saved);
+      });
+    },
     getAutoFlaggerConfig: () => autoFlaggerConfig,
     setAutoFlaggerConfig(config) {
       autoFlaggerConfig = config;
@@ -1098,14 +1122,6 @@ export function createMemoryConfigStore(
           autoFlaggerStore.put(org, { scopeId: org, ...config }),
         );
       }
-    },
-    getTurnWallClockSecDurable: async (id) => (await turnWallClockStore.get(id))?.sec ?? null,
-    async setTurnWallClockSec(id, sec) {
-      await writeQueue(`turnWallClock:${id}`, () =>
-        sec === null ? turnWallClockStore.delete(id) : turnWallClockStore.put(id, { scopeId: id, sec }),
-      );
-      if (sec === null) turnWallClocks.delete(id);
-      else turnWallClocks.set(id, sec);
     },
     async setConnectorClient(id, provider, input) {
       const rec: StoredConnectorClient = {
@@ -1277,7 +1293,6 @@ export function createMemoryConfigStore(
         `egress:${id}`,
         `externalSlack:${id}`,
         `model:${id}`,
-        `turnWallClock:${id}`,
         `branding:${id}`,
         ...(id === org
           ? [

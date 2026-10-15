@@ -9,8 +9,8 @@ import { setGatewayModels } from "../src/model/gateway-models.ts";
 const adaptiveId = "claude-sonnet-4-6";
 
 test("native Auto is model and harness specific, while legacy auto remains valid", () => {
-  for (const harnessId of ["pi", "codex", "claude", "opencode"] as const) {
-    const modelId = harnessId === "codex" ? "gpt-5.4" : adaptiveId;
+  for (const harnessId of ["pi", "claude"] as const) {
+    const modelId = adaptiveId;
     assert.equal(validateRuntimeChoice({ harnessId, modelId, effortLevel: "auto" }), null);
     assert.equal(
       validateRuntimeChoice({ harnessId, modelId, effortLevel: "adaptive" }),
@@ -111,7 +111,7 @@ test("real Pi AgentSession and Anthropic serializer send Auto without a fixed ef
       headers: { "content-type": "text/event-stream" },
     });
   }) as typeof fetch;
-  for (const modelId of [adaptiveId, "claude-opus-5-5", "claude-sonnet-5-5"])
+  for (const modelId of [adaptiveId, "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"])
     for (const route of ["api-key", "personal-key", "oauth", "gateway"] as const) {
       await t.test(`${modelId}/${route}`, async () => {
         const harness = createPiHarness({

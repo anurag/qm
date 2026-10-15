@@ -214,14 +214,61 @@ test("restores stopped/restarted turns from durable document metadata and dedupl
   assert.match(await documentFallbackText(inputs.documents[0]!), /QUARTZ-731/);
 });
 
-test("document replay follows compaction boundaries and excludes security-tainted uploads", () => {
+test("reuploaded identical documents consume the input budget once and retain the newest artifact", async () => {
+  const { store, meta, artifact, opens } = storeFor();
+  store.get = async (id) => ({ ...artifact, id });
+  const open = store.open.bind(store);
+  store.open = async (id) => {
+    const loaded = await open(id);
+    return loaded && { ...loaded, artifact: { ...loaded.artifact, id } };
+  };
+  const checked: string[] = [];
+  const inputs = await loadDocumentInputs(
+    store,
+    [meta, { ...meta, artifactId: "new-upload" }],
+    (file) => {
+      checked.push(file.id);
+      return true;
+    },
+    artifact.sizeBytes,
+  );
+  assert.equal(inputs.documents.length, 1);
+  assert.equal(inputs.documents[0]!.artifactId, "new-upload");
+  assert.deepEqual(inputs.notices, []);
+  assert.equal(opens(), 1);
+  assert.ok(checked.includes(artifact.id));
+  assert.ok(checked.includes("new-upload"));
+});
+
+test("steered reuploads already in the turn do not consume another document slot or emit budget notices", async () => {
+  const { store, meta, artifact, opens } = storeFor();
+  const initial = await loadDocumentInputs(store, [meta], () => true);
+  store.get = async (id) => ({ ...artifact, id });
+  const checked: string[] = [];
+  const steered = await loadDocumentInputs(
+    store,
+    [{ ...meta, artifactId: "steered-upload" }],
+    (file) => {
+      checked.push(file.id);
+      return true;
+    },
+    0,
+    undefined,
+    0,
+    initial.documents,
+  );
+  assert.deepEqual(steered, { documents: [], notices: [] });
+  assert.deepEqual(checked, ["steered-upload"]);
+  assert.equal(opens(), 1);
+});
+
+test("document replay follows compaction boundaries", () => {
   const { meta } = storeFor();
   const recent = { ...meta, artifactId: "recent" };
   const history = [
     { seq: 0, type: "user", payload: { attachments: [meta] } },
     { seq: 1, type: "user", payload: { attachments: [recent] } },
     { seq: 2, type: "system", payload: { kind: "context_summary", text: "Prior upload", throughSeq: 0 } },
-    { seq: 3, type: "user", payload: { attachments: [meta], securityTainted: true } },
   ] as SessionEntry[];
   assert.deepEqual(historicalDocumentMetas(history), [recent]);
   assert.deepEqual((history[0]!.payload as { attachments: AttachmentMeta[] }).attachments, [meta]);

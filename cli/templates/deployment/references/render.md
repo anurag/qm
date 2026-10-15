@@ -184,8 +184,7 @@ targets. Use the current CLI and run `qm up` from a deployment directory whose
 `render.source` selects the updated repository and branch. The CLI applies
 registered database migrations and builds the services at one source commit.
 
-For swarms, set `env.core.SANDBOX_RESOURCES_ENABLED` to `"true"` and enable the
-`swarms` feature flag for the required people in Admin. Workers and the shared
+For swarms, enable the `swarms` feature flag for the required people in Admin. Workers and the shared
 board use native Render Sandboxes when Render is the selected backend. Each
 worker starts with a blank computer. Verify worker creation, shared board access,
 pause, resume, and retirement before enabling it for more people.

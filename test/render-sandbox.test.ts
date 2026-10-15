@@ -24,7 +24,7 @@ import { supportsAgentComputerExport, supportsProcessSessions } from "../src/san
 import { pollProcess } from "../src/sandbox/process-poll.ts";
 import { createSdkRenderClient } from "../src/sandbox/render-client.ts";
 import { createSandboxResources } from "../src/sandbox/sandbox-resources.ts";
-import { createSandboxRouter, type SandboxRoute } from "../src/sandbox/sandbox-routing.ts";
+import { createSandboxRouter } from "../src/sandbox/sandbox-routing.ts";
 import { createFakeRender, serveFakeRenderApi } from "./support/fake-render.ts";
 
 async function readBackup(snapshots: HomeSnapshotStore, key: string): Promise<Buffer | null> {
@@ -382,40 +382,32 @@ test(
   },
 );
 
-for (const enabled of [false, true])
-  test(
-    `Render turns share one computer through the sandbox router with sandbox resources ${enabled ? "on" : "off"}`,
-    { timeout: 60_000 },
-    async (t) => {
-      const { make, fake, layers, scope, advisoryLock } = setup(t);
-      const render = make();
-      const routes = createMemoryMap<SandboxRoute>();
-      const resources = createSandboxResources({
-        enabled,
-        rollout: createMemoryMap(),
-        legacyScopes: async () => [scope],
-        records: createMemoryMap(),
-        defaults: createMemoryMap(),
-        routes,
-        backends: { render },
-        defaultBackend: "render",
-        lock: advisoryLock,
-        canUseScope: async () => true,
-      });
-      const router = createSandboxRouter({ routes, backends: { render }, defaultBackend: "render", resources });
-      const first = await router.provision(layers);
-      assert.ok(first.resourceId);
-      const gate = blockCommands(fake);
-      const blocked = router.run(first, "echo blocked-command");
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      const second = await router.provision(layers);
-      assert.equal((await router.run(second, "echo concurrent")).stdout, "concurrent\n");
-      await router.teardown(second);
-      gate.resolve();
-      assert.equal((await blocked).stdout, "blocked-command\n");
-      await router.teardown(first);
-    },
-  );
+test("Render turns share one computer through the sandbox router", { timeout: 60_000 }, async (t) => {
+  const { make, fake, layers, scope, advisoryLock } = setup(t);
+  const render = make();
+  const resources = createSandboxResources({
+    records: createMemoryMap(),
+    defaults: createMemoryMap(),
+    backends: { render },
+    defaultBackend: "render",
+    lock: advisoryLock,
+    canUseScope: async () => true,
+  });
+  const router = createSandboxRouter({ backends: { render }, defaultBackend: "render", resources });
+  const record = await resources.create("tester", scope, "render");
+  await resources.setDefault("tester", scope, record.id);
+  const first = await router.provision(layers);
+  assert.equal(first.resourceId, record.id);
+  const gate = blockCommands(fake);
+  const blocked = router.run(first, "echo blocked-command");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const second = await router.provision(layers);
+  assert.equal((await router.run(second, "echo concurrent")).stdout, "concurrent\n");
+  await router.teardown(second);
+  gate.resolve();
+  assert.equal((await blocked).stdout, "blocked-command\n");
+  await router.teardown(first);
+});
 
 test("Render reaping keeps a sandbox whose background process starts after the first process probe", async (t) => {
   const { make, fake, layers, store, scope } = setup(t);
@@ -512,19 +504,6 @@ test("Render destroys both the sandbox and its checkpoint", async (t) => {
   assert.equal(fake.sandboxes.get("sbx-1")?.status, "terminated");
 });
 
-test("Render imports a home archive and captures a native checkpoint", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer } = setup(t);
-  const sandbox = make();
-  const tar = await makeTar([{ path: "workspace/imported", data: Buffer.from("imported home") }]);
-  const blob = await blobTransfer.put(tar);
-  await sandbox.adoptHomeSnapshot!(scope, blob.blobId);
-  const handle = await sandbox.provision(layers);
-  assert.equal(handle.coldStart, false);
-  assert.equal(await sandbox.readFile(handle, "imported"), "imported home");
-  const stored = (await store.get(scope))!;
-  assert.ok(fake.snapshots.has(stored.checkpoint!.id));
-});
-
 test("Render does not replay a command when an exec call fails", async (t) => {
   const { make, fake, layers, store, scope } = setup(t);
   const sandbox = make();
@@ -592,75 +571,6 @@ test("Render recovers from an expired staged native checkpoint with the durable 
   assert.equal((await store.get(scope))?.retiredResources, undefined);
 });
 
-test("Render keeps the previous home archive when an import cannot publish its record", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer, snapshots } = setup(t);
-  const source = make();
-  const handle = await source.provision(layers);
-  await source.writeFile(handle, "work", "original value");
-  await source.teardown(handle);
-  const before = (await store.get(scope))!;
-  const put = store.put;
-  let failed = false;
-  store.put = async (key, value) => {
-    if (
-      !failed &&
-      value.sandboxId !== before.sandboxId &&
-      !value.retiredResources?.some((r) => r.sandboxId === value.sandboxId)
-    ) {
-      failed = true;
-      throw new Error("publish record outage");
-    }
-    await put(key, value);
-  };
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("replacement") }]));
-  await assert.rejects(source.adoptHomeSnapshot!(scope, blob.blobId), /publish record outage/);
-  assert.deepEqual(await store.get(scope), before);
-  assert.ok((await readBackup(snapshots, scope))!.includes("original value"));
-  assert.equal(fake.snapshots.size, 1);
-  assert.equal(fake.sandboxes.get("sbx-2")?.status, "terminated");
-  const restored = await make().provision(layers);
-  assert.equal(await source.readFile(restored, "work"), "original value");
-});
-
-test("Render keeps the original body and backup when import checkpoint creation fails", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer, snapshots } = setup(t);
-  const source = make();
-  const handle = await source.provision(layers);
-  await source.writeFile(handle, "work", "original value");
-  await source.teardown(handle);
-  const before = (await store.get(scope))!;
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("replacement") }]));
-  fake.failCheckpoint(new Error("native snapshot outage"));
-  await assert.rejects(source.adoptHomeSnapshot!(scope, blob.blobId), /native snapshot outage/);
-  assert.deepEqual(await store.get(scope), before);
-  assert.equal(await source.readFile(handle, "work"), "original value");
-  assert.ok(await readBackup(snapshots, scope));
-  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "running");
-  assert.equal(fake.sandboxes.get("sbx-2")?.status, "terminated");
-  assert.equal(fake.snapshots.size, 1);
-});
-
-test("Render retains old-body cleanup after an import and retries it from another core", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer, snapshots } = setup(t);
-  const source = make();
-  await source.provision(layers);
-  const before = (await store.get(scope))!;
-  fake.failTerminate(new Error("terminate outage"), before.sandboxId);
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("replacement") }]));
-  await source.adoptHomeSnapshot!(scope, blob.blobId);
-  const published = (await store.get(scope))!;
-  assert.notEqual(published.sandboxId, before.sandboxId);
-  assert.equal(published.retiredResources?.[0]?.sandboxId, before.sandboxId);
-  assert.equal(published.retirementError, "terminate outage");
-  assert.ok(await readBackup(snapshots, scope));
-  fake.failTerminate(undefined, before.sandboxId);
-  const next = make();
-  const handle = await next.provision(layers);
-  assert.equal(await next.readFile(handle, "work"), "replacement");
-  assert.equal((await store.get(scope))!.retiredResources, undefined);
-  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "terminated");
-});
-
 test("Render keeps a running process during monitor provisioning near sandbox expiry", async (t) => {
   const { make, fake, layers, store, scope } = setup(t);
   const source = make();
@@ -703,102 +613,6 @@ test("Render keeps its record while the home archive cannot be deleted and remov
   assert.equal(await snapshots.open(scope), null);
   assert.equal(fake.snapshots.size, 0);
   assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "terminated");
-});
-
-test("Render retains failed first-import cleanup and never provisions its abandoned sandbox", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer, snapshots } = setup(t);
-  const sandbox = make();
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("discarded") }]));
-  fake.failCheckpoint(new Error("native snapshot outage"));
-  fake.failTerminate(new Error("terminate outage"), "sbx-1");
-  await assert.rejects(sandbox.adoptHomeSnapshot!(scope, blob.blobId), /native snapshot outage/);
-  const abandoned = (await store.get(scope))!;
-  assert.equal(abandoned.sandboxId, "sbx-1");
-  assert.equal(abandoned.retiredResources?.[0]?.sandboxId, "sbx-1");
-  assert.equal(abandoned.retirementError, "terminate outage");
-  assert.equal(await snapshots.open(scope), null);
-  assert.equal((await sandbox.computerStatus!(scope)).provisioned, false);
-  await assert.rejects(make().provision(layers), /cleanup is incomplete/);
-  await assert.rejects(sandbox.persistHomeSnapshot!(scope), /not provisioned/);
-  assert.equal(fake.createdFrom.length, 1);
-  fake.failCheckpoint();
-  fake.failTerminate(undefined, "sbx-1");
-  const next = make();
-  const handle = await next.provision(layers);
-  assert.equal(handle.coldStart, true);
-  assert.equal(await next.readFile(handle, "work"), null);
-  assert.equal((await store.get(scope))!.retiredResources, undefined);
-  assert.equal(fake.sandboxes.get("sbx-1")?.status, "terminated");
-  assert.ok(await readBackup(snapshots, scope));
-});
-
-test("Render cleans a first-import native checkpoint when its staging record write fails", async (t) => {
-  const { make, fake, store, scope, blobTransfer } = setup(t);
-  const put = store.put;
-  let failed = false;
-  store.put = async (key, value) => {
-    if (!failed && value.retiredResources?.some((resource) => resource.checkpoint)) {
-      failed = true;
-      throw new Error("checkpoint record outage");
-    }
-    await put(key, value);
-  };
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("discarded") }]));
-  await assert.rejects(make().adoptHomeSnapshot!(scope, blob.blobId), /checkpoint record outage/);
-  assert.equal(await store.get(scope), null);
-  assert.equal(fake.snapshots.size, 0);
-  assert.equal(fake.sandboxes.get("sbx-1")?.status, "terminated");
-});
-
-test("Render retries abandoned import cleanup after its record deletion fails", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer } = setup(t);
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("discarded") }]));
-  fake.failCheckpoint(new Error("native snapshot outage"));
-  fake.failTerminate(new Error("terminate outage"), "sbx-1");
-  await assert.rejects(make().adoptHomeSnapshot!(scope, blob.blobId), /native snapshot outage/);
-  fake.failCheckpoint();
-  fake.failTerminate(undefined, "sbx-1");
-  const remove = store.delete;
-  let failDelete = true;
-  t.mock.method(store, "delete", async (key: string) => {
-    if (failDelete) {
-      failDelete = false;
-      throw new Error("record delete outage");
-    }
-    await remove(key);
-  });
-  await assert.rejects(make().provision(layers), /record delete outage/);
-  assert.equal((await store.get(scope))!.discarded, true);
-  assert.equal((await store.get(scope))!.retiredResources, undefined);
-  assert.equal(fake.sandboxes.get("sbx-1")?.status, "terminated");
-  const next = make();
-  assert.equal((await next.computerStatus!(scope)).provisioned, false);
-  const handle = await next.provision(layers);
-  assert.equal(handle.coldStart, true);
-  assert.equal(await next.readFile(handle, "work"), null);
-  assert.equal((await store.get(scope))!.discarded, undefined);
-});
-
-test("Render cleans an import after the first staging write fails over an existing home", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer } = setup(t);
-  const sandbox = make();
-  await sandbox.provision(layers);
-  const before = (await store.get(scope))!;
-  const merge = store.merge;
-  let failed = false;
-  store.merge = async (key, patch) => {
-    if (!failed && patch.retiredResources?.some((resource) => resource.sandboxId === "sbx-2")) {
-      failed = true;
-      throw new Error("staging record outage");
-    }
-    return merge(key, patch);
-  };
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("discarded") }]));
-  await assert.rejects(sandbox.adoptHomeSnapshot!(scope, blob.blobId), /staging record outage/);
-  assert.deepEqual(await store.get(scope), before);
-  assert.equal(fake.snapshots.size, 1);
-  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "running");
-  assert.equal(fake.sandboxes.get("sbx-2")?.status, "terminated");
 });
 
 test("Render disposes a new native checkpoint when its staging record write fails", async (t) => {
@@ -997,26 +811,6 @@ test("Render removes a destroyed scope at once and deletes a checkpoint that was
   assert.equal((await store.get(scope))!.discarded, true);
   await assert.rejects(make().provision(layers), /cleanup is incomplete/);
   fake.snapshots.get(stray)!.status = "available";
-  now += 6 * 60_000;
-  await make().reapDeepIdle!(3600_000);
-  assert.equal(await store.get(scope), null);
-  assert.equal(fake.snapshots.size, 0);
-});
-
-test("Render keeps an abandoned import until it finds and deletes a native checkpoint that appears late", async (t) => {
-  const { make, fake, layers, store, scope, blobTransfer } = setup(t);
-  let now = Date.now();
-  t.mock.method(Date, "now", () => now);
-  const find = fake.client.findSnapshots;
-  let visible = false;
-  fake.client.findSnapshots = async (sandboxId, sinceMs) => (visible ? find(sandboxId, sinceMs) : []);
-  fake.loseCheckpointReply();
-  const blob = await blobTransfer.put(await makeTar([{ path: "workspace/work", data: Buffer.from("imported") }]));
-  await assert.rejects(make().adoptHomeSnapshot!(scope, blob.blobId), /did not confirm/);
-  assert.equal((await store.get(scope))!.discarded, true);
-  assert.equal(fake.snapshots.size, 1);
-  await assert.rejects(make().provision(layers), /cleanup is incomplete/);
-  visible = true;
   now += 6 * 60_000;
   await make().reapDeepIdle!(3600_000);
   assert.equal(await store.get(scope), null);

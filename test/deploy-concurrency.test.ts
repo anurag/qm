@@ -194,7 +194,7 @@ for (const [visit, stop, status] of [
     const stopping = stop === "archive" ? deploy.archiveDeployment(d.id) : deploy.reapIdleDeployments(60_000, future);
     await destroying.promise;
     let settled = false;
-    const visiting = (visit === "reach" ? deploy.reachDeployment(d.id, "U1") : deploy.keepAlwaysOnWarm()).finally(
+    const visiting = (visit === "reach" ? deploy.reachDeployment(d.id, "U1") : deploy.maintainDeployments()).finally(
       () => {
         settled = true;
       },

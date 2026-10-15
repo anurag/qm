@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  AGENT_OPENED_TEXT,
   INTERRUPTED_TOOL_RESULT,
   recordedMessageTimestamps,
   planColdStartSeed,
@@ -43,33 +44,21 @@ function ent(type: SessionEntry["type"], payload: unknown, seq = 0): SessionEntr
 function assertValidWire(msgs: ReturnType<typeof reconstructMessagesFromHistory>): void {
   if (!msgs.length) return;
   assert.equal(msgs[0]!.role, "user", "first message must be user-side");
-  const wire = (m: (typeof msgs)[number]) => (m.role === "assistant" ? "a" : "u");
-  let prevWire: string | null = null;
-  let prevWasToolResult = false;
   const open = new Set<string>();
   for (const m of msgs) {
-    const w = wire(m);
-    if (prevWire === w) assert.ok(prevWasToolResult, `no two consecutive ${w} turns (except after a tool result)`);
     if (m.role === "assistant") for (const b of m.content) if (b.type === "toolCall") open.add(b.id);
     if (m.role === "toolResult") {
       assert.ok(open.has(m.toolCallId), "tool_result pairs an open tool_use");
       open.delete(m.toolCallId);
     }
-    prevWire = w;
-    prevWasToolResult = m.role === "toolResult";
   }
   assert.equal(open.size, 0, "every tool_use has a matching tool_result");
 }
 
-test("replayPreamble renders user, assistant, and delivered-file entries", () => {
-  const out = replayPreamble([
-    entry("user", "send me a pirate flag"),
-    entry("assistant", "done!"),
-    entry("delivery", "pirate_flag.png (image/png, 142 bytes)"),
-  ]);
+test("replayPreamble renders user and assistant entries", () => {
+  const out = replayPreamble([entry("user", "send me a pirate flag"), entry("assistant", "done!")]);
   assert.match(out, /User: send me a pirate flag/);
   assert.match(out, /Assistant: done!/);
-  assert.match(out, /^\[files delivered to the conversation: pirate_flag\.png \(image\/png, 142 bytes\)\]$/m);
 });
 
 test("replayPreamble is empty when there is nothing to replay", () => {
@@ -201,13 +190,29 @@ test("reconstructMessagesFromHistory replays a delivery in user voice, never the
   assertValidWire(msgs);
   assert.deepEqual(
     msgs.map((m) => m.role),
-    ["user", "assistant", "user"],
+    ["user", "assistant", "user", "user"],
   );
-  const assistantText = (msgs[1] as { content: Array<{ text: string }> }).content.map((c) => c.text).join(" ");
-  assert.equal(assistantText, "here you go");
-  const userText = (msgs[2] as { content: Array<{ text: string }> }).content.map((c) => c.text).join(" ");
-  assert.match(userText, /\[files delivered to the conversation: flag\.png \(image\/png, 100 bytes\)\]/);
-  assert.match(userText, /thanks/);
+  assert.deepEqual(msgs[1]!.content, [{ type: "text", text: "here you go" }]);
+  assert.deepEqual(msgs[2]!.content, [
+    { type: "text", text: "[files delivered to the conversation: flag.png (image/png, 100 bytes)]" },
+  ]);
+  assert.deepEqual(msgs[3]!.content, [{ type: "text", text: "thanks" }]);
+});
+
+test("reconstructMessagesFromHistory opens with a fixed user frame when the agent spoke first", () => {
+  const msgs = reconstructMessagesFromHistory([
+    ent("assistant", { text: "daily digest", deliveryKey: "cron:9" }, 1),
+    ent("user", { text: "thanks" }, 2),
+  ]);
+  assertValidWire(msgs);
+  assert.deepEqual(
+    msgs.map((m) => [m.role, m.content]),
+    [
+      ["user", [{ type: "text", text: AGENT_OPENED_TEXT }]],
+      ["assistant", [{ type: "text", text: "daily digest" }]],
+      ["user", [{ type: "text", text: "thanks" }]],
+    ],
+  );
 });
 
 test("reconstructMessagesFromHistory coalesces consecutive assistant text entries to keep alternation", () => {
@@ -532,4 +537,62 @@ test("overheard reconciliation deduplicates IDs within a batch but preserves ide
     ["100.001", "100.002", "100.003"],
   );
   assert.deepEqual(selectOverheardToImport(incoming, new Set(picked.map((p) => p.ts))), []);
+});
+
+test("a tool_result marked interrupted replays as the interrupted placeholder, not as a real result", () => {
+  const entries: SessionEntry[] = [
+    {
+      sessionId: "s",
+      seq: 1,
+      parentSeq: null,
+      type: "user",
+      payload: { text: "run it" },
+      scopeLabel: "org:o",
+      createdAt: 1,
+    },
+    {
+      sessionId: "s",
+      seq: 2,
+      parentSeq: null,
+      type: "tool_call",
+      payload: { tool: "execute", callId: "c1", command: "make" },
+      scopeLabel: "org:o",
+      createdAt: 2,
+    },
+    {
+      sessionId: "s",
+      seq: 3,
+      parentSeq: null,
+      type: "tool_result",
+      payload: { callId: "c1", result: "[exit 143]", interrupted: true },
+      scopeLabel: "org:o",
+      createdAt: 3,
+    },
+  ];
+  const result = reconstructMessagesFromHistory(entries).find((m) => m.role === "toolResult")!;
+  assert.equal(result.role, "toolResult");
+  if (result.role !== "toolResult") return;
+  assert.deepEqual(result.content, [{ type: "text", text: INTERRUPTED_TOOL_RESULT }]);
+  assert.equal(result.isError, true);
+});
+
+test("reconstructMessagesFromHistory keeps parallel tool calls in one assistant message", () => {
+  const history: SessionEntry[] = [
+    ent("user", { text: "check both" }, 1),
+    ent("tool_call", { tool: "read", callId: "a", path: "/a" }, 2),
+    ent("tool_call", { tool: "read", callId: "b", path: "/b" }, 3),
+    ent("tool_result", { tool: "read", callId: "a", result: "A" }, 4),
+    ent("tool_result", { tool: "read", callId: "b", result: "B" }, 5),
+    ent("tool_call", { tool: "read", callId: "c", path: "/c" }, 6),
+    ent("tool_result", { tool: "read", callId: "c", result: "C" }, 7),
+    ent("assistant", { text: "done" }, 8),
+  ];
+  const msgs = reconstructMessagesFromHistory(history);
+  assertValidWire(msgs);
+  assert.deepEqual(
+    msgs.map((m) =>
+      m.role === "assistant" ? m.content.map((c) => (c.type === "toolCall" ? c.id : "text")).join(",") : m.role,
+    ),
+    ["user", "a,b", "toolResult", "toolResult", "c", "toolResult", "text"],
+  );
 });

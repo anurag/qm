@@ -1,4 +1,4 @@
-import { isBackendCredential } from "../../credentials/keychain.ts";
+import { isBackendCredential, type PublicServiceCredential } from "../../credentials/keychain.ts";
 import { livePersonCapability } from "../artifact-share.ts";
 import { mintSignedPayload, verifySignedPayload } from "../../auth/signed-token.ts";
 import { canonicalPerson, personIds, samePerson } from "../../directory/person.ts";
@@ -9,8 +9,15 @@ import { parseRef } from "../../acl/resource-ref.ts";
 import { orgId } from "../../config.ts";
 import { principalEntitledToScope } from "../../resolution/context-filter.ts";
 import { sendJson } from "../http.ts";
+import { redactSecrets } from "../../harness/redact-secrets.ts";
+import { createExactSecretValueMasker } from "../../security/secret-masking.ts";
+import { errMessage, httpFailure, reportFailure } from "../../util/errors.ts";
 import { activePrincipal, audit } from "./shared.ts";
 import type { ApiCtx, Route } from "./route.ts";
+
+export function isComposioServiceCredential(c: PublicServiceCredential): boolean {
+  return c.enabled && c.hasSecret && c.delivery === "env" && c.envKey === "COMPOSIO_API_KEY";
+}
 
 export function composioUserId(org: string, principal: string): string {
   return `qm_${createHash("sha256")
@@ -110,7 +117,7 @@ async function credential(ctx: ApiCtx): Promise<{ key: string; principal: string
     )) ?? [];
   const allowed = new Set(grants.map((g) => parseRef(g.ref).id));
   const records = ((await ctx.deps.serviceCreds?.listServiceCredentials(org)) ?? []).filter(
-    (c) => c.enabled && c.hasSecret && c.delivery === "env" && c.envKey === "COMPOSIO_API_KEY" && allowed.has(c.slug),
+    (c) => isComposioServiceCredential(c) && allowed.has(c.slug),
   );
   if (records.length !== 1) {
     sendJson(ctx.res, records.length ? 409 : 403, {
@@ -135,7 +142,7 @@ async function request(ctx: ApiCtx, key: string, path: string, body?: unknown): 
     redirect: "error",
     signal: AbortSignal.timeout(20_000),
   });
-  if (!response.ok) throw new Error("Composio request failed");
+  if (!response.ok) throw new Error(`Composio request failed: ${await httpFailure(response)}`);
   return (await response.json()) as Record<string, unknown>;
 }
 
@@ -260,7 +267,10 @@ async function authorize(ctx: ApiCtx, linkSlack = false): Promise<void> {
       accountId: link.connected_account_id,
       ...(ticket ? { ticket } : {}),
     });
-  } catch {
+  } catch (error) {
+    // Keep the cause for operators (secret-redacted); the user only sees a generic message.
+    const mask = createExactSecretValueMasker([access.key]);
+    reportFailure("composio: authorize", new Error(mask(redactSecrets(errMessage(error)))), `toolkit=${toolkit}`);
     return sendJson(ctx.res, 502, {
       error: "composio_authorization_failed",
       message: "Could not start authorization. Please try again.",

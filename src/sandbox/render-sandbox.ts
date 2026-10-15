@@ -1,6 +1,5 @@
 import type { WorkspaceStore } from "../workspace/workspace-store.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
-import { collectBytes } from "../util/bytes.ts";
 import {
   createHomeSnapshotOps,
   HOME_SNAPSHOT_PRUNE,
@@ -568,7 +567,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       backend: "render",
       writablePersistence: "provider_managed",
       processSessions: true,
-      concurrentProvision: true,
       egressEnforcement: "none",
       spec: {
         os: "Render sandbox; filesystem checkpoints restore files after the sandbox expires",
@@ -597,8 +595,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
           handle = await base.provision(layers, options);
         } catch (error) {
           const temporary = scratch.get(name);
-          if (error instanceof SandboxProvisionCleanupError && temporary)
-            throw new SandboxProvisionCleanupError({ ...error.handle, providerSandboxId: temporary.id });
+          if (error instanceof SandboxProvisionCleanupError && temporary) error.handle.providerSandboxId = temporary.id;
           throw error;
         }
         if (handle.scratch) {
@@ -628,88 +625,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     signalProcess: lockHandle(processes.signalProcess),
     listProcesses: lockHandle(processes.listProcesses),
     destroyScope,
-    async adoptHomeSnapshot(scope, blobId) {
-      const blob = await opts.blobTransfer?.open(blobId);
-      if (!blob) throw new Error(`Render home import could not read blob ${blobId}`);
-      if (blob.sizeBytes > 256 * 1024 * 1024) {
-        blob.stream.destroy();
-        throw new Error("Render home import exceeds the 256 MiB limit");
-      }
-      const archive = (await collectBytes(blob.stream, { maxBytes: 256 * 1024 * 1024 })).data;
-      const name = nameFor(scope);
-      await withLifecycle(name, () =>
-        withUse(name, async () => {
-          let previous = await store.get(scope);
-          if (previous) previous = await recoverStored(scope, previous);
-          const info = await client.create();
-          const resources: RenderSandboxResources = { sandboxId: info.id };
-          let published = false;
-          const retainStaging = async (): Promise<void> => {
-            const retiredResources = [...(previous?.retiredResources ?? []), { ...resources }];
-            if (previous) {
-              await store.merge(scope, { retiredResources });
-            } else {
-              await store.put(scope, {
-                sandboxId: info.id,
-                discarded: true,
-                expiresAtMs: info.expiresAtMs,
-                lastActivityMs: 0,
-                retiredResources,
-              });
-            }
-          };
-          try {
-            await retainStaging();
-            await client.writeFileBytes(info.id, `${homeDir}/.qm-import.tar`, archive);
-            const restored = await client.runScript(
-              info.id,
-              `mkdir -p ${shq(homeDir)} && tar -tf ${shq(homeDir)}/.qm-import.tar > /dev/null && tar -xf ${shq(homeDir)}/.qm-import.tar -C ${shq(homeDir)} && rm -f ${shq(homeDir)}/.qm-import.tar`,
-              180,
-            );
-            if (restored.exitCode !== 0) throw new Error(`Render home import failed: ${restored.stderr}`);
-            resources.checkpoint = await client.createSnapshot(info.id);
-            await retainStaging();
-            resources.checkpoint = await waitCheckpoint(resources.checkpoint);
-            const imported: StoredRenderSandbox = {
-              ...resources,
-              sandboxId: info.id,
-              expiresAtMs: info.expiresAtMs,
-              lastActivityMs: Date.now(),
-              ...(previous ? { retiredResources: [...(previous.retiredResources ?? []), resourcesFor(previous)] } : {}),
-              ...(previous?.unconfirmedCheckpoints ? { unconfirmedCheckpoints: previous.unconfirmedCheckpoints } : {}),
-            };
-            await store.put(scope, imported);
-            published = true;
-            await homeSnapshots.snapshotHome(scope, info.id);
-            const savedAtMs = Date.now();
-            await store.merge(scope, { homeCheckpointAtMs: savedAtMs, savedAtMs, homeDirty: false });
-            await cleanupRetired(scope, imported);
-          } catch (error) {
-            if (!published) {
-              try {
-                await retainStaging();
-                let staged = (await store.get(scope))!;
-                if (error instanceof RenderCheckpointUnconfirmedError)
-                  staged = (await store.merge(scope, { unconfirmedCheckpoints: unconfirmed(staged, error) })) ?? staged;
-                const cleaned = await cleanupRetired(scope, staged);
-                if (
-                  cleanupOnly(cleaned) &&
-                  !cleaned.retiredResources?.length &&
-                  !cleaned.unconfirmedCheckpoints?.length
-                )
-                  await store.delete(scope);
-              } catch {
-                await disposeResources(resources).catch(async (cleanupError) => {
-                  await retainStaging();
-                  await store.merge(scope, { retirementError: errMessage(cleanupError) });
-                });
-              }
-            }
-            throw error;
-          }
-        }),
-      );
-    },
 
     async persistHomeSnapshot(scope) {
       await withLifecycle(nameFor(scope), async () => {

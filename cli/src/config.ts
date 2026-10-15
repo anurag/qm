@@ -138,8 +138,8 @@ export const MODEL_PROVIDER_KEYS: Readonly<Record<ModelProvider, string>> = {
 };
 
 export const MODEL_PROVIDER_HARNESSES: Readonly<Record<ModelProvider, readonly string[]>> = {
-  anthropic: ["pi", "opencode", "claude", "mock"],
-  openai: ["pi", "opencode", "codex", "mock"],
+  anthropic: ["pi", "claude", "mock"],
+  openai: ["pi", "mock"],
   openrouter: ["pi", "mock"],
 };
 
@@ -729,10 +729,7 @@ function validate(raw: unknown, path: string): QmConfig {
       `${path}: "env.core.SANDBOX_BACKEND" is blank — name the backend core should run, or remove the key; every target forwards env.core verbatim, so a blank value leaves core with no backend`,
     );
   }
-  if (
-    (effectiveSandboxBackend({ env, sandbox }) === "superserve" || scopeUsesSuperserve(env.core)) &&
-    !env.core?.SUPERSERVE_TEMPLATE?.trim()
-  ) {
+  if (effectiveSandboxBackend({ env, sandbox }) === "superserve" && !env.core?.SUPERSERVE_TEMPLATE?.trim()) {
     throw new CliError(
       `${path}: the superserve sandbox backend requires env.core.SUPERSERVE_TEMPLATE (the ready qm-agent-<release> template); core refuses to start without it`,
     );
@@ -856,7 +853,15 @@ export function effectiveModelProvider(config: QmConfig): ModelProvider | undefi
   return isModelProvider(override) ? override : config.modelProvider;
 }
 
+const HARNESSES = ["mock", "pi", "claude"];
+
 function validateModelProvider(config: QmConfig, path: string): void {
+  const harness = configuredHarness(config);
+  if (!HARNESSES.includes(harness)) {
+    throw new CliError(
+      `${path}: env.core.HARNESS "${harness}" is not recognized — use ${HARNESSES.join(", ")}, or unset it.`,
+    );
+  }
   const override = config.env.core?.MODEL_PROVIDER?.trim();
   if (override === "") delete config.env.core!.MODEL_PROVIDER;
   if (override !== undefined && override !== "" && !isModelProvider(override)) {
@@ -866,7 +871,6 @@ function validateModelProvider(config: QmConfig, path: string): void {
   }
   const provider = effectiveModelProvider(config);
   if (!provider) return;
-  const harness = configuredHarness(config);
   if (!MODEL_PROVIDER_HARNESSES[provider].includes(harness)) {
     throw new CliError(
       `${path}: model provider "${provider}" cannot serve a base model on env.core.HARNESS "${harness}" — that harness runs no ${provider} model, so every agent turn would be refused. Use ${MODEL_PROVIDER_HARNESSES[provider].join(", ")}, or pick a provider that harness can bill.`,
@@ -1002,30 +1006,11 @@ export function validatePortalTrust(config: QmConfig, path = "config", secrets?:
   }
 }
 
-function scopeUsesSuperserve(core: Record<string, string> | undefined): boolean {
-  try {
-    const scopes: unknown = JSON.parse(core?.SANDBOX_SCOPE_BACKENDS || "{}");
-    return Boolean(
-      scopes &&
-      typeof scopes === "object" &&
-      !Array.isArray(scopes) &&
-      Object.values(scopes).some((value) => typeof value === "string" && value.trim() === "superserve"),
-    );
-  } catch {
-    return false;
-  }
-}
-
 export function requiresAwsMicrovmImage(config: QmConfig): boolean {
   if (config.target !== "aws") return false;
   const core = config.env.core;
   if ((core?.DEPLOY_PROVIDER?.trim() || "aws") === "aws") return true;
-  if ((core?.SANDBOX_BACKEND?.trim() || config.sandbox?.backend || "aws") === "aws") return true;
-  const scopes: unknown = JSON.parse(core?.SANDBOX_SCOPE_BACKENDS || "{}");
-  if (!scopes || typeof scopes !== "object" || Array.isArray(scopes)) {
-    throw new CliError("SANDBOX_SCOPE_BACKENDS must be an object");
-  }
-  return Object.values(scopes).some((value) => typeof value === "string" && value.trim() === "aws");
+  return (core?.SANDBOX_BACKEND?.trim() || config.sandbox?.backend || "aws") === "aws";
 }
 
 function validateAwsFrontDoor(config: QmConfig, path: string): void {

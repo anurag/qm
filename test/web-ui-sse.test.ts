@@ -94,6 +94,8 @@ test("SSE streams partial frames then a terminal done frame carrying the reply",
 });
 
 test("SSE relays tool activity frames and folds them into the done frame", async () => {
+  const computer = await built.sandboxResources.create("alice", "personal:alice", "sprites", "default");
+  await built.sandboxResources.setDefault("alice", "personal:alice", computer.id);
   const submit = (await (
     await fetch(
       `${webBase}/api/turn`,
@@ -235,4 +237,34 @@ test("the events route is ownership-gated (404 for a run the caller doesn't own)
 test("the events route requires a signed-in principal (401 without a cookie)", async () => {
   const res = await fetch(`${webBase}/api/runs/whatever/events`);
   assert.equal(res.status, 401);
+});
+
+test("a completed long stream replays its bounded tail with absolute offsets and its full reply", async () => {
+  const text = "long output ".repeat(20_000) + "last sentence";
+  const submit = (await (
+    await fetch(
+      `${webBase}/api/turn`,
+      asUser("alice", {
+        method: "POST",
+        body: JSON.stringify({ text, threadRef: `web:alice:${randomUUID()}` }),
+      }),
+    )
+  ).json()) as { runId: string };
+  await built.runs.waitFor(submit.runId, 10_000);
+  const res = await fetch(
+    `${webBase}/api/runs/${submit.runId}/events`,
+    asUser("alice", {
+      signal: AbortSignal.timeout(20_000),
+    }),
+  );
+  const done = parseSse(await res.text()).find((event) => event.event === "done")!.data as {
+    partial: string;
+    partialStartOffset: number;
+    result: { reply: string };
+  };
+  assert.ok(done.partial.length <= 200_000);
+  assert.ok(done.partial.length >= 100_000);
+  assert.ok(done.partialStartOffset > 0);
+  assert.equal(done.result.reply.slice(done.partialStartOffset), done.partial);
+  assert.ok(done.partial.includes("last sentence"));
 });

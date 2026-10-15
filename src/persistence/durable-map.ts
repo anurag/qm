@@ -19,6 +19,7 @@ export interface DurableMap<T> {
   insertIfAbsent?(id: string, value: T): Promise<boolean>;
   merge(id: string, patch: Partial<T>): Promise<T | null>;
   update?(id: string, fn: (value: T) => T): Promise<T | null>;
+  mutateMany(updates: readonly { id: string; apply: (value: T | null) => T }[]): Promise<T[]>;
   deleteIf?(id: string, predicate: (value: T) => boolean): Promise<boolean>;
   delete(id: string): Promise<void>;
   take(id: string): Promise<T | null>;
@@ -145,6 +146,16 @@ export function createMemoryMap<T>(): DurableMap<T> {
       m.set(id, next);
       return next;
     },
+    async mutateMany(updates) {
+      const pending = new Map<string, T>();
+      const results = updates.map(({ id, apply }) => {
+        const next = apply(structuredClone(pending.get(id) ?? m.get(id) ?? null));
+        pending.set(id, next);
+        return next;
+      });
+      for (const [id, value] of pending) m.set(id, value);
+      return results;
+    },
     async deleteIf(id, predicate) {
       const value = m.get(id);
       if (value === undefined || !predicate(value)) return false;
@@ -200,6 +211,14 @@ export function createPostgresMap<T>(
            ON ${table} (lower(json->>'${field}'))`,
             `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${table}_${field.toLowerCase()}_unicode
            ON ${table} (id) WHERE json->>'${field}' ~ '[^\\x01-\\x7f]'`,
+          ],
+        },
+        {
+          id: `durable-map/${table}/stats-${field.toLowerCase()}`,
+          statements: [
+            `SET LOCAL lock_timeout = '3s'`,
+            `CREATE STATISTICS IF NOT EXISTS ${table}_${field.toLowerCase()}_stats ON (json->>'${field}') FROM ${table}`,
+            `ANALYZE ${table}`,
           ],
         },
       ];
@@ -271,14 +290,13 @@ export function createPostgresMap<T>(
       }
       let sql = `SELECT ${projection} - $1::text[] AS json FROM ${table}`;
       if (query.where) {
-        params.push(
-          query.where.field,
-          query.where.anyOfFold.map((v) => v.toLowerCase()),
-        );
+        const field = query.where.field;
+        if (!/^[a-z_][a-z0-9_]*$/i.test(field)) throw new Error(`invalid select field: ${field}`);
+        params.push(query.where.anyOfFold.map((v) => v.toLowerCase()));
         sql += ` WHERE id IN (
-          SELECT id FROM ${table} WHERE lower(json->>$${params.length - 1}) = ANY($${params.length}::text[])
+          SELECT id FROM ${table} WHERE lower(json->>'${field}') = ANY($${params.length}::text[])
           UNION
-          SELECT id FROM ${table} WHERE json->>$${params.length - 1} ~ '[^\\x01-\\x7f]')`;
+          SELECT id FROM ${table} WHERE json->>'${field}' ~ '[^\\x01-\\x7f]')`;
       }
       if (query.afterId !== undefined) {
         params.push(query.afterId);
@@ -347,6 +365,28 @@ export function createPostgresMap<T>(
         const next = fn(current.rows[0].json as T);
         await client.query(`UPDATE ${table} SET json = $2 WHERE id = $1`, [id, jsonbStringify(next)]);
         return next;
+      });
+    },
+    async mutateMany(updates) {
+      if (!updates.length) return [];
+      return withBump(async (client) => {
+        const rows = await client.query(
+          `SELECT id, json FROM ${table} WHERE id = ANY($1::text[]) ORDER BY id FOR UPDATE`,
+          [updates.map(({ id }) => id)],
+        );
+        const current = new Map(rows.rows.map((row) => [row.id as string, row.json as T]));
+        const pending = new Map<string, T>();
+        const results = updates.map(({ id, apply }) => {
+          const next = apply(structuredClone(pending.get(id) ?? current.get(id) ?? null));
+          pending.set(id, next);
+          return next;
+        });
+        await client.query(
+          `INSERT INTO ${table} (id, json) SELECT id, json FROM jsonb_to_recordset($1::jsonb) AS batch(id text, json jsonb)
+           ON CONFLICT (id) DO UPDATE SET json = EXCLUDED.json`,
+          [jsonbStringify([...pending].map(([id, json]) => ({ id, json })))],
+        );
+        return results;
       });
     },
     async deleteIf(id, predicate) {

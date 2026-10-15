@@ -20,8 +20,8 @@ import {
   putAdminCronDestination,
   putAdminCronRuntime,
 } from "./admin/artifacts.ts";
-import { getAdminMemory, listMemoryScopes, putAdminMemory } from "./admin/memory.ts";
-import { listSandboxRoutes, migrateSandboxScope, manageSandboxResources } from "./admin/sandbox.ts";
+import { adminMemory, listMemoryScopes } from "./admin/memory.ts";
+import { manageSandboxResources } from "./admin/sandbox.ts";
 import {
   createAdminGrant,
   getUserDetail,
@@ -51,10 +51,11 @@ import {
   startSlackInstallation,
   managedSlackRequest,
 } from "./admin/slack-installation.ts";
+import { getConnectorSources } from "./admin/connector-sources.ts";
 import { deleteModelProvider, getModelProviders, putModelProvider } from "./admin/model-providers.ts";
 import { deleteCustomProvider, getCustomProviders, putCustomProvider } from "./admin/custom-providers.ts";
 import { deleteMcpServer, getMcpServers, putMcpServer } from "./admin/mcp-servers.ts";
-import { listSecurityFlags, releaseSecurityTaint } from "./admin/security.ts";
+import { listSecurityFlags } from "./admin/security.ts";
 import { spend } from "./admin/spend.ts";
 import { createPrincipalLink, deletePrincipalLink, listPrincipalLinks } from "./admin/principal-links.ts";
 
@@ -82,6 +83,7 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "POST", path: "/v1/slack/managed/events", auth: "public", handle: managedSlackRequest },
   { method: "GET", path: "/v1/admin/slack-installation", auth: "either", handle: getSlackInstallation },
   { method: "GET", path: "/v1/admin/slack-emoji", auth: "either", handle: getSlackEmojiList },
+  { method: "GET", path: "/v1/admin/connector-sources", auth: "either", handle: getConnectorSources },
   { method: "PUT", path: "/v1/admin/slack-installation", auth: "either", handle: putSlackInstallation },
   { method: "DELETE", path: "/v1/admin/slack-installation", auth: "either", handle: deleteSlackInstallation },
   { method: "GET", path: "/v1/admin/model-providers", auth: "either", handle: getModelProviders },
@@ -135,7 +137,6 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/admin/errors", auth: "either", handle: listAdminErrors },
   { method: "GET", path: "/v1/admin/audit", auth: "either", handle: listAdminAudit },
   { method: "GET", path: "/v1/admin/security/flags", auth: "either", handle: listSecurityFlags },
-  { method: "POST", path: "/v1/admin/security/release", auth: "either", handle: releaseSecurityTaint },
   {
     match: (m, p) =>
       m === "GET" && (p === "/v1/admin/crons" || p === "/v1/admin/deployments" || p === "/v1/admin/skills"),
@@ -147,12 +148,12 @@ const routes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/admin/skills/:id", auth: "either", handle: getAdminSkill },
   { method: "DELETE", path: "/v1/admin/skills/:id", auth: "either", handle: archiveAdminSkill },
   { method: "GET", path: "/v1/admin/memory/scopes", auth: "either", handle: listMemoryScopes },
-  { method: "GET", path: "/v1/admin/memory", auth: "either", handle: getAdminMemory },
-  { method: "PUT", path: "/v1/admin/memory", auth: "either", handle: putAdminMemory },
+  { method: "GET", path: "/v1/admin/memory", auth: "either", handle: adminMemory },
+  { method: "POST", path: "/v1/admin/memory", auth: "either", handle: adminMemory },
+  { method: "PATCH", path: "/v1/admin/memory", auth: "either", handle: adminMemory },
+  { method: "DELETE", path: "/v1/admin/memory", auth: "either", handle: adminMemory },
   { method: "GET", path: "/v1/admin/sandboxes/:scopeId", auth: "either", handle: manageSandboxResources },
   { method: "POST", path: "/v1/admin/sandboxes/:scopeId", auth: "either", handle: manageSandboxResources },
-  { method: "GET", path: "/v1/admin/sandbox-routes", auth: "either", handle: listSandboxRoutes },
-  { method: "POST", path: "/v1/admin/sandbox-routes/:scopeId/migrate", auth: "either", handle: migrateSandboxScope },
   { method: "GET", path: "/v1/admin/users", auth: "either", handle: listUsers },
   { method: "GET", path: "/v1/admin/directory", auth: "either", handle: searchDirectory },
   { method: "GET", path: "/v1/admin/keychain", auth: "either", handle: listKeychainStatus },

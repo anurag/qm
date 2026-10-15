@@ -440,7 +440,7 @@ test("tool entries are folded into the following assistant reply's work block", 
     { type: "tool_call", payload: { tool: "execute", command: "ls" }, createdAt: 110, seq: 2, parentSeq: 1 },
     {
       type: "tool_result",
-      payload: { tool: "execute", code: 0, stdout: "a\nb" },
+      payload: { tool: "execute", code: 0, result: "a\nb" },
       createdAt: 120,
       seq: 3,
       parentSeq: 2,
@@ -531,16 +531,22 @@ test("a durable turn_failure entry renders like the live inline error (survives 
   assert.equal(err.errorMessage, "API integrators: you can reduce refusals…");
 });
 
-test("user entries carry the stored speaker name and slack ts onto the rebuilt message", () => {
+test("user entries carry the stored speaker identity, name and slack ts onto the rebuilt message", () => {
   const entries: SessionEntry[] = [
-    { type: "user", payload: { text: "hi", name: "Alice Example", ts: "100.1" }, createdAt: 100 },
+    {
+      type: "user",
+      payload: { text: "hi", name: "Alice Example", speakerId: "person-a", ts: "100.1" },
+      createdAt: 100,
+    },
     { type: "user", payload: { text: "anonymous web message" }, createdAt: 110 },
   ];
   const msgs = entriesToMessages(entries, MODEL);
-  const [slack, web] = msgs as Array<{ speaker?: string; ts?: string }>;
+  const [slack, web] = msgs as Array<{ speaker?: string; speakerId?: string; ts?: string }>;
   assert.equal(slack?.speaker, "Alice Example");
+  assert.equal(slack?.speakerId, "person-a");
   assert.equal(slack?.ts, "100.1");
   assert.equal(web?.speaker, undefined);
+  assert.equal(web?.speakerId, undefined);
   assert.equal(web?.ts, undefined);
 });
 
@@ -1685,7 +1691,7 @@ test("live consumed steers join canonical history once and survive stopped/error
     assert.equal(live.length, 2);
     assert.equal((live[1] as { entrySeq?: number }).entrySeq, 3);
     live.push({ ...entriesToMessages(entries).at(-1)!, stopReason: reason } as AgentMessage);
-    assert.equal(forkCutSeq(entries, live.filter((message) => message.role === "user").length, false), undefined);
-    assert.equal(forkCutSeq(entries, 2, true), 3);
+    assert.equal(forkCutSeq(entries, live, live.length - 1), 5);
+    assert.equal(forkCutSeq(entries, live, 1), 3);
   }
 });

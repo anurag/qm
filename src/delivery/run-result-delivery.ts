@@ -2,18 +2,11 @@ import { isSubagentThreadRef } from "../sessions/session-syscalls.ts";
 import type { DeliveryProvenance, Destination, OutgoingAttachment } from "../types.ts";
 import type { Run, RunStore } from "../runs/run-store.ts";
 import { turnDeliveryProvenance, type DeliveryStore } from "./delivery-store.ts";
-import type { Task, TaskStore } from "../tasks/task-store.ts";
 import { resolveTurnOrigin } from "../core/turn-origin.ts";
 import type { TurnFailurePayload } from "../core/turn-error.ts";
 import { standaloneFailureText, userFacingFailureClause } from "../core/failure-copy.ts";
 import { conversationScope } from "../resolution/resolution-service.ts";
-import {
-  acquireLeaseWithin,
-  appendEntryOutsideTurn,
-  entryDeliveryKey,
-  type SessionStore,
-  type TranscriptAppendSessions,
-} from "../sessions/session-store.ts";
+import { acquireLeaseWithin, entryDeliveryKey, type SessionStore } from "../sessions/session-store.ts";
 import { turnRecordedFailure } from "./web-transcript-delivery.ts";
 import { reportFailureAs } from "../util/errors.ts";
 
@@ -35,11 +28,7 @@ function webTranscriptNote(run: Run, surface: string, failed: boolean): Destinat
 
 export type AdminUrlFor = (sessionId: string) => string | undefined;
 
-export function runResultDelivery(
-  run: Run,
-  taskList: Task[] = [],
-  adminUrlFor?: AdminUrlFor,
-): RunResultDelivery | null {
+export function runResultDelivery(run: Run, adminUrlFor?: AdminUrlFor): RunResultDelivery | null {
   if (isSubagentThreadRef(run.sessionId) || run.request.swarm || run.request.privateSessionMessage) return null;
   const target = run.request.deliveryTarget;
   const surface = run.request.surface;
@@ -58,7 +47,6 @@ export function runResultDelivery(
       ? { slackPolicyNamespace: run.request.slackSource.externalPolicyNamespace }
       : {}),
     ...(editRef ? { editRef } : {}),
-    ...(taskList.length ? { taskList: taskList.map(({ id, title, status }) => ({ id, title, status })) } : {}),
     ...(webTranscript ? { webTranscript } : {}),
   };
   const idempotencyKey = `run:${run.id}`;
@@ -77,7 +65,7 @@ export function runResultDelivery(
   if (
     surface === "slack" &&
     run.result?.status === "refused" &&
-    run.result.refusalKind === "security_quarantine" &&
+    (run.result.refusalKind === "security_quarantine" || run.result.refusalKind === "model_budget") &&
     run.request.addressed
   ) {
     return { destination, text: standaloneFailureText(run.result)!, provenance, idempotencyKey };
@@ -102,8 +90,10 @@ export function runResultDelivery(
   return null;
 }
 
-export type TurnFailureSessions = TranscriptAppendSessions &
-  Pick<SessionStore, "getByThread" | "acquireLease" | "peekLease" | "releaseLease" | "getEntries">;
+export type TurnFailureSessions = Pick<
+  SessionStore,
+  "append" | "getByThread" | "acquireLease" | "peekLease" | "releaseLease" | "getEntries"
+>;
 
 const FAILURE_RECORD_SCAN_LIMIT = 200;
 const FAILURE_RECORD_WAIT_MS = 10 * 60_000;
@@ -131,31 +121,58 @@ export async function recordRunFailureEntry(sessions: TurnFailureSessions, run: 
       message: `I couldn't finish that turn: ${userFacingFailureClause(run.result ?? { status: "failed" })}`,
       runId: run.id,
     };
-    await appendEntryOutsideTurn(sessions, lease, { type: "system", payload, scopeLabel: session.scopeId });
+    await sessions.append(lease, { type: "system", payload, scopeLabel: session.scopeId });
     return true;
   } finally {
     await sessions.releaseLease(lease);
   }
 }
 
+const RUN_RESULT_SWEEP_LOOKBACK_MS = 60 * 60_000;
+const RUN_RESULT_SWEEP_GRACE_MS = 60_000;
+const RUN_RESULT_SWEEP_PAGE = 200;
+
+export interface RunResultRecovery {
+  sweep(now?: number): Promise<number>;
+}
+
 export function wireRunResultDeliveries(
-  runs: RunStore,
-  deliveries: DeliveryStore,
-  tasks?: TaskStore,
+  runs: Pick<RunStore, "onTerminal" | "terminalFinished">,
+  deliveries: Pick<DeliveryStore, "enqueue" | "existingKeys">,
   adminUrlFor?: AdminUrlFor,
   sessions?: TurnFailureSessions,
-): void {
-  runs.onTerminal((run) => {
+): RunResultRecovery {
+  const recover = async (run: Run): Promise<boolean> => {
     if (sessions) {
       void recordRunFailureEntry(sessions, run).catch(
         reportFailureAs("delivery: record turn_failure entry", undefined, `run=${run.id}`),
       );
     }
-    void (async () => {
-      const taskList = tasks ? await tasks.list({ originRunId: run.id }) : [];
-      const delivery = runResultDelivery(run, taskList, adminUrlFor);
-      if (!delivery) return;
-      await deliveries.enqueue(delivery);
-    })().catch(reportFailureAs("delivery: enqueue recovery delivery", undefined, `run=${run.id}`));
+    const delivery = runResultDelivery(run, adminUrlFor);
+    if (!delivery) return false;
+    await deliveries.enqueue(delivery);
+    return true;
+  };
+  runs.onTerminal((run) => {
+    void recover(run).catch(reportFailureAs("delivery: enqueue recovery delivery", undefined, `run=${run.id}`));
   });
+  return {
+    async sweep(now = Date.now()) {
+      const before = now - RUN_RESULT_SWEEP_GRACE_MS;
+      let cursor = { finishedAt: now - RUN_RESULT_SWEEP_LOOKBACK_MS, id: "" };
+      let recovered = 0;
+      for (;;) {
+        const batch = await runs.terminalFinished(cursor, before, RUN_RESULT_SWEEP_PAGE);
+        const existing = await deliveries.existingKeys(batch.map((run) => `run:${run.id}`));
+        for (const run of batch) {
+          if (existing.has(`run:${run.id}`) || !(await recover(run))) continue;
+          console.error(`[delivery] terminal run ${run.id} had no outbox row — enqueued its recovery delivery`);
+          recovered += 1;
+        }
+        const last = batch.at(-1);
+        if (!last || batch.length < RUN_RESULT_SWEEP_PAGE) return recovered;
+        cursor = { finishedAt: last.finishedAt!, id: last.id };
+      }
+    },
+  };
 }

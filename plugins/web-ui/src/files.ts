@@ -1,3 +1,4 @@
+import { previewFile } from "./file-open.ts";
 import { html, nothing, render } from "lit";
 import {
   File,
@@ -16,7 +17,8 @@ import {
 } from "lucide";
 import { api, fileContentUrl, webFetch, withBase } from "./core-bridge";
 import { errMessage } from "../../chassis/src/errors";
-import { browserRenderableImage, fieldSelect, formatBytes, icon, relTime } from "./ui";
+import { browserRenderableImage, fieldSelect, formatBytes, relTime } from "./ui";
+import { icon } from "./icons";
 import { contextsState, ensureContexts, personalScopeId, scopeTitle } from "./contexts";
 import { appState } from "./shell";
 import { fileListNeedsAllPages } from "./file-list";
@@ -240,7 +242,14 @@ function fileRow(f: FileRow) {
     >
   `;
   return f.openable
-    ? html`<a class="list-row file-row" href=${contentUrl} target="_blank" rel="noreferrer">${content}</a>`
+    ? html`<a
+        class="list-row file-row"
+        href=${contentUrl}
+        target="_blank"
+        rel="noreferrer"
+        @click=${(event: MouseEvent) => previewFile(event, f.name, contentUrl, f.mimetype)}
+        >${content}</a
+      >`
     : html`<article class="list-row file-row">${content}</article>`;
 }
 
