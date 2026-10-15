@@ -315,7 +315,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     let snapshot: RenderSnapshot | undefined;
     let saved: StoredRenderSandbox;
     try {
-      snapshot = await client.createSnapshot(stored.sandboxId);
+      snapshot = await client.createSnapshot(stored.sandboxId, nameFor(scope));
       const staged = await store.merge(scope, { retiredResources: retire(stored, { checkpoint: snapshot }) });
       if (!staged) throw new Error(`Render sandbox checkpoint lost its scope: ${scope}`);
       const available = await waitCheckpoint(snapshot);

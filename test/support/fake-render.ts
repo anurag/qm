@@ -57,7 +57,7 @@ export function createFakeRender() {
   const root = mkdtempSync(join(tmpdir(), "fake-render-"));
   const sandboxes = new Map<string, RenderSandboxInfo>();
   const snapshots = new Map<string, RenderSnapshot>();
-  const snapshotSources = new Map<string, { sandboxId: string; requestedAtMs: number }>();
+  const snapshotSources = new Map<string, { sandboxId: string; name: string; requestedAtMs: number }>();
   const createdFrom: Array<string | undefined> = [];
   const commands: string[] = [];
   const deleted: string[] = [];
@@ -149,7 +149,7 @@ export function createFakeRender() {
       mkdirSync(dirname(dest), { recursive: true });
       writeFileSync(dest, data);
     },
-    async createSnapshot(id) {
+    async createSnapshot(id, name) {
       requireRunning(id);
       if (checkpointError) throw checkpointError;
       const snapshotId = `snp-${snapshots.size + deleted.length + 1}`;
@@ -162,7 +162,7 @@ export function createFakeRender() {
       };
       cpSync(home(id), join(root, snapshotId), { recursive: true });
       snapshots.set(snapshotId, snapshot);
-      snapshotSources.set(snapshotId, { sandboxId: id, requestedAtMs: snapshot.capturedAtMs! });
+      snapshotSources.set(snapshotId, { sandboxId: id, name, requestedAtMs: snapshot.capturedAtMs! });
       if (loseCheckpointReply) {
         snapshot.status = loseCheckpointReply;
         loseCheckpointReply = undefined;
@@ -241,13 +241,14 @@ export function serveFakeRenderApi(
       status: info.status,
       plan: "starter",
       region: "oregon",
-      networkPolicy: { default: "allow" },
+      networkPolicy: { default: "allow-all" },
       timeoutSeconds: 7200,
       createdAt: new Date(info.expiresAtMs - 7200_000).toISOString(),
     };
   };
   const snapshotJson = (snapshot: RenderSnapshot) => ({
     id: snapshot.id,
+    name: fake.snapshotSource(snapshot.id)?.name ?? null,
     sandboxGroupId: snapshot.sandboxGroupId,
     sourceSandboxId: fake.snapshotSource(snapshot.id)?.sandboxId ?? "sbx-source",
     kind: "filesystem",
@@ -289,8 +290,10 @@ export function serveFakeRenderApi(
         token: "file-token",
       });
     }
-    if ((match = /^\/sandboxes\/([^/]+)\/snapshots$/.exec(path)) && request.method === "POST")
-      return Response.json(snapshotJson(await fake.client.createSnapshot(match[1]!)), { status: 201 });
+    if ((match = /^\/sandboxes\/([^/]+)\/snapshots$/.exec(path)) && request.method === "POST") {
+      const body = (await request.json()) as { name: string };
+      return Response.json(snapshotJson(await fake.client.createSnapshot(match[1]!, body.name)), { status: 201 });
+    }
     if (path === "/sandbox-groups" && request.method === "GET")
       return Response.json([
         {
