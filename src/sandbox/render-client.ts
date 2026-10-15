@@ -29,6 +29,7 @@ export interface RenderSandboxInfo {
 
 export interface RenderSnapshot {
   id: string;
+  name?: string;
   sandboxGroupId: string;
   status: "creating" | "available" | "failed";
   expiresAtMs: number;
@@ -47,7 +48,7 @@ export interface RenderClient {
   ): Promise<{ stdout: string; stderr: string; exitCode: number }>;
   readFileBytes(sandboxId: string, absPath: string): Promise<Uint8Array | null>;
   writeFileBytes(sandboxId: string, absPath: string, data: Uint8Array): Promise<void>;
-  createSnapshot(sandboxId: string): Promise<RenderSnapshot>;
+  createSnapshot(sandboxId: string, name: string): Promise<RenderSnapshot>;
   getSnapshot(snapshot: RenderSnapshot): Promise<RenderSnapshot>;
   deleteSnapshot(snapshot: RenderSnapshot): Promise<void>;
   findSnapshots(sourceSandboxId: string, sinceMs: number): Promise<RenderSnapshot[]>;
@@ -95,6 +96,7 @@ export function createSdkRenderClient(opts: SdkRenderClientOptions): RenderClien
   });
   const normalizeSnapshot = (value: Awaited<ReturnType<typeof api.snapshots.create>>): RenderSnapshot => ({
     id: value.id,
+    ...(value.name ? { name: value.name } : {}),
     sandboxGroupId: value.sandboxGroupId,
     status: value.status,
     expiresAtMs: Date.parse(value.expiresAt),
@@ -249,11 +251,11 @@ export function createSdkRenderClient(opts: SdkRenderClientOptions): RenderClien
         timeoutMs: TRANSFER_TIMEOUT_MS,
       });
     },
-    async createSnapshot(sandboxId) {
+    async createSnapshot(sandboxId, name) {
       const requestedAtMs = Date.now();
       try {
         return normalizeSnapshot(
-          await retryOperation(() => api.snapshots.create({ sandboxId, kind: "filesystem" }), "refused", {
+          await retryOperation(() => api.snapshots.create({ sandboxId, kind: "filesystem", name }), "refused", {
             ...sdkErrors,
             timeoutMs: SUBMIT_TIMEOUT_MS,
             onLate: (late) =>

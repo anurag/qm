@@ -23,6 +23,7 @@ import { scopeId } from "../src/types.ts";
 import { supportsAgentComputerExport, supportsProcessSessions } from "../src/sandbox/sandbox.ts";
 import { pollProcess } from "../src/sandbox/process-poll.ts";
 import { createSdkRenderClient } from "../src/sandbox/render-client.ts";
+import { sandboxScopeName } from "../src/sandbox/exec-sandbox-base.ts";
 import { createSandboxResources } from "../src/sandbox/sandbox-resources.ts";
 import { createSandboxRouter } from "../src/sandbox/sandbox-routing.ts";
 import { createFakeRender, serveFakeRenderApi } from "./support/fake-render.ts";
@@ -201,6 +202,7 @@ test("Render restores files from its checkpoint after sandbox expiry and a core 
   const restored = await second.provision(layers);
   assert.equal(restored.coldStart, false);
   assert.equal(fake.createdFrom[1], checkpointId);
+  assert.equal(fake.snapshots.get(checkpointId)!.name, sandboxScopeName("qm", scope));
   assert.equal(await second.readFile(restored, "nested/work.txt"), "retained");
   assert.equal(await second.readFile(restored, "missing"), null);
   const binary = Buffer.from([0, 255, 4, 0, 128]);
@@ -728,9 +730,9 @@ test("Render keeps its checkpoint interval while the home backup keeps failing",
   const handle = await sandbox.provision(layers);
   const create = fake.client.createSnapshot;
   let natives = 0;
-  fake.client.createSnapshot = async (sandboxId) => {
+  fake.client.createSnapshot = async (sandboxId, name) => {
     natives++;
-    return create(sandboxId);
+    return create(sandboxId, name);
   };
   now += 6 * 60_000;
   await sandbox.teardown(handle);
@@ -760,9 +762,9 @@ test("Render stops saving an unchanged home that is too large for its archive", 
   assert.equal((await store.get(scope))!.homeDirty, false);
   const create = fake.client.createSnapshot;
   let natives = 0;
-  fake.client.createSnapshot = async (sandboxId) => {
+  fake.client.createSnapshot = async (sandboxId, name) => {
     natives++;
-    return create(sandboxId);
+    return create(sandboxId, name);
   };
   for (let pass = 0; pass < 3; pass++) {
     now += 6 * 60_000;
@@ -871,7 +873,7 @@ test("Render saves portable files before it disposes a staged native snapshot", 
   const sandbox = make();
   const handle = await sandbox.provision(layers);
   const stored = (await store.get(scope))!;
-  const pending = await fake.client.createSnapshot(stored.sandboxId);
+  const pending = await fake.client.createSnapshot(stored.sandboxId, "qm-pending");
   await store.merge(scope, { retiredResources: [{ checkpoint: { ...pending, status: "creating" } }] });
   await sandbox.writeFile(handle, "work", "after pending snapshot");
   fake.failCheckpoint(new Error("native snapshot unavailable"));

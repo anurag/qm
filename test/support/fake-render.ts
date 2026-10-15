@@ -149,12 +149,13 @@ export function createFakeRender() {
       mkdirSync(dirname(dest), { recursive: true });
       writeFileSync(dest, data);
     },
-    async createSnapshot(id) {
+    async createSnapshot(id, name) {
       requireRunning(id);
       if (checkpointError) throw checkpointError;
       const snapshotId = `snp-${snapshots.size + deleted.length + 1}`;
       const snapshot: RenderSnapshot = {
         id: snapshotId,
+        name,
         sandboxGroupId: "sbg-test",
         status: "available",
         expiresAtMs: Date.now() + 86400_000,
@@ -241,13 +242,14 @@ export function serveFakeRenderApi(
       status: info.status,
       plan: "starter",
       region: "oregon",
-      networkPolicy: { default: "allow" },
+      networkPolicy: { default: "allow-all" },
       timeoutSeconds: 7200,
       createdAt: new Date(info.expiresAtMs - 7200_000).toISOString(),
     };
   };
   const snapshotJson = (snapshot: RenderSnapshot) => ({
     id: snapshot.id,
+    name: snapshot.name ?? null,
     sandboxGroupId: snapshot.sandboxGroupId,
     sourceSandboxId: fake.snapshotSource(snapshot.id)?.sandboxId ?? "sbx-source",
     kind: "filesystem",
@@ -289,8 +291,10 @@ export function serveFakeRenderApi(
         token: "file-token",
       });
     }
-    if ((match = /^\/sandboxes\/([^/]+)\/snapshots$/.exec(path)) && request.method === "POST")
-      return Response.json(snapshotJson(await fake.client.createSnapshot(match[1]!)), { status: 201 });
+    if ((match = /^\/sandboxes\/([^/]+)\/snapshots$/.exec(path)) && request.method === "POST") {
+      const body = (await request.json()) as { name: string };
+      return Response.json(snapshotJson(await fake.client.createSnapshot(match[1]!, body.name)), { status: 201 });
+    }
     if (path === "/sandbox-groups" && request.method === "GET")
       return Response.json([
         {

@@ -39,13 +39,14 @@ const sandbox = {
   id: "sbx-test",
   status: "running",
   plan: "standard",
-  networkPolicy: { default: "allow" },
+  networkPolicy: { default: "allow-all" },
   region: "oregon",
   timeoutSeconds: 7200,
   createdAt: "2026-09-12T00:00:00Z",
 };
 const snapshot = {
   id: "snp-test",
+  name: "qm-test",
   sandboxGroupId: "sbg-test",
   sourceSandboxId: "sbx-test",
   kind: "filesystem",
@@ -88,8 +89,9 @@ test("Render SDK adapter maps sandbox and snapshot records and forwards the crea
   assert.equal(info.id, sandbox.id);
   assert.equal(info.status, "running");
   assert.equal(info.expiresAtMs, Date.parse(sandbox.createdAt) + 7200_000);
-  const saved = await client.createSnapshot(info.id);
+  const saved = await client.createSnapshot(info.id, "qm-test");
   assert.equal(saved.id, snapshot.id);
+  assert.equal(saved.name, "qm-test");
   assert.equal(saved.sandboxGroupId, snapshot.sandboxGroupId);
   assert.equal(saved.status, "available");
   assert.equal(saved.capturedAtMs, Date.parse(snapshot.capturedAt));
@@ -97,7 +99,7 @@ test("Render SDK adapter maps sandbox and snapshot records and forwards the crea
   assert.deepEqual(await client.getSnapshot(saved), saved);
   await client.deleteSnapshot(saved);
   assert.deepEqual(requests.slice(1), [
-    { method: "POST", path: "/v1/sandboxes/sbx-test/snapshots", body: { kind: "filesystem" } },
+    { method: "POST", path: "/v1/sandboxes/sbx-test/snapshots", body: { kind: "filesystem", name: "qm-test" } },
     { method: "GET", path: "/v1/sandbox-groups/sbg-test/snapshots/snp-test" },
     { method: "DELETE", path: "/v1/sandbox-groups/sbg-test/snapshots/snp-test" },
   ]);
@@ -203,7 +205,7 @@ test("Render SDK adapter retries idempotent calls after a connection failure but
   await client.deleteSnapshot({ id: "snp-test", sandboxGroupId: "sbg-test", status: "available", expiresAtMs: 0 });
   await client.writeFileBytes("sbx-test", "/root/file", Buffer.from("data"));
   await assert.rejects(client.create(), /fetch failed/);
-  await assert.rejects(client.createSnapshot("sbx-test"), /fetch failed/);
+  await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), /fetch failed/);
   assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 2);
   assert.equal(attempts("DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test"), 2);
   assert.equal(attempts("PUT /files"), 2);
@@ -263,11 +265,11 @@ test("Render SDK adapter reports unconfirmed checkpoints and finds the snapshots
     throw new Error(`Unexpected request ${request.method} ${url.pathname}`);
   });
   const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
-  const unconfirmed = await client.createSnapshot("sbx-test").catch((error: unknown) => error);
+  const unconfirmed = await client.createSnapshot("sbx-test", "qm-test").catch((error: unknown) => error);
   assert.ok(unconfirmed instanceof RenderCheckpointUnconfirmedError);
   assert.equal(unconfirmed.sandboxId, "sbx-test");
   assert.match(unconfirmed.message, /injected 503/);
-  const refused = await client.createSnapshot("sbx-test").catch((error: unknown) => error);
+  const refused = await client.createSnapshot("sbx-test", "qm-test").catch((error: unknown) => error);
   assert.ok(!(refused instanceof RenderCheckpointUnconfirmedError));
   assert.match(String(refused), /injected 409/);
   assert.deepEqual(
@@ -287,13 +289,13 @@ test("Render SDK adapter retries sandbox and checkpoint creation only on 429", a
   const attempts = scriptedApi(t, failures);
   const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
   assert.equal((await client.create()).id, "sbx-test");
-  assert.equal((await client.createSnapshot("sbx-test")).id, "snp-test");
+  assert.equal((await client.createSnapshot("sbx-test", "qm-test")).id, "snp-test");
   assert.equal(attempts("POST /v1/sandboxes"), 2);
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/snapshots"), 2);
   failures.set("POST /v1/sandboxes", [503]);
   failures.set("POST /v1/sandboxes/sbx-test/snapshots", [503]);
   await assert.rejects(client.create(), /injected 503/);
-  await assert.rejects(client.createSnapshot("sbx-test"), /injected 503/);
+  await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), /injected 503/);
   assert.equal(attempts("POST /v1/sandboxes"), 3);
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/snapshots"), 3);
 });
@@ -352,7 +354,7 @@ test(
     await assert.rejects(client.create(), { name: "TimeoutError" });
     await cleaned.sandbox.promise;
     await assert.rejects(
-      client.createSnapshot("sbx-test"),
+      client.createSnapshot("sbx-test", "qm-test"),
       (error: unknown) =>
         error instanceof RenderCheckpointUnconfirmedError && (error.cause as Error).name === "TimeoutError",
     );
