@@ -91,7 +91,6 @@ test("Render SDK adapter maps sandbox and snapshot records and forwards the crea
   assert.equal(info.expiresAtMs, Date.parse(sandbox.createdAt) + 7200_000);
   const saved = await client.createSnapshot(info.id, "qm-test");
   assert.equal(saved.id, snapshot.id);
-  assert.equal(saved.name, "qm-test");
   assert.equal(saved.sandboxGroupId, snapshot.sandboxGroupId);
   assert.equal(saved.status, "available");
   assert.equal(saved.capturedAtMs, Date.parse(snapshot.capturedAt));

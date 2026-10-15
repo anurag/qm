@@ -29,7 +29,6 @@ export interface RenderSandboxInfo {
 
 export interface RenderSnapshot {
   id: string;
-  name?: string;
   sandboxGroupId: string;
   status: "creating" | "available" | "failed";
   expiresAtMs: number;
@@ -96,7 +95,6 @@ export function createSdkRenderClient(opts: SdkRenderClientOptions): RenderClien
   });
   const normalizeSnapshot = (value: Awaited<ReturnType<typeof api.snapshots.create>>): RenderSnapshot => ({
     id: value.id,
-    ...(value.name ? { name: value.name } : {}),
     sandboxGroupId: value.sandboxGroupId,
     status: value.status,
     expiresAtMs: Date.parse(value.expiresAt),

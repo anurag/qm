@@ -57,7 +57,7 @@ export function createFakeRender() {
   const root = mkdtempSync(join(tmpdir(), "fake-render-"));
   const sandboxes = new Map<string, RenderSandboxInfo>();
   const snapshots = new Map<string, RenderSnapshot>();
-  const snapshotSources = new Map<string, { sandboxId: string; requestedAtMs: number }>();
+  const snapshotSources = new Map<string, { sandboxId: string; name: string; requestedAtMs: number }>();
   const createdFrom: Array<string | undefined> = [];
   const commands: string[] = [];
   const deleted: string[] = [];
@@ -155,7 +155,6 @@ export function createFakeRender() {
       const snapshotId = `snp-${snapshots.size + deleted.length + 1}`;
       const snapshot: RenderSnapshot = {
         id: snapshotId,
-        name,
         sandboxGroupId: "sbg-test",
         status: "available",
         expiresAtMs: Date.now() + 86400_000,
@@ -163,7 +162,7 @@ export function createFakeRender() {
       };
       cpSync(home(id), join(root, snapshotId), { recursive: true });
       snapshots.set(snapshotId, snapshot);
-      snapshotSources.set(snapshotId, { sandboxId: id, requestedAtMs: snapshot.capturedAtMs! });
+      snapshotSources.set(snapshotId, { sandboxId: id, name, requestedAtMs: snapshot.capturedAtMs! });
       if (loseCheckpointReply) {
         snapshot.status = loseCheckpointReply;
         loseCheckpointReply = undefined;
@@ -249,7 +248,7 @@ export function serveFakeRenderApi(
   };
   const snapshotJson = (snapshot: RenderSnapshot) => ({
     id: snapshot.id,
-    name: snapshot.name ?? null,
+    name: fake.snapshotSource(snapshot.id)?.name ?? null,
     sandboxGroupId: snapshot.sandboxGroupId,
     sourceSandboxId: fake.snapshotSource(snapshot.id)?.sandboxId ?? "sbx-source",
     kind: "filesystem",

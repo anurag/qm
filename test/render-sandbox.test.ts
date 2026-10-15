@@ -23,7 +23,6 @@ import { scopeId } from "../src/types.ts";
 import { supportsAgentComputerExport, supportsProcessSessions } from "../src/sandbox/sandbox.ts";
 import { pollProcess } from "../src/sandbox/process-poll.ts";
 import { createSdkRenderClient } from "../src/sandbox/render-client.ts";
-import { sandboxScopeName } from "../src/sandbox/exec-sandbox-base.ts";
 import { createSandboxResources } from "../src/sandbox/sandbox-resources.ts";
 import { createSandboxRouter } from "../src/sandbox/sandbox-routing.ts";
 import { createFakeRender, serveFakeRenderApi } from "./support/fake-render.ts";
@@ -202,7 +201,7 @@ test("Render restores files from its checkpoint after sandbox expiry and a core 
   const restored = await second.provision(layers);
   assert.equal(restored.coldStart, false);
   assert.equal(fake.createdFrom[1], checkpointId);
-  assert.equal(fake.snapshots.get(checkpointId)!.name, sandboxScopeName("qm", scope));
+  assert.equal(fake.snapshotSource(checkpointId)?.name, "qm-personal-tester-e41213");
   assert.equal(await second.readFile(restored, "nested/work.txt"), "retained");
   assert.equal(await second.readFile(restored, "missing"), null);
   const binary = Buffer.from([0, 255, 4, 0, 128]);
