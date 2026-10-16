@@ -1,4 +1,5 @@
 import { codexAuthFileForEnv, loadCodexAuthFile } from "./model/chatgpt-auth-file.ts";
+import { RENDER_SANDBOX_TTL_SEC } from "./sandbox/render-client.ts";
 import { errMessage } from "./util/errors.ts";
 import type { ExternalSlackPolicies } from "./resolution/external-slack.ts";
 import { isBearerSecret, isStrongSigningSecret } from "./auth/source-auth.ts";
@@ -160,7 +161,6 @@ export interface Config {
   s3Bucket?: string;
   s3Region?: string;
   s3Endpoint?: string;
-  s3ForcePathStyle?: boolean;
   s3Prefix?: string;
   deployIdleTtlMs?: number;
   deployGitDir: string;
@@ -441,33 +441,23 @@ interface RenderSandboxEnv {
   apiKey?: string;
   workspaceId?: string;
   region: string;
-  plan: "starter" | "standard" | "pro";
-  ttlSec: number;
   defaultTimeoutSec?: number;
 }
 
 function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
-  const plan = env.RENDER_SANDBOX_PLAN?.trim() || "starter";
-  if (plan !== "starter" && plan !== "standard" && plan !== "pro") {
-    throw new Error("RENDER_SANDBOX_PLAN must be starter, standard, or pro");
-  }
-  const ttlSec = numEnvStrict("RENDER_SANDBOX_TTL_SEC", env.RENDER_SANDBOX_TTL_SEC) ?? 7200;
-  if (!Number.isSafeInteger(ttlSec) || ttlSec <= 0) {
-    throw new Error("RENDER_SANDBOX_TTL_SEC must be a positive integer");
-  }
   const defaultTimeoutSec = numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC);
   if (
     (env.SANDBOX_BACKEND?.trim() === "render" || (env.RENDER_API_KEY?.trim() && env.RENDER_WORKSPACE_ID?.trim())) &&
-    ttlSec <= (defaultTimeoutSec ?? 600) + 60
+    (defaultTimeoutSec ?? 600) + 60 >= RENDER_SANDBOX_TTL_SEC
   ) {
-    throw new Error("RENDER_SANDBOX_TTL_SEC must exceed SANDBOX_TIMEOUT_SEC (default 600) by more than 60 seconds");
+    throw new Error(
+      `SANDBOX_TIMEOUT_SEC must stay more than 60 seconds below the ${RENDER_SANDBOX_TTL_SEC} second Render sandbox lifetime`,
+    );
   }
   return {
     ...(env.RENDER_API_KEY?.trim() ? { apiKey: env.RENDER_API_KEY.trim() } : {}),
     ...(env.RENDER_WORKSPACE_ID?.trim() ? { workspaceId: env.RENDER_WORKSPACE_ID.trim() } : {}),
     region: env.RENDER_REGION?.trim() || "oregon",
-    plan,
-    ttlSec,
     ...(defaultTimeoutSec !== undefined ? { defaultTimeoutSec } : {}),
   };
 }
@@ -483,8 +473,6 @@ interface RenderDeployEnv {
   source?: { repo: string; branch: string; commit: string };
   region: string;
   appRegion: string;
-  plan?: string;
-  appPrefix?: string;
 }
 
 function githubRepoUrl(value: string): string | undefined {
@@ -549,8 +537,6 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
     ...(repo && branch && commit ? { source: { repo, branch, commit } } : {}),
     region,
     appRegion: env.RENDER_APP_REGION?.trim() || region,
-    ...(env.RENDER_DEPLOY_PLAN?.trim() ? { plan: env.RENDER_DEPLOY_PLAN.trim() } : {}),
-    ...(env.RENDER_DEPLOY_APP_PREFIX?.trim() ? { appPrefix: env.RENDER_DEPLOY_APP_PREFIX.trim() } : {}),
   };
 }
 
@@ -1784,7 +1770,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.S3_BUCKET ? { s3Bucket: env.S3_BUCKET } : {}),
     ...(env.S3_REGION ? { s3Region: env.S3_REGION } : {}),
     ...(s3Endpoint ? { s3Endpoint } : {}),
-    s3ForcePathStyle: boolEnvStrict("S3_FORCE_PATH_STYLE", env.S3_FORCE_PATH_STYLE) ?? false,
     ...(env.S3_PREFIX ? { s3Prefix: env.S3_PREFIX } : {}),
     ...(numEnvStrict("DEPLOY_IDLE_TTL_MS", env.DEPLOY_IDLE_TTL_MS) !== undefined
       ? { deployIdleTtlMs: numEnvStrict("DEPLOY_IDLE_TTL_MS", env.DEPLOY_IDLE_TTL_MS) }

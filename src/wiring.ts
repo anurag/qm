@@ -828,9 +828,7 @@ export function buildApp(
     if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
     return config.databaseUrl;
   };
-  const s3 = config.s3Endpoint
-    ? s3Client({ region: config.s3Region, endpoint: config.s3Endpoint, forcePathStyle: config.s3ForcePathStyle })
-    : undefined;
+  const s3 = config.s3Endpoint ? s3Client({ region: config.s3Region, endpoint: config.s3Endpoint }) : undefined;
   const s3Override = s3 ? { _client: s3 } : {};
   const workspace =
     config.workspaceStore === "postgres"
@@ -1180,8 +1178,6 @@ export function buildApp(
         apiKey: render.apiKey,
         workspaceId: render.workspaceId,
         region: render.region,
-        plan: render.plan,
-        ttlSec: render.ttlSec,
       }),
       ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
       store: renderBodies,

@@ -5,9 +5,8 @@ import { retryOperation, sleep, withAbort } from "../util/async.ts";
 import { swallowAs } from "../util/errors.ts";
 import { shq } from "../util/shell.ts";
 
-type RenderSandboxPlan = "starter" | "standard" | "pro";
-
 export const RENDER_SCRIPT_DIR = "/dev/.qm-run";
+export const RENDER_SANDBOX_TTL_SEC = 7200;
 const CONTROL_TIMEOUT_MS = 30_000;
 const SUBMIT_TIMEOUT_MS = 60_000;
 const TRANSFER_TIMEOUT_MS = 300_000;
@@ -56,8 +55,6 @@ export interface SdkRenderClientOptions {
   apiKey: string;
   workspaceId: string;
   region?: string;
-  plan?: RenderSandboxPlan;
-  ttlSec?: number;
 }
 
 export class RenderSandboxGoneError extends Error {
@@ -185,8 +182,7 @@ export function createSdkRenderClient(opts: SdkRenderClientOptions): RenderClien
         await retryOperation(
           () =>
             api.create({
-              plan: opts.plan ?? "starter",
-              timeoutSeconds: opts.ttlSec ?? 7200,
+              timeoutSeconds: RENDER_SANDBOX_TTL_SEC,
               ...(snapshotId ? { snapshotId } : {}),
             }),
           "refused",

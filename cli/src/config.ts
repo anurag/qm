@@ -1530,7 +1530,7 @@ export function githubRepoUrl(value: string): string | undefined {
   return `https://github.com/${segments.join("/")}`;
 }
 
-export function isGitBranchName(branch: string): boolean {
+function isGitBranchName(branch: string): boolean {
   try {
     capture("git", ["check-ref-format", "--branch", branch]);
     return true;

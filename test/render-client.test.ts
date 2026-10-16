@@ -71,15 +71,13 @@ test("Render SDK adapter maps sandbox and snapshot records and forwards the crea
     apiKey: "secret",
     workspaceId: "tea-test",
     region: "oregon",
-    plan: "standard",
-    ttlSec: 7200,
   });
   const info = await client.create("snp-base");
   assert.deepEqual(requests, [
     {
       method: "POST",
       path: "/v1/sandboxes",
-      body: { ownerId: "tea-test", plan: "standard", timeoutSeconds: 7200, region: "oregon", snapshotId: "snp-base" },
+      body: { ownerId: "tea-test", timeoutSeconds: 7200, region: "oregon", snapshotId: "snp-base" },
     },
   ]);
   assert.equal(info.id, sandbox.id);

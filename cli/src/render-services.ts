@@ -59,7 +59,6 @@ export function renderStorageEnv(storage?: { endpoint: string; secretKey: string
   return {
     S3_BUCKET: "qm-storage",
     S3_REGION: "us-east-1",
-    S3_FORCE_PATH_STYLE: "true",
     AWS_ENDPOINT_URL_S3: storage?.endpoint ?? "",
     AWS_ACCESS_KEY_ID: "qm-storage",
     AWS_SECRET_ACCESS_KEY: storage?.secretKey ?? "",

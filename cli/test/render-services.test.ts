@@ -146,7 +146,6 @@ test("Render core receives scoped storage credentials and assigned URLs", (t) =>
   assert.equal(core.AWS_ENDPOINT_URL_S3, "https://minio-assigned.onrender.com");
   assert.equal(core.AWS_SESSION_TOKEN, "");
   assert.equal(core.S3_BUCKET, "qm-storage");
-  assert.equal(core.S3_FORCE_PATH_STYLE, "true");
   assert.equal(core.RENDER_PROJECT_ID, connections.projectId);
   assert.equal(core.RENDER_POSTGRES_ID, connections.postgresId);
   assert.equal(core.RENDER_APP_DATABASE_ENDPOINT, connections.appDatabaseEndpoint);

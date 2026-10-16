@@ -65,8 +65,6 @@ export interface RenderDeployProviderOptions {
   source: { repo: string; branch: string; commit: string };
   region?: string;
   appRegion?: string;
-  plan?: string;
-  appPrefix?: string;
   store: DurableMap<StoredRenderDeploy>;
   artifacts: RenderDeployArtifacts;
   resources: {
@@ -82,7 +80,7 @@ export interface RenderDeployProviderOptions {
 export function createRenderDeployProvider(opts: RenderDeployProviderOptions): DeployProvider {
   const api = createRenderApi(opts);
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const prefix = opts.appPrefix ?? "qm-app";
+  const prefix = "qm-app";
   const region = opts.region ?? "oregon";
   const timeout = opts.deployTimeoutMs ?? 600_000;
   const poll = opts.pollIntervalMs ?? 2_000;
@@ -362,7 +360,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
             secretFiles: [],
             serviceDetails: {
               ...bootstrap,
-              plan: opts.plan ?? "0.5c-512mb",
+              plan: "0.5c-512mb",
               region: record.appRegion ?? region,
               numInstances: 1,
             },
