@@ -171,6 +171,18 @@ test("Render resumes from its native checkpoint through transient API errors and
   );
 });
 
+test("Render declares the computer that its base image provides and its sandbox lifetime", (t) => {
+  const { make } = setup(t);
+  const { spec } = make().profile;
+  assert.match(spec?.os ?? "", /^Debian 12 — Render sandbox \(each sandbox runs at most 2 hours;/);
+  assert.match(spec?.os ?? "", /background processes stop when a sandbox ends/);
+  assert.deepEqual(spec?.runtimes, ["Node 24", "Python 3"]);
+  for (const tool of ["git", "curl", "jq", "tar", "python3"]) assert.ok(spec?.tools?.includes(tool), tool);
+  for (const tool of ["gh", "aws", "gcloud", "kubectl", "flyctl", "glab"])
+    assert.ok(spec?.notInstalled?.includes(tool), tool);
+  assert.deepEqual([spec?.cpus, spec?.memoryMb, spec?.diskGb], [2, 4096, 10]);
+});
+
 test("Render provisions one durable sandbox across two cores and executes in its workspace", async (t) => {
   const { make, fake, layers, store, scope } = setup(t);
   const first = make();

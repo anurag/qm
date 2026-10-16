@@ -26,6 +26,7 @@ import {
 } from "./exec-file-ops.ts";
 import {
   SandboxProvisionCleanupError,
+  visibleNotInstalled,
   visibleTools,
   type ComputerStatus,
   type ExecResult,
@@ -33,6 +34,7 @@ import {
   type SandboxHandle,
 } from "./sandbox.ts";
 import {
+  RENDER_SANDBOX_TTL_SEC,
   RenderSnapshotGoneError,
   type RenderClient,
   type RenderSandboxInfo,
@@ -514,11 +516,18 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       processSessions: true,
       egressEnforcement: "none",
       spec: {
-        os: "Render sandbox; filesystem checkpoints restore files after the sandbox expires",
+        os: `Debian 12 — Render sandbox (each sandbox runs at most ${RENDER_SANDBOX_TTL_SEC / 3600} hours; files return from checkpoints in the next sandbox, but background processes stop when a sandbox ends; publish durable work to git or Files)`,
+        runtimes: ["Node 24", "Python 3"],
+        cpus: 2,
+        memoryMb: 4096,
+        diskGb: 10,
         homeDir,
         workdir: base.workspaceDir,
         get tools() {
-          return visibleTools(opts.extraTools ?? []);
+          return visibleTools(["git", "curl", "jq", "tar", "python3", ...(opts.extraTools ?? [])]);
+        },
+        get notInstalled() {
+          return visibleNotInstalled(["gh", "aws", "gcloud", "kubectl", "flyctl", "glab"], opts.extraTools ?? []);
         },
       },
     },
