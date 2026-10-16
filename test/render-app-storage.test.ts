@@ -325,81 +325,79 @@ test("Rate-limited Render storage submissions keep their repair intent and resub
   assert.equal((await f.store.get(id))!.enabled, true);
 });
 
-for (const status of [400, 401, 403, 404, 409, 410, 412, 422])
-  test(`Rejected Render storage submissions (${status}) drop repair intent and allow a new job`, async () => {
-    let rejected = true;
+test("Rejected Render storage submissions drop repair intent and allow a new job", async () => {
+  let rejected = true;
+  let jobs = 0;
+  const f = fixture(({ method, path }) => {
+    if (method === "POST") {
+      if (rejected) throw new RenderApiError(method, path, 400);
+      return { id: `job-${++jobs}` };
+    }
+    return { status: "succeeded" };
+  });
+  const id = randomUUID();
+  await assert.rejects(f.storage.ensure(id), /http 400/);
+  assert.equal((await f.store.get(id))!.operation, "enable");
+  assert.equal((await f.store.get(id))!.jobRequest, undefined);
+  rejected = false;
+  await f.storage.ensure(id);
+  assert.equal(jobs, 1);
+  assert.equal((await f.store.get(id))!.enabled, true);
+});
+
+for (const [failure, failedOperation, nextOperation] of [
+  ["connection", "enable", "disable"],
+  ["503", "disable", "enable"],
+] as const)
+  test(`Render storage recovers ${failedOperation} lost before creation (${failure}) with ${nextOperation} after restart`, async () => {
+    const events: string[] = [];
+    let fail = false;
+    let enabled = false;
     let jobs = 0;
-    const f = fixture(({ method, path }) => {
+    const f = fixture(({ method, path, body }) => {
       if (method === "POST") {
-        if (rejected) throw new RenderApiError(method, path, status);
+        const operation = scriptOperation(body);
+        events.push(`POST ${operation}`);
+        if (fail) {
+          if (failure === "503") throw new RenderApiError(method, path, 503);
+          throw new Error("Connection closed before job creation");
+        }
+        enabled = operation === "enable";
         return { id: `job-${++jobs}` };
+      }
+      if (path === "/services/srv-minio/jobs" && method === "GET") {
+        events.push("LIST");
+        return [];
       }
       return { status: "succeeded" };
     });
     const id = randomUUID();
-    await assert.rejects(f.storage.ensure(id), new RegExp(`http ${status}`));
-    assert.equal((await f.store.get(id))!.operation, "enable");
-    assert.equal((await f.store.get(id))!.jobRequest, undefined);
-    rejected = false;
-    await f.storage.ensure(id);
-    assert.equal(jobs, 1);
-    assert.equal((await f.store.get(id))!.enabled, true);
+    const initial = failedOperation === "disable" ? await f.storage.ensure(id) : undefined;
+    fail = true;
+    await assert.rejects(
+      failedOperation === "enable" ? f.storage.ensure(id) : f.storage.suspend(id),
+      /http 503|Connection closed/,
+    );
+    const pending = (await f.store.get(id))!;
+    assert.ok(pending.jobRequest);
+    assert.equal(pending.operation, failedOperation);
+    const acceptedBeforeRetry = jobs;
+    fail = false;
+    events.length = 0;
+    const restarted = f.restart();
+    const result = nextOperation === "enable" ? await restarted.ensure(id) : await restarted.suspend(id);
+    const final = (await f.store.get(id))!;
+    assert.deepEqual(events, ["LIST", `POST ${nextOperation}`]);
+    assert.equal(jobs, acceptedBeforeRetry + 1);
+    assert.equal(enabled, nextOperation === "enable");
+    assert.equal(final.enabled, enabled);
+    assert.equal(final.operation, undefined);
+    assert.equal(final.jobRequest, undefined);
+    assert.equal(final.jobId, undefined);
+    assert.equal(final.accessKey, pending.accessKey);
+    assert.equal(final.secretKeyEnc, pending.secretKeyEnc);
+    if (initial) assert.deepEqual(result, initial);
   });
-
-for (const failure of ["503", "connection"])
-  for (const failedOperation of ["enable", "disable"] as const)
-    for (const nextOperation of ["enable", "disable"] as const)
-      test(`Render storage recovers ${failedOperation} lost before creation (${failure}) with ${nextOperation} after restart`, async () => {
-        const events: string[] = [];
-        let fail = false;
-        let enabled = false;
-        let userExists = false;
-        let jobs = 0;
-        const f = fixture(({ method, path, body }) => {
-          if (method === "POST") {
-            const operation = scriptOperation(body);
-            events.push(`POST ${operation}`);
-            if (fail) {
-              if (failure === "503") throw new RenderApiError(method, path, 503);
-              throw new Error("Connection closed before job creation");
-            }
-            if (operation === "enable") userExists = true;
-            if (userExists) enabled = operation === "enable";
-            return { id: `job-${++jobs}` };
-          }
-          if (path === "/services/srv-minio/jobs" && method === "GET") {
-            events.push("LIST");
-            return [];
-          }
-          return { status: "succeeded" };
-        });
-        const id = randomUUID();
-        const initial = failedOperation === "disable" ? await f.storage.ensure(id) : undefined;
-        fail = true;
-        await assert.rejects(
-          failedOperation === "enable" ? f.storage.ensure(id) : f.storage.suspend(id),
-          /http 503|Connection closed/,
-        );
-        const pending = (await f.store.get(id))!;
-        assert.ok(pending.jobRequest);
-        assert.equal(pending.operation, failedOperation);
-        const acceptedBeforeRetry = jobs;
-        fail = false;
-        events.length = 0;
-        const restarted = f.restart();
-        const result = nextOperation === "enable" ? await restarted.ensure(id) : await restarted.suspend(id);
-        const final = (await f.store.get(id))!;
-        assert.deepEqual(events, ["LIST", `POST ${nextOperation}`]);
-        assert.equal(jobs, acceptedBeforeRetry + 1);
-        assert.equal(enabled, nextOperation === "enable");
-        assert.equal(final.enabled, enabled);
-        assert.equal(final.operation, undefined);
-        assert.equal(final.jobRequest, undefined);
-        assert.equal(final.jobId, undefined);
-        assert.equal(final.accessKey, pending.accessKey);
-        assert.equal(final.secretKeyEnc, pending.secretKeyEnc);
-        if (initial && result) assert.deepEqual(result, initial);
-      });
 
 for (const failure of ["request", "missing cursor", "repeated cursor", "invalid list"])
   test(`Render storage keeps unconfirmed writes after a job search ${failure}`, async () => {

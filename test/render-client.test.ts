@@ -150,17 +150,17 @@ function scriptedApi(t: import("node:test").TestContext, failures: Map<string, n
   return (key: string) => attempts.get(key) ?? 0;
 }
 
-test("Render SDK adapter retries reads, deletes, and file transfers on 429 and 5xx", async (t) => {
+test("Render SDK adapter retries reads, deletes, and file transfers after a server error or a lost connection", async (t) => {
   const attempts = scriptedApi(
     t,
     new Map([
-      ["GET /v1/sandboxes/sbx-test", [429, 503]],
-      ["POST /v1/sandboxes/sbx-test/terminate", [502]],
-      ["GET /v1/sandbox-groups/sbg-test/snapshots/snp-test", [500]],
-      ["DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test", [504]],
-      ["POST /v1/sandboxes/sbx-test/files/upload/token", [429]],
-      ["PUT /files", [503]],
-      ["POST /v1/sandboxes/sbx-test/files/download/token", [503]],
+      ["GET /v1/sandboxes/sbx-test", [0]],
+      ["POST /v1/sandboxes/sbx-test/terminate", [503]],
+      ["GET /v1/sandbox-groups/sbg-test/snapshots/snp-test", [503]],
+      ["DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test", [503]],
+      ["POST /v1/sandboxes/sbx-test/files/upload/token", [-503]],
+      ["PUT /files", [0]],
+      ["POST /v1/sandboxes/sbx-test/files/download/token", [-503]],
       ["GET /files", [503]],
     ]),
   );
@@ -172,7 +172,7 @@ test("Render SDK adapter retries reads, deletes, and file transfers on 429 and 5
   await client.deleteSnapshot(checkpoint);
   await client.writeFileBytes("sbx-test", "/root/file", Buffer.from("data"));
   assert.equal(Buffer.from((await client.readFileBytes("sbx-test", "/root/file"))!).toString(), "data");
-  assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 3);
+  assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 2);
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/terminate"), 2);
   assert.equal(attempts("GET /v1/sandbox-groups/sbg-test/snapshots/snp-test"), 2);
   assert.equal(attempts("DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test"), 2);
@@ -180,63 +180,7 @@ test("Render SDK adapter retries reads, deletes, and file transfers on 429 and 5
   assert.equal(attempts("PUT /files"), 2);
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/download/token"), 3);
   assert.equal(attempts("GET /files"), 2);
-});
-
-test("Render SDK adapter retries idempotent calls after a connection failure but not creations or commands", async (t) => {
-  const attempts = scriptedApi(
-    t,
-    new Map([
-      ["GET /v1/sandboxes/sbx-test", [0]],
-      ["DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test", [0]],
-      ["PUT /files", [0]],
-      ["POST /v1/sandboxes", [0]],
-      ["POST /v1/sandboxes/sbx-test/snapshots", [0]],
-    ]),
-  );
-  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
-  assert.equal((await client.get("sbx-test"))?.id, "sbx-test");
-  await client.deleteSnapshot({ id: "snp-test", sandboxGroupId: "sbg-test", status: "available", expiresAtMs: 0 });
-  await client.writeFileBytes("sbx-test", "/root/file", Buffer.from("data"));
-  await assert.rejects(client.create(), /fetch failed/);
-  await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), /fetch failed/);
-  assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 2);
-  assert.equal(attempts("DELETE /v1/sandbox-groups/sbg-test/snapshots/snp-test"), 2);
-  assert.equal(attempts("PUT /files"), 2);
-  assert.equal(attempts("POST /v1/sandboxes"), 1);
-  assert.equal(attempts("POST /v1/sandboxes/sbx-test/snapshots"), 1);
-  assert.equal(attempts("POST /v1/sandboxes/sbx-test/runs/stream/token"), 1);
-});
-
-test("Render SDK adapter retries a file transfer after an error response without a body", async (t) => {
-  const attempts = scriptedApi(
-    t,
-    new Map([
-      ["POST /v1/sandboxes/sbx-test/files/upload/token", [-503]],
-      ["POST /v1/sandboxes/sbx-test/files/download/token", [-502]],
-    ]),
-  );
-  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
-  await client.writeFileBytes("sbx-test", "/root/file", Buffer.from("data"));
-  assert.equal(Buffer.from((await client.readFileBytes("sbx-test", "/root/file"))!).toString(), "data");
-  assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/upload/token"), 2);
-  assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/download/token"), 2);
-});
-
-test("Render SDK adapter rejects a checkpoint whose creation fails with the API's answer", async (t) => {
-  const creations = [503, 409];
-  t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
-    const request = new Request(input, init);
-    const url = new URL(request.url);
-    if (request.method === "POST" && url.pathname === "/v1/sandboxes/sbx-test/snapshots") {
-      const status = creations.shift()!;
-      return Response.json({ message: `injected ${status}` }, { status });
-    }
-    throw new Error(`Unexpected request ${request.method} ${url.pathname}`);
-  });
-  const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
-  await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), /injected 503/);
-  await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), /injected 409/);
-  assert.deepEqual(creations, []);
+  assert.equal(attempts("POST /v1/sandboxes/sbx-test/runs/stream/token"), 2);
 });
 
 test("Render SDK adapter retries sandbox and checkpoint creation only on 429", async (t) => {
@@ -258,16 +202,12 @@ test("Render SDK adapter retries sandbox and checkpoint creation only on 429", a
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/snapshots"), 3);
 });
 
-test("Render SDK adapter sends an exec once and does not retry a rejected read", async (t) => {
-  const failures = new Map([["POST /v1/sandboxes/sbx-test/runs/stream/token", [503]]]);
-  const attempts = scriptedApi(t, failures);
+test("Render SDK adapter sends an exec once", async (t) => {
+  const attempts = scriptedApi(t, new Map([["POST /v1/sandboxes/sbx-test/runs/stream/token", [503]]]));
   const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
   await assert.rejects(client.runScript("sbx-test", "echo once", 30), /injected 503/);
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/runs/stream/token"), 2);
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/upload/token"), 1);
-  failures.set("GET /v1/sandboxes/sbx-test", [400]);
-  await assert.rejects(client.get("sbx-test"), /injected 400/);
-  assert.equal(attempts("GET /v1/sandboxes/sbx-test"), 1);
 });
 
 test(

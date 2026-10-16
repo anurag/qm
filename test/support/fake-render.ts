@@ -60,6 +60,7 @@ export function createFakeRender() {
   const createdFrom: Array<string | undefined> = [];
   const commands: string[] = [];
   const deleted: string[] = [];
+  const terminated: string[] = [];
   let checkpointError: Error | undefined;
   let loseCheckpointReply: RenderSnapshot["status"] | undefined;
   let terminateError: Error | undefined;
@@ -129,6 +130,7 @@ export function createFakeRender() {
     },
     async terminate(id) {
       if (terminateError ?? terminateErrors.get(id)) throw terminateError ?? terminateErrors.get(id);
+      terminated.push(id);
       const info = sandboxes.get(id);
       if (info) info.status = "terminated";
       rmSync(home(id), { recursive: true, force: true });
@@ -188,6 +190,7 @@ export function createFakeRender() {
     createdFrom,
     commands,
     deleted,
+    terminated,
     home,
     runProxyCommand,
     failCheckpoint(error?: Error) {

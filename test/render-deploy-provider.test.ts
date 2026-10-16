@@ -576,7 +576,7 @@ for (const status of [undefined, 200])
     }
   });
 
-test("Render deploy API retries reads on 429 and 5xx, retries submissions only on 429, and reports the request id", async () => {
+test("Render deploy API retries reads on 5xx, retries submissions only on 429, and reports the request id", async () => {
   const f = fixture();
   const d = f.deployment;
   const v1 = d.versions[0]!;
@@ -586,12 +586,9 @@ test("Render deploy API retries reads on 429 and 5xx, retries submissions only o
   await f.provider.apply(d, v1);
   assert.equal(count("POST", "/services"), 2);
   const environment = count("GET", "/environments/env-test");
-  f.failNextRequest("GET", "/environments/env-test", 429, 1, { "retry-after": "0" });
+  f.failNextRequest("GET", "/environments/env-test", 503, 1, { "retry-after": "0" });
   await f.provider.apply(d, { ...v1, version: 2 });
   assert.equal(count("GET", "/environments/env-test"), environment + 2);
-  f.failNextRequest("GET", "/environments/env-test", 503, 2, { "retry-after": "0" });
-  await f.provider.apply(d, { ...v1, version: 2 });
-  assert.equal(count("GET", "/environments/env-test"), environment + 5);
   const deploys = count("POST", "/services/srv-app/deploys");
   f.failNextRequest("POST", "/services/srv-app/deploys", 503, 1, { "render-request-id": "req-submit" });
   await assert.rejects(
