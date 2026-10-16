@@ -152,7 +152,10 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   const installTools = async (sandboxId: string): Promise<void> => {
     const installed = await client.runScript(sandboxId, AWS_CLI_ENSURE, 300);
     if (installed.exitCode !== 0)
-      throw new Error(`Render sandbox could not install the AWS CLI: ${installed.stderr.slice(0, 300)}`);
+      reportError(
+        "aws_cli_install_failed",
+        new Error(`Render sandbox ${sandboxId} could not install the AWS CLI: ${installed.stderr.slice(0, 300)}`),
+      );
   };
   const writeAbsBytes = async (name: string, path: string, data: Uint8Array): Promise<void> =>
     client.writeFileBytes(await idFor(name), path, data);

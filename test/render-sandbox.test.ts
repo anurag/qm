@@ -183,6 +183,22 @@ test("Render declares the computer that its base image provides and its sandbox 
   assert.deepEqual([spec?.cpus, spec?.memoryMb, spec?.diskGb], [2, 4096, 10]);
 });
 
+test("Render starts a sandbox and reports the failure when the AWS CLI cannot be installed", async (t) => {
+  const { make, fake, layers, errors } = setup(t);
+  const runScript = fake.client.runScript;
+  t.mock.method(fake.client, "runScript", async (id: string, script: string, timeoutSec: number) =>
+    script === AWS_CLI_ENSURE
+      ? { stdout: "", stderr: "curl: (6) Could not resolve host", exitCode: 6 }
+      : runScript(id, script, timeoutSec),
+  );
+  const sandbox = make();
+  const handle = await sandbox.provision(layers);
+  assert.equal((await sandbox.run(handle, "echo ready")).stdout, "ready\n");
+  assert.ok(
+    errors.some((error) => error.code === "aws_cli_install_failed" && /Could not resolve host/.test(error.message)),
+  );
+});
+
 test("Render installs the AWS CLI on every sandbox it starts, including restores and disposable ones", async (t) => {
   const { make, fake, layers, store, scope } = setup(t);
   const sandbox = make();
