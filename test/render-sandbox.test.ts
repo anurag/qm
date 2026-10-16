@@ -24,6 +24,7 @@ import { scopeId } from "../src/types.ts";
 import { supportsAgentComputerExport, supportsProcessSessions } from "../src/sandbox/sandbox.ts";
 import { pollProcess } from "../src/sandbox/process-poll.ts";
 import { createSdkRenderClient } from "../src/sandbox/render-client.ts";
+import { AWS_CLI_ENSURE } from "../src/sandbox/aws-cli.ts";
 import { createSandboxResources } from "../src/sandbox/sandbox-resources.ts";
 import { createSandboxRouter } from "../src/sandbox/sandbox-routing.ts";
 import { createFakeRender, serveFakeRenderApi } from "./support/fake-render.ts";
@@ -177,10 +178,20 @@ test("Render declares the computer that its base image provides and its sandbox 
   assert.match(spec?.os ?? "", /^Debian 12 — Render sandbox \(each sandbox runs at most 2 hours;/);
   assert.match(spec?.os ?? "", /background processes stop when a sandbox ends/);
   assert.deepEqual(spec?.runtimes, ["Node 24", "Python 3"]);
-  for (const tool of ["git", "curl", "jq", "tar", "python3"]) assert.ok(spec?.tools?.includes(tool), tool);
-  for (const tool of ["gh", "aws", "gcloud", "kubectl", "flyctl", "glab"])
-    assert.ok(spec?.notInstalled?.includes(tool), tool);
+  for (const tool of ["git", "curl", "jq", "tar", "python3", "aws"]) assert.ok(spec?.tools?.includes(tool), tool);
+  for (const tool of ["gh", "gcloud", "kubectl", "flyctl", "glab"]) assert.ok(spec?.notInstalled?.includes(tool), tool);
   assert.deepEqual([spec?.cpus, spec?.memoryMb, spec?.diskGb], [2, 4096, 10]);
+});
+
+test("Render installs the AWS CLI on every sandbox it starts, including restores and disposable ones", async (t) => {
+  const { make, fake, layers, store, scope } = setup(t);
+  const sandbox = make();
+  const handle = await sandbox.provision(layers);
+  await sandbox.teardown(handle);
+  await fake.client.terminate((await store.get(scope))!.sandboxId);
+  await sandbox.provision(layers);
+  await sandbox.provision(layers, { scratch: { key: "build" } });
+  assert.equal(fake.commands.filter((command) => command === AWS_CLI_ENSURE).length, 3);
 });
 
 test("Render provisions one durable sandbox across two cores and executes in its workspace", async (t) => {

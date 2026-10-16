@@ -16,6 +16,7 @@ import { createLayerToolInstaller } from "./layer-tool-install.ts";
 import { errMessage, swallowAs } from "../util/errors.ts";
 import { sleep } from "../util/async.ts";
 import { shq } from "../util/shell.ts";
+import { AWS_CLI_ENSURE } from "./aws-cli.ts";
 import { createExecSandboxBase, sandboxScopeName } from "./exec-sandbox-base.ts";
 import { createExecProcessSessions } from "./exec-process-session.ts";
 import {
@@ -147,6 +148,11 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   const exec = async (name: string, script: string, timeoutSec: number): Promise<ExecResult> => {
     const result = await client.runScript(await idFor(name), script, timeoutSec);
     return { stdout: result.stdout, stderr: result.stderr, code: result.exitCode, timedOut: result.exitCode === 124 };
+  };
+  const installTools = async (sandboxId: string): Promise<void> => {
+    const installed = await client.runScript(sandboxId, AWS_CLI_ENSURE, 300);
+    if (installed.exitCode !== 0)
+      throw new Error(`Render sandbox could not install the AWS CLI: ${installed.stderr.slice(0, 300)}`);
   };
   const writeAbsBytes = async (name: string, path: string, data: Uint8Array): Promise<void> =>
     client.writeFileBytes(await idFor(name), path, data);
@@ -360,6 +366,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       if (created.expiresAtMs <= Date.now() + rotationMarginMs) {
         throw new Error("Render sandbox lifetime must exceed the command timeout by at least 60 seconds");
       }
+      await installTools(created.id);
       if (from) {
         const scrub = await client.runScript(created.id, `rm -rf /tmp/agent-creds ${shq(homeDir)}/.cred-state*`, 30);
         if (scrub.exitCode !== 0)
@@ -487,6 +494,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
         }
         throw error;
       }
+      await installTools(temporary.id);
     },
     async deleteInstance(name) {
       const scope = base.scopeFor(name);
@@ -524,10 +532,10 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
         homeDir,
         workdir: base.workspaceDir,
         get tools() {
-          return visibleTools(["git", "curl", "jq", "tar", "python3", ...(opts.extraTools ?? [])]);
+          return visibleTools(["git", "curl", "jq", "tar", "python3", "aws", ...(opts.extraTools ?? [])]);
         },
         get notInstalled() {
-          return visibleNotInstalled(["gh", "aws", "gcloud", "kubectl", "flyctl", "glab"], opts.extraTools ?? []);
+          return visibleNotInstalled(["gh", "gcloud", "kubectl", "flyctl", "glab"], opts.extraTools ?? []);
         },
       },
     },

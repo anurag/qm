@@ -1,3 +1,4 @@
+import { AWS_CLI_ENSURE } from "../../src/sandbox/aws-cli.ts";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
@@ -77,6 +78,7 @@ export function createFakeRender() {
     return path.replace(/^\/tmp\//, `${home(id)}/tmp/`).replace(/^\/root(?![A-Za-z0-9_-])/, home(id));
   };
   const execute = async (id: string, script: string) => {
+    if (script.endsWith(AWS_CLI_ENSURE)) return { stdout: "", stderr: "", exitCode: 0 };
     mkdirSync(join(home(id), "tmp"), { recursive: true });
     const file = join(root, `run-${randomUUID()}.sh`);
     writeFileSync(
