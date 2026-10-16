@@ -15,14 +15,20 @@ const APP_GID = 10001;
 
 function git(args, cwd, env) {
   return new Promise((resolveGit, rejectGit) => {
-    const child = spawn("git", args, { cwd, env, stdio: ["ignore", "pipe", "ignore"], timeout: 120_000 });
+    const child = spawn("git", args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000 });
     const stdout = [];
+    const stderr = [];
     child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.on("error", () => rejectGit(new Error("Could not start Git for the app source")));
-    child.on("exit", (code) =>
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.on("error", (error) => rejectGit(new Error(`Could not start Git for the app source: ${error.message}`)));
+    child.on("exit", (code, signal) =>
       code === 0
         ? resolveGit(Buffer.concat(stdout).toString("utf8"))
-        : rejectGit(new Error(`App source Git command failed (${code})`)),
+        : rejectGit(
+            new Error(
+              `App source Git command failed (${signal ?? code}): ${Buffer.concat(stderr).toString("utf8").trim()}`,
+            ),
+          ),
     );
   });
 }
@@ -206,8 +212,9 @@ export async function runRenderApp({
   try {
     const deadline = Date.now() + 90_000;
     while (true) {
-      if (spawnError || child.exitCode !== null || child.signalCode !== null)
-        throw new Error("Render app exited before it was ready");
+      if (spawnError) throw new Error(`Render app could not start: ${spawnError.message}`);
+      if (child.exitCode !== null || child.signalCode !== null)
+        throw new Error(`Render app exited before it was ready (${child.signalCode ?? child.exitCode})`);
       if (await listening(1_000)) break;
       if (Date.now() >= deadline) throw new Error("Render app did not become ready");
       await new Promise((done) => setTimeout(done, 200));

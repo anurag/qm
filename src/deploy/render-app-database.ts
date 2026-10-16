@@ -3,6 +3,7 @@ import pg from "pg";
 import { decryptSecret, deriveConnectorKey, encryptSecret } from "../connectors/connector-client-store.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
+import { withPgTransaction, type Pool } from "../persistence/pg-pool.ts";
 
 export interface StoredRenderAppDatabase {
   deploymentId: string;
@@ -32,7 +33,22 @@ class ProvisioningError extends Error {}
 function provisioningFailure(error: unknown): Error {
   if (error instanceof ProvisioningError) return error;
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-  return new Error(`Render app database provisioning failed${/^[A-Z0-9]{5}$/.test(code) ? ` (${code})` : ""}`);
+  return new Error(`Render app database provisioning failed${/^[A-Z0-9]{5}$/.test(code) ? ` (${code})` : ""}`, {
+    cause: error,
+  });
+}
+
+async function connected<T>(connectionString: string, run: (pool: Pool) => Promise<T>): Promise<T> {
+  const pool = new pg.Pool({ connectionString, max: 1, connectionTimeoutMillis: 10_000, statement_timeout: 30_000 });
+  pool.on("error", () => {});
+  pool.on("connect", (client) => {
+    client.on("error", () => {});
+  });
+  try {
+    return await run(pool);
+  } finally {
+    await pool.end();
+  }
 }
 
 export function parseRenderAppDatabaseEndpoint(value: string): URL {
@@ -83,20 +99,14 @@ export function createRenderAppDatabase(opts: {
   if (!opts.keyMaterial.length) throw new Error("Render app databases require an encryption key");
   const key = deriveConnectorKey(opts.keyMaterial, "render-app-database");
   const locks = opts.advisoryLock ?? createNoopAdvisoryLock();
-  const provisioning = <T>(run: (client: pg.Client) => Promise<T>): Promise<T> =>
-    locks.withLock("render-app-databases", async () => {
-      const client = new pg.Client({ connectionString: opts.adminUrl, connectionTimeoutMillis: 10_000 });
-      client.on("error", () => {});
-      try {
-        await client.connect();
-        await client.query("SET statement_timeout = '30s'");
-        return await run(client);
-      } catch (error) {
-        throw provisioningFailure(error);
-      } finally {
-        await client.end();
-      }
-    });
+  const provisioning = <T>(run: (pool: Pool) => Promise<T>): Promise<T> =>
+    locks.withLock("render-app-databases", () =>
+      connected(opts.adminUrl, (pool) =>
+        run(pool).catch((error: unknown) => {
+          throw provisioningFailure(error);
+        }),
+      ),
+    );
   const identifier = pg.escapeIdentifier;
   const literal = pg.escapeLiteral;
   const marker = (record: StoredRenderAppDatabase) => `qm:render-app:${record.deploymentId}:${record.ownershipToken}`;
@@ -110,19 +120,8 @@ export function createRenderAppDatabase(opts: {
     return url.toString();
   };
 
-  async function transaction(client: pg.Client, run: () => Promise<void>): Promise<void> {
-    await client.query("BEGIN");
-    try {
-      await run();
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    }
-  }
-
-  async function roles(client: pg.Client, record: StoredRenderAppDatabase, password: string, admin: string) {
-    const found = await client.query<Role>(
+  async function roles(pool: Pool, record: StoredRenderAppDatabase, password: string, admin: string) {
+    const found = await pool.query<Role>(
       `SELECT r.*, shobj_description(r.oid, 'pg_authid') AS marker,
          EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid) AS member
        FROM pg_roles r WHERE rolname = ANY($1::text[])`,
@@ -148,7 +147,7 @@ export function createRenderAppDatabase(opts: {
       return;
     }
     if (record.ready) throw new ProvisioningError("The retained Render app database roles are missing");
-    await transaction(client, async () => {
+    await withPgTransaction(pool, async (client) => {
       const flags = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT NOLOGIN";
       await client.query(`CREATE ROLE ${identifier(record.ownerRole)} WITH ${flags}`);
       await client.query(
@@ -162,22 +161,22 @@ export function createRenderAppDatabase(opts: {
 
   return {
     suspend: (deploymentId) =>
-      provisioning(async (client) => {
+      provisioning(async (pool) => {
         const record = await opts.store.get(deploymentId);
         if (!record) return;
-        const found = await client.query<{ marker: string }>(
+        const found = await pool.query<{ marker: string }>(
           "SELECT shobj_description(oid, 'pg_authid') AS marker FROM pg_roles WHERE rolname = $1",
           [record.loginRole],
         );
         if (found.rows[0]?.marker !== marker(record))
           throw new ProvisioningError("The retained Render app database role is missing or has a different owner");
-        await client.query(`GRANT ${identifier(record.loginRole)} TO CURRENT_USER WITH INHERIT TRUE, SET FALSE`);
-        await client.query(`ALTER ROLE ${identifier(record.loginRole)} NOLOGIN`);
-        await client.query(
+        await pool.query(`GRANT ${identifier(record.loginRole)} TO CURRENT_USER WITH INHERIT TRUE, SET FALSE`);
+        await pool.query(`ALTER ROLE ${identifier(record.loginRole)} NOLOGIN`);
+        await pool.query(
           "SELECT pg_terminate_backend(pid, 10000) AS terminated FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid()",
           [record.loginRole],
         );
-        const remaining = await client.query(
+        const remaining = await pool.query(
           "SELECT 1 FROM pg_stat_activity WHERE usename = $1 AND pid <> pg_backend_pid() LIMIT 1",
           [record.loginRole],
         );
@@ -187,13 +186,13 @@ export function createRenderAppDatabase(opts: {
     async ensure(deploymentId) {
       if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(deploymentId))
         throw new Error("Render app databases require a deployment UUID");
-      return provisioning(async (client) => {
-        const identity = await client.query<{ database: string; admin: string }>(
+      return provisioning(async (pool) => {
+        const identity = await pool.query<{ database: string; admin: string }>(
           "SELECT current_database() AS database, current_user AS admin",
         );
         const { database: coreDatabase, admin } = identity.rows[0]!;
-        await client.query(`REVOKE CONNECT ON DATABASE ${identifier(coreDatabase)} FROM PUBLIC`);
-        await client.query(`GRANT CONNECT ON DATABASE ${identifier(coreDatabase)} TO ${identifier(admin)}`);
+        await pool.query(`REVOKE CONNECT ON DATABASE ${identifier(coreDatabase)} FROM PUBLIC`);
+        await pool.query(`GRANT CONNECT ON DATABASE ${identifier(coreDatabase)} TO ${identifier(admin)}`);
         let record = await opts.store.get(deploymentId);
         if (!record) {
           const suffix = randomBytes(16).toString("hex");
@@ -216,8 +215,8 @@ export function createRenderAppDatabase(opts: {
         )
           throw new ProvisioningError("The saved Render app database identity is invalid");
         const password = decryptSecret(record.passwordEnc, key);
-        await roles(client, record, password, admin);
-        const coreAccess = await client.query<{ allowed: boolean }>(
+        await roles(pool, record, password, admin);
+        const coreAccess = await pool.query<{ allowed: boolean }>(
           `SELECT has_database_privilege($1, $2, 'CONNECT,CREATE')
              OR EXISTS (
                SELECT 1 FROM pg_namespace n WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
@@ -244,7 +243,7 @@ export function createRenderAppDatabase(opts: {
         );
         if (coreAccess.rows[0]!.allowed)
           throw new ProvisioningError("The core database grants app roles access to protected data or schema changes");
-        const existing = await client.query<{ owner: string }>(
+        const existing = await pool.query<{ owner: string }>(
           "SELECT pg_get_userbyid(datdba) AS owner FROM pg_database WHERE datname = $1",
           [record.database],
         );
@@ -252,45 +251,26 @@ export function createRenderAppDatabase(opts: {
           throw new ProvisioningError("The Render app database does not match its saved owner");
         if (!existing.rows.length) {
           if (record.ready) throw new ProvisioningError("The retained Render app database is missing");
-          await client.query(
+          await pool.query(
             `CREATE DATABASE ${identifier(record.database)} OWNER ${identifier(record.ownerRole)} TEMPLATE template0 ALLOW_CONNECTIONS false`,
           );
         }
-        await transaction(client, async () => {
+        await withPgTransaction(pool, async (client) => {
           await client.query(`REVOKE ALL ON DATABASE ${identifier(record.database)} FROM PUBLIC`);
           await client.query(
             `GRANT CONNECT, TEMPORARY ON DATABASE ${identifier(record.database)} TO ${identifier(record.loginRole)}`,
           );
           await client.query(`ALTER DATABASE ${identifier(record.database)} ALLOW_CONNECTIONS true`);
         });
-        const appAdmin = new pg.Client({
-          connectionString: connectionUrl(adminUrl, record.database),
-          connectionTimeoutMillis: 10_000,
-        });
-        appAdmin.on("error", () => {});
-        try {
-          await appAdmin.connect();
-          await appAdmin.query("SET statement_timeout = '30s'");
-          await transaction(appAdmin, async () => {
-            await appAdmin.query("REVOKE ALL ON SCHEMA public FROM PUBLIC");
-            await appAdmin.query(`GRANT USAGE, CREATE ON SCHEMA public TO ${identifier(record.loginRole)}`);
-          });
-        } finally {
-          await appAdmin.end();
-        }
-        await client.query(`ALTER ROLE ${identifier(record.loginRole)} LOGIN`);
+        await connected(connectionUrl(adminUrl, record.database), (appAdmin) =>
+          withPgTransaction(appAdmin, async (client) => {
+            await client.query("REVOKE ALL ON SCHEMA public FROM PUBLIC");
+            await client.query(`GRANT USAGE, CREATE ON SCHEMA public TO ${identifier(record.loginRole)}`);
+          }),
+        );
+        await pool.query(`ALTER ROLE ${identifier(record.loginRole)} LOGIN`);
         const login = { role: record.loginRole, password };
-        const app = new pg.Client({
-          connectionString: connectionUrl(adminUrl, record.database, login),
-          connectionTimeoutMillis: 10_000,
-        });
-        app.on("error", () => {});
-        try {
-          await app.connect();
-          await app.query("SELECT 1");
-        } finally {
-          await app.end();
-        }
+        await connected(connectionUrl(adminUrl, record.database, login), (app) => app.query("SELECT 1"));
         if (!record.ready) await opts.store.put(deploymentId, { ...record, ready: true });
         return { DATABASE_URL: connectionUrl(appEndpoint, record.database, login) };
       });

@@ -344,10 +344,10 @@ test("Render runner rejects missing commits and revoked access without executing
   const file = join(f.root, "manifest.json");
   const dir = join(f.root, "app");
   await writeFile(file, JSON.stringify({ ...manifest, commit: "f".repeat(40) }));
-  await assert.rejects(prepareRenderApp(file, dir), /Git command failed/);
+  await assert.rejects(prepareRenderApp(file, dir), /Git command failed \(\d+\): \S/);
   await f.artifacts.revoke(f.d.id);
   await writeFile(file, JSON.stringify(manifest));
-  await assert.rejects(prepareRenderApp(file, dir), /Git command failed/);
+  await assert.rejects(prepareRenderApp(file, dir), /Git command failed \(\d+\): \S/);
 });
 
 test("Render runner preserves relative Git symlinks after source staging cleanup", async (t) => {

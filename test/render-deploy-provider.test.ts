@@ -501,6 +501,47 @@ for (const outcome of ["not_submitted", "build_in_progress", "old_instance"]) {
   });
 }
 
+test("Render polls only the deploy while it waits for a deployment and reads one deploy while it idles", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  f.outcome = "build_in_progress";
+  await assert.rejects(f.provider.apply(d, v1), /unconfirmed deployment/);
+  const submitted = f.calls.findIndex((call) => call.method === "POST" && call.path === "/services/srv-app/deploys");
+  const polled = f.calls.slice(submitted + 1).map((call) => `${call.method} ${call.path}`);
+  assert.ok(polled.length >= 2);
+  assert.match(polled[0]!, /^GET \/services\/srv-app\/deploys\/dep-\d+$/);
+  assert.deepEqual(new Set(polled), new Set([polled[0]]));
+  f.outcome = "live";
+  const mark = f.calls.length;
+  await f.provider.apply(d, { ...v1, version: 2 });
+  const canceled = f.calls.findIndex((call, index) => index >= mark && call.path.endsWith("/cancel"));
+  assert.ok(canceled > mark);
+  assert.deepEqual(
+    f.calls.slice(canceled + 1, canceled + 2).map((call) => `${call.method} ${call.path}`),
+    ["GET /services/srv-app/deploys?limit=1"],
+  );
+});
+
+test("Render keeps the failure as the cause of unconfirmed bootstraps and deployments", async () => {
+  const f = fixture();
+  const d = f.deployment;
+  const v1 = d.versions[0]!;
+  f.failNextRequest("POST", "/services");
+  await assert.rejects(f.provider.apply(d, v1), (error: Error) => {
+    assert.match(error.message, /bootstrap is unconfirmed/);
+    assert.match((error.cause as Error).message, /connection lost/);
+    return true;
+  });
+  await f.provider.apply(d, v1);
+  f.failNextRequest("GET", "/__qm_ready", undefined, Number.POSITIVE_INFINITY);
+  await assert.rejects(f.provider.apply(d, { ...v1, version: 2 }), (error: Error) => {
+    assert.match(error.message, /unconfirmed deployment/);
+    assert.match((error.cause as Error).message, /connection lost/);
+    return true;
+  });
+});
+
 test("Render retains pending state when archive cannot confirm suspension", async () => {
   const f = fixture();
   const d = f.deployment;

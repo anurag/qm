@@ -33,6 +33,22 @@ async function query(url: string, text: string): Promise<pg.QueryResult> {
   }
 }
 
+function interceptQueries(
+  t: TestContext,
+  handle: (text: string, run: () => Promise<pg.QueryResult>) => Promise<unknown>,
+) {
+  const original = pg.Client.prototype.query;
+  return t.mock.method(pg.Client.prototype, "query", function (this: pg.Client, ...args: unknown[]) {
+    const callback =
+      typeof args.at(-1) === "function" ? (args.pop() as (error: unknown, result?: unknown) => void) : undefined;
+    const text = typeof args[0] === "string" ? args[0] : (args[0] as { text: string }).text;
+    const outcome = handle(text, () => Reflect.apply(original, this, args) as Promise<pg.QueryResult>);
+    if (!callback) return outcome;
+    outcome.then((result) => callback(null, result), callback);
+    return undefined;
+  });
+}
+
 async function fixture(t: TestContext) {
   const suffix = randomBytes(12).toString("hex");
   const adminRole = `qm_test_admin_${suffix}`;
@@ -388,13 +404,12 @@ for (const stillActive of [false, true])
       const active = new pg.Client({ connectionString: url });
       active.on("error", () => {});
       await active.connect();
-      const original = pg.Client.prototype.query;
-      const mocked = t.mock.method(pg.Client.prototype, "query", async function (this: pg.Client, ...args: unknown[]) {
-        if (typeof args[0] === "string" && args[0].startsWith("SELECT pg_terminate_backend")) {
+      const mocked = interceptQueries(t, async (text, run) => {
+        if (text.startsWith("SELECT pg_terminate_backend")) {
           if (!stillActive) await active.end();
           return { rows: [{ terminated: false }], rowCount: 1 };
         }
-        return Reflect.apply(original, this, args);
+        return run();
       });
       try {
         if (stillActive) {
@@ -443,11 +458,9 @@ test(
 test("Render app database recovers when CREATE DATABASE commits before its reply is lost", { skip }, async (t) => {
   const f = await fixture(t);
   const id = randomUUID();
-  const original = pg.Client.prototype.query;
-  const mocked = t.mock.method(pg.Client.prototype, "query", async function (this: pg.Client, ...args: unknown[]) {
-    const result = await Reflect.apply(original, this, args);
-    if (typeof args[0] === "string" && args[0].startsWith('CREATE DATABASE "qm_app_'))
-      throw new Error("lost database creation reply");
+  const mocked = interceptQueries(t, async (text, run) => {
+    const result = await run();
+    if (text.startsWith('CREATE DATABASE "qm_app_')) throw new Error("lost database creation reply");
     return result;
   });
   await assert.rejects(f.create().ensure(id), /provisioning failed/);

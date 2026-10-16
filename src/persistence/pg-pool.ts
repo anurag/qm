@@ -155,7 +155,7 @@ export async function withPgTransaction<T>(pool: Pool, fn: (client: PoolClient) 
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK").catch(swallowAs("pg-pool: rollback transaction", undefined));
     throw error;
   } finally {
     client.release();
