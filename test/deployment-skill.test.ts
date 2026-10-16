@@ -148,8 +148,13 @@ test("each provider has an independent agent-computer proof", () => {
   const root = read("cli/templates/deployment/deployment.md");
   const fly = read("cli/templates/deployment/references/fly.md");
   const aws = read("cli/templates/deployment/references/aws.md");
+  const render = read("cli/templates/deployment/references/render.md");
 
   assert.match(root, /\/root\/workspace\/qm-computer-proof\.txt/);
+  assert.match(render, /## Agent-computer proof/);
+  assert.match(render, /render-home\/<url-encoded scope id>\.tar/);
+  assert.match(render, /workspace\/qm-computer-proof\.txt/);
+  assert.ok(render.split("\n").length < 140, "the Render reference stays close to the other provider references");
   assert.match(fly, /## Agent-computer proof/);
   assert.match(fly, /agent_scope/);
   assert.match(fly, /fly machine exec/);

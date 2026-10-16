@@ -354,25 +354,50 @@ storage. qm down retains Postgres and MinIO data, and qm rollback restores the
 prior service builds without reversing database migrations.
 
 .codex/skills/deploy-qm/references/render.md is the Render reference: setup,
-updates, data and credentials, archive and restore, and permanent cleanup.
+configuration keys, commands, and the agent-computer proof.
 `,
   files: () => [
     {
       segments: ["sandbox", "skills", "render-platform", "SKILL.md"],
       content: `---
 name: render-platform
-description: Build and publish apps on this QM Render deployment. Use when an app needs persistent data, background work, or a deployment update.
+description: Build and publish apps on this QM Render deployment. Use with the publish skill when an app needs persistent data, background work, or a deployment update.
 ---
 Use the built-in deployment tools to publish, update, archive, and restore apps.
-The platform creates diskless app services in this deployment's Render project.
-Use the provided DATABASE_URL for persistent relational data. Use the provided
-S3 bucket, endpoint, and scoped credentials for persistent files and objects.
-Local files, including SQLite databases, are temporary and are lost at deploy.
-Use PORT for the listening port and bind the server to 0.0.0.0.
+The platform creates diskless app services in this deployment's Render project,
+each in its own network-isolated environment. Each update starts a new process
+before Render stops the old one. Listen on PORT, bind the server to 0.0.0.0, and
+bind only after initialization succeeds. Handle SIGTERM to stop new work and
+finish current requests. Core proxies app traffic through an authenticated
+gateway; other apps cannot connect to the app port.
 
-Keep app credentials inside the app environment. Never give an app the Render API
-key, the core database URL, or MinIO administrator credentials. Each app receives
-its own database and object prefix. Archive retains data. Restore reuses that data.
+Use DATABASE_URL for persistent relational data. Each app receives
+its own database and object prefix. The database login cannot connect to the
+core database or other app databases. Use a bounded pool of at most 10
+connections per process and transactions for changes to related records. Run
+compatible schema changes before the server starts; a rollback restores code
+only, so a schema change must work with the previous and the new code.
+
+Use an S3 client for files with AWS_ENDPOINT_URL_S3, AWS_REGION,
+AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET, and S3_PREFIX from the
+environment. Enable path-style requests and prepend S3_PREFIX to every object
+key and list prefix; the credentials reach only that prefix. Keep
+AWS_REQUEST_CHECKSUM_CALCULATION=WHEN_REQUIRED, which QM sets to avoid checksum
+trailers on streaming uploads. For the AWS SDK for JavaScript, set endpoint,
+region, forcePathStyle: true, and requestChecksumCalculation: "WHEN_REQUIRED"
+on S3Client.
+
+Local files, including SQLite databases and /data, are temporary and are lost at
+deploy. Store generated files in object storage before you return their links.
+Keep app credentials inside the app environment and never send them to a
+browser. Never give an app the Render API key, the core database URL, or MinIO
+administrator credentials.
+
+Apps build from an immutable QM Git commit. Keep dependency installation in the
+entrypoint when the app needs packages. Update an app by its existing name.
+Archive suspends the service and disables its credentials; restore reuses the
+retained database, object prefix, and service. Verify a record and an object
+after create, update, rollback, and archive or restore.
 
 The agent executes in native Render Sandboxes. Save useful workspace changes
 before an operation that replaces a sandbox. Sandboxes are workspace resources;

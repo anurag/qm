@@ -25,6 +25,9 @@ test("qm init --target render creates a Git deployment with native sandbox guida
   assert.match(readFileSync(join(dir, "AGENTS.md"), "utf8"), /Native Render Sandboxes are workspace resources/);
   const skill = readFileSync(join(dir, "sandbox", "skills", "render-platform", "SKILL.md"), "utf8");
   assert.match(skill, /Each app receives\nits own database and object prefix/);
+  assert.match(skill, /prepend S3_PREFIX to every object\nkey and list prefix/);
+  assert.match(skill, /requestChecksumCalculation: "WHEN_REQUIRED"/);
+  assert.match(skill, /Handle SIGTERM/);
   assert.ok(existsSync(join(dir, ".codex", "skills", "deploy-qm", "references", "render.md")));
   assert.doesNotMatch(readFileSync(join(dir, ".env"), "utf8"), /^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=/m);
   assert.match(readFileSync(join(dir, ".env"), "utf8"), /^RENDER_API_KEY=$/m);
