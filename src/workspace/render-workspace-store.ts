@@ -1,10 +1,10 @@
 import { randomBytes } from "node:crypto";
-import { access, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
+import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
 import { createPgPool, type PoolClient } from "../persistence/pg-pool.ts";
 import type { ScopeId } from "../types.ts";
 import { createKeyedQueue } from "../util/async.ts";
-import { createLocalWorkspaceStore, type WorkspaceStore } from "./workspace-store.ts";
+import { createLocalWorkspaceStore, safeJoin, type WorkspaceStore } from "./workspace-store.ts";
 
 const NESTED_PATH = "(starts_with(path, $2 || '/') OR starts_with($2, path || '/'))";
 const SHAPE_ERRORS = new Set(["EEXIST", "EISDIR", "ENOTDIR"]);
@@ -18,8 +18,6 @@ const absent = (error: unknown): null => {
 export function createRenderWorkspaceStore(rootDir: string, connectionString: string): WorkspaceStore {
   const local = createLocalWorkspaceStore(rootDir);
   const queue = createKeyedQueue<string>();
-  const adopted = new Set<string>();
-  const adopting = new Map<string, Promise<void>>();
   const synced = new Map<string, number>();
   const db = createPgPool(connectionString, [
     {
@@ -62,9 +60,8 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
   ]);
   const pathFor = (scope: ScopeId, input: string): string => {
     const base = local.scopeDir(scope);
-    const path = relative(base, resolve(base, input));
-    if (!path || path === ".." || path.startsWith("../") || isAbsolute(path) || input.includes("\0"))
-      throw new Error(`path escapes workspace: ${input}`);
+    const path = relative(base, safeJoin(base, input));
+    if (!path || input.includes("\0")) throw new Error(`path escapes workspace: ${input}`);
     return path;
   };
   async function transaction<T>(scope: ScopeId, fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -83,15 +80,6 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
       throw error;
     } finally {
       client.release(releaseError);
-    }
-  }
-  async function localFiles(scope: ScopeId): Promise<string[]> {
-    try {
-      const entries = await readdir(local.scopeDir(scope), { recursive: true, withFileTypes: true });
-      return entries.filter((entry) => entry.isFile()).map((entry) => join(entry.parentPath, entry.name));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw error;
     }
   }
   async function clearShape(scope: ScopeId, path: string): Promise<void> {
@@ -131,38 +119,6 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
     const info = await lstat(abs).catch(absent);
     if (info && !info.isDirectory()) await rm(abs, { force: true });
   }
-  const markerFor = (scope: ScopeId): string => resolve(rootDir, "workspace-mirrors", basename(local.scopeDir(scope)));
-  async function importLocal(scope: ScopeId): Promise<void> {
-    const marker = markerFor(scope);
-    const mirrored = await access(marker).then(
-      () => true,
-      () => false,
-    );
-    if (!mirrored) {
-      const files = await localFiles(scope);
-      if (files.length)
-        await transaction(scope, async (client) => {
-          for (const abs of files)
-            await client.query(
-              `INSERT INTO render_workspace_files(scope_id, path, data) SELECT $1, $2, $3
-               WHERE NOT EXISTS (SELECT 1 FROM render_workspace_files WHERE scope_id=$1 AND (path=$2 OR ${NESTED_PATH}))`,
-              [scope, pathFor(scope, relative(local.scopeDir(scope), abs)), await readFile(abs)],
-            );
-        });
-      await mkdir(resolve(rootDir, "workspace-mirrors"), { recursive: true });
-      await writeFile(marker, "");
-    }
-    adopted.add(scope);
-  }
-  function adopt(scope: ScopeId): Promise<void> {
-    if (adopted.has(scope)) return Promise.resolve();
-    let pending = adopting.get(scope);
-    if (!pending) {
-      pending = importLocal(scope).finally(() => adopting.delete(scope));
-      adopting.set(scope, pending);
-    }
-    return pending;
-  }
   async function revisionOf(client: Pick<PoolClient, "query">, scope: ScopeId): Promise<number> {
     const rows = await client.query("SELECT revision FROM render_workspace_scopes WHERE scope_id=$1", [scope]);
     return Number(rows.rows[0]?.revision ?? 0);
@@ -189,7 +145,6 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
   }
   async function readBytes(scope: ScopeId, relPath: string): Promise<Uint8Array | null> {
     const path = pathFor(scope, relPath);
-    await adopt(scope);
     return queue(scope, async () => {
       const rows = await db.q("SELECT data FROM render_workspace_files WHERE scope_id=$1 AND path=$2", [scope, path]);
       if (!rows[0]) {
@@ -202,7 +157,6 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
     });
   }
   async function list(scope: ScopeId, opts?: { limit: number }): Promise<string[]> {
-    await adopt(scope);
     return queue(scope, async () => {
       const limit = opts ? Math.max(0, Math.floor(opts.limit)) : null;
       if (limit !== null && !Number.isFinite(limit)) throw new Error("workspace list limit must be finite");
@@ -250,7 +204,6 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
     readBytes,
     async write(scope, input, data) {
       const path = pathFor(scope, input);
-      await adopt(scope);
       await queue(scope, async () => {
         const revision = await mutate(scope, async (client) => {
           const conflict = await client.query(
@@ -270,7 +223,6 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
     },
     async remove(scope, input) {
       const path = pathFor(scope, input);
-      await adopt(scope);
       await queue(scope, async () => {
         const revision = await mutate(scope, async (client) => {
           const removed = await client.query("DELETE FROM render_workspace_files WHERE scope_id=$1 AND path=$2", [

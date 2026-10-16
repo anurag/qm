@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { chmod, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -83,24 +83,6 @@ test(
   },
 );
 
-test("Render workspace imports files a local workspace store left in its directory", { skip }, async (t) => {
-  const { root, scope, core } = await workspaces(t);
-  const legacy = createLocalWorkspaceStore(join(root, "first"));
-  await legacy.write(scope, "memory/MEMORY.md", "kept");
-  await legacy.write(scope, "notes/old.md", "kept too");
-  const first = core("first");
-  await first.ensureScope(scope);
-  assert.equal(await first.read(scope, "memory/MEMORY.md"), "kept");
-  const second = core("second");
-  assert.equal(await second.read(scope, "notes/old.md"), "kept too");
-  await second.remove(scope, "notes/old.md");
-  const restarted = core("first");
-  await restarted.ensureScope(scope);
-  assert.equal(existsSync(join(restarted.scopeDir(scope), "notes/old.md")), false);
-  assert.equal(await restarted.read(scope, "notes/old.md"), null);
-  assert.equal(await restarted.read(scope, "memory/MEMORY.md"), "kept");
-});
-
 test(
   "Render workspace keeps its file cache while a scope is unchanged and refreshes it after another core writes",
   { skip },
@@ -122,28 +104,6 @@ test(
     await first.remove(scope, "notes/b.md");
     await second.ensureScope(scope);
     assert.equal(existsSync(join(second.scopeDir(scope), "notes/b.md")), false);
-  },
-);
-
-test(
-  "Render workspace keeps legacy files it cannot read and imports them once they are readable",
-  { skip: skip || (process.getuid?.() === 0 ? "file modes do not stop root" : false) },
-  async (t) => {
-    const { root, scope, core } = await workspaces(t);
-    const legacy = createLocalWorkspaceStore(join(root, "first"));
-    await legacy.write(scope, "notes/kept.md", "readable");
-    await legacy.write(scope, "notes/locked.md", "unreadable");
-    const locked = join(legacy.scopeDir(scope), "notes/locked.md");
-    await chmod(locked, 0o000);
-    t.after(() => chmod(locked, 0o644).catch(() => undefined));
-    await assert.rejects(core("first").ensureScope(scope), { code: "EACCES" });
-    assert.equal(existsSync(join(legacy.scopeDir(scope), "notes/kept.md")), true);
-    assert.equal(await core("second").read(scope, "notes/kept.md"), null);
-    await chmod(locked, 0o644);
-    const first = core("first");
-    await first.ensureScope(scope);
-    assert.equal(await core("second").read(scope, "notes/locked.md"), "unreadable");
-    assert.equal(await first.read(scope, "notes/kept.md"), "readable");
   },
 );
 
