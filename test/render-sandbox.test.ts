@@ -188,14 +188,18 @@ test("Render starts a sandbox and reports the failure when the AWS CLI cannot be
   const runScript = fake.client.runScript;
   t.mock.method(fake.client, "runScript", async (id: string, script: string, timeoutSec: number) =>
     script === AWS_CLI_ENSURE
-      ? { stdout: "", stderr: "curl: (6) Could not resolve host", exitCode: 6 }
+      ? { stdout: "downloading", stderr: "curl: (6) Could not resolve host", exitCode: 6 }
       : runScript(id, script, timeoutSec),
   );
   const sandbox = make();
   const handle = await sandbox.provision(layers);
   assert.equal((await sandbox.run(handle, "echo ready")).stdout, "ready\n");
   assert.ok(
-    errors.some((error) => error.code === "aws_cli_install_failed" && /Could not resolve host/.test(error.message)),
+    errors.some(
+      (error) =>
+        error.code === "aws_cli_install_failed" &&
+        /\(exit 6\): curl: \(6\) Could not resolve host downloading$/.test(error.message),
+    ),
   );
 });
 
