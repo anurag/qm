@@ -1,6 +1,7 @@
 import { codexAuthFileForEnv, loadCodexAuthFile } from "./model/chatgpt-auth-file.ts";
 import { RENDER_SANDBOX_TTL_SEC } from "./sandbox/render-client.ts";
 import { errMessage } from "./util/errors.ts";
+import { commitShaSchema } from "./util/ids.ts";
 import type { ExternalSlackPolicies } from "./resolution/external-slack.ts";
 import { isBearerSecret, isStrongSigningSecret } from "./auth/source-auth.ts";
 import { parseSandboxCapabilityTtlMs } from "./auth/capability-token.ts";
@@ -500,7 +501,7 @@ function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
   if (rawRepo && !repo)
     throw new Error("RENDER_DEPLOY_REPO must be an HTTPS GitHub repository URL without credentials");
   if (branch && !isGitBranchName(branch)) throw new Error("RENDER_DEPLOY_BRANCH must be a valid Git branch name");
-  if (env.DEPLOY_PROVIDER === "render" && (!repo || !branch || !/^[a-f0-9]{40}$/.test(commit ?? "")))
+  if (env.DEPLOY_PROVIDER === "render" && (!repo || !branch || !commitShaSchema.safeParse(commit).success))
     throw new Error(
       "DEPLOY_PROVIDER=render requires RENDER_DEPLOY_REPO, RENDER_DEPLOY_BRANCH, and RENDER_DEPLOY_COMMIT",
     );

@@ -5,6 +5,7 @@ import type { DurableMap } from "../persistence/durable-map.ts";
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { withPgTransaction, type Pool } from "../persistence/pg-pool.ts";
 import { swallowAs } from "../util/errors.ts";
+import { uuidSchema } from "../util/ids.ts";
 
 export interface StoredRenderAppDatabase {
   deploymentId: string;
@@ -185,7 +186,7 @@ export function createRenderAppDatabase(opts: {
           throw new ProvisioningError("The Render app database sessions did not stop before the deadline");
       }),
     async ensure(deploymentId) {
-      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(deploymentId))
+      if (!uuidSchema.lowercase().safeParse(deploymentId).success)
         throw new Error("Render app databases require a deployment UUID");
       return provisioning(async (pool) => {
         const identity = await pool.query<{ database: string; admin: string }>(

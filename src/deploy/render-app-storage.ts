@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { decryptSecret, deriveConnectorKey, encryptSecret } from "../connectors/connector-client-store.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { sleep } from "../util/async.ts";
+import { uuidSchema } from "../util/ids.ts";
 import { shq } from "../util/shell.ts";
 import { createRenderApi, list, RenderApiError, type RenderApi } from "./render-api.ts";
 
@@ -215,7 +216,7 @@ printf 'QM app storage %s applied\\n' ${operation}
 
   return {
     async ensure(deploymentId) {
-      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(deploymentId))
+      if (!uuidSchema.lowercase().safeParse(deploymentId).success)
         throw new Error("Render app storage requires a deployment UUID");
       let record = await opts.store.get(deploymentId);
       if (!record)
