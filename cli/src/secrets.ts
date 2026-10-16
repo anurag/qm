@@ -24,7 +24,14 @@ export interface SecretSpec {
   required: boolean | { when: SecretCondition; optional?: true; optionalOtherwise?: true };
   description: string;
   generate?: string;
-  managedBy?: "operator" | "terraform" | "render";
+  managedBy?: ManagedBy | Partial<Record<QmConfig["target"] | "default", ManagedBy>>;
+}
+
+type ManagedBy = "operator" | "terraform" | "render";
+
+function managedByFor(spec: SecretSpec, target: QmConfig["target"]): ManagedBy {
+  if (typeof spec.managedBy === "string") return spec.managedBy;
+  return spec.managedBy?.[target] ?? spec.managedBy?.default ?? "operator";
 }
 
 export interface ComputedSecret {
@@ -33,7 +40,7 @@ export interface ComputedSecret {
   description: string;
   required: boolean;
   generate?: string;
-  managedBy: "operator" | "terraform" | "render";
+  managedBy: ManagedBy;
   aliases?: Array<{ service: DeclaredServiceName; name: string }>;
 }
 
@@ -83,6 +90,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: { when: { kind: "env-equals", service: "core", name: "HARNESS", value: "pi" } },
     description: "Public core self-API URL reachable from agent sandboxes.",
+    managedBy: { render: "render" },
   },
   {
     name: "CORE_SIGNING_SECRET",
@@ -231,7 +239,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: { when: { kind: "target", target: "aws" } },
     description: "Postgres connection string for durable state.",
-    managedBy: "terraform",
+    managedBy: { default: "terraform", render: "render" },
   },
   {
     name: "DATABASE_POOL_URL",
@@ -620,10 +628,7 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
       description: spec.description,
       required,
       ...(spec.generate ? { generate: spec.generate } : {}),
-      managedBy:
-        config.target === "render" && ["PUBLIC_API_URL", "DATABASE_URL"].includes(spec.name)
-          ? "render"
-          : (spec.managedBy ?? "operator"),
+      managedBy: managedByFor(spec, config.target),
       ...(spec.envName ? { aliases: [{ service: spec.service, name: spec.envName }] } : {}),
     });
   }
@@ -837,7 +842,11 @@ export function renderEnvExample(config: QmConfig): string {
     lines.push(`# ${spec.description} (${spec.service})`);
     lines.push(`# Needed when ${clauses.join(" and ")}${spec.required === false ? " (optional even then)" : ""}.`);
     if (spec.generate) lines.push(`# Generate with: ${generate(spec.generate)}`);
-    lines.push(spec.managedBy === "terraform" ? `# ${spec.name}=  # populated by Terraform` : `# ${spec.name}=`);
+    lines.push(
+      managedByFor(spec, config.target) === "terraform"
+        ? `# ${spec.name}=  # populated by Terraform`
+        : `# ${spec.name}=`,
+    );
     lines.push("");
   }
   return `${lines.join("\n").trimEnd()}\n`;

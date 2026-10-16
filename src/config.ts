@@ -446,10 +446,7 @@ interface RenderSandboxEnv {
 
 function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
   const defaultTimeoutSec = numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC);
-  if (
-    (env.SANDBOX_BACKEND?.trim() === "render" || (env.RENDER_API_KEY?.trim() && env.RENDER_WORKSPACE_ID?.trim())) &&
-    (defaultTimeoutSec ?? 600) + 60 >= RENDER_SANDBOX_TTL_SEC
-  ) {
+  if (env.SANDBOX_BACKEND?.trim() === "render" && (defaultTimeoutSec ?? 600) + 60 >= RENDER_SANDBOX_TTL_SEC) {
     throw new Error(
       `SANDBOX_TIMEOUT_SEC must stay more than 60 seconds below the ${RENDER_SANDBOX_TTL_SEC} second Render sandbox lifetime`,
     );

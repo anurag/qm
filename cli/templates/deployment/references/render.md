@@ -30,8 +30,8 @@ Set these keys in `qm.config.jsonc`:
   defaults to `render.region`, and each app keeps the region selected at
   creation.
 - `render.corePlan`, `render.servicePlan`, and `render.storage.plan`: Render
-  compute plan IDs such as `2c-4g`. Legacy names such as `standard` are
-  normalized to plan IDs. `render.corePlan` defaults to `2c-4g`, which fits the
+  compute plan IDs such as `2c-4g`. Retired names such as `standard` are
+  rejected with the current ID. `render.corePlan` defaults to `2c-4g`, which fits the
   default 16 run workers; a smaller core plan needs a lower `env.core.WORKERS`.
 - `render.postgresPlan` and `render.postgresDiskSizeGB`: passed through to
   Render Postgres. `render.storage.diskSizeGB` sizes the MinIO disk, the only

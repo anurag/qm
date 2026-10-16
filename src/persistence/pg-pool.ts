@@ -149,16 +149,20 @@ async function withStatementTimeout<T>(
 
 export async function withPgTransaction<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
+  let rollbackError: Error | undefined;
   try {
     await client.query("BEGIN");
     const result = await fn(client);
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK").catch(swallowAs("pg-pool: rollback transaction", undefined));
+    await client.query("ROLLBACK").catch((e: unknown) => {
+      rollbackError = e instanceof Error ? e : new Error(String(e));
+      swallowAs("pg-pool: rollback transaction", undefined)(e);
+    });
     throw error;
   } finally {
-    client.release();
+    client.release(rollbackError);
   }
 }
 

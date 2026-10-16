@@ -319,7 +319,7 @@ export const renderScaffold: ProviderScaffold = {
     "servicePlan": "0.5c-512mb",
     "postgresPlan": "0.5c-1g",
     "postgresDiskSizeGB": 10,
-    "storage": { "type": "minio", "plan": "0.5c-512mb", "diskSizeGB": 10 }
+    "storage": { "plan": "0.5c-512mb", "diskSizeGB": 10 }
   },
 `,
       services: ["core", "slack", "web-ui", "admin", "portal", "auth"],

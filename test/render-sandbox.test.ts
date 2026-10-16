@@ -783,6 +783,24 @@ test("Render stops saving an unchanged home that is too large for its archive", 
   assert.equal(natives, 1);
 });
 
+test("Render finishes a destroy that stopped after it wrote the cleanup record", async (t) => {
+  const { make, fake, layers, store, scope, cleanupStore } = setup(t);
+  const sandbox = make();
+  const handle = await sandbox.provision(layers);
+  await sandbox.teardown(handle);
+  const before = (await store.get(scope))!;
+  await cleanupStore.put(scope, {
+    resources: [{ sandboxId: before.sandboxId, checkpoint: before.checkpoint }],
+    homeArchive: true,
+  });
+  const replacement = await make().provision(layers);
+  assert.equal(replacement.coldStart, true);
+  assert.equal(await cleanupStore.get(scope), null);
+  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "terminated");
+  assert.equal(fake.snapshots.has(before.checkpoint!.id), false);
+  assert.notEqual((await store.get(scope))!.sandboxId, before.sandboxId);
+});
+
 test("Render removes a destroyed scope at once and deletes a retired checkpoint that is still being created later", async (t) => {
   const { make, fake, layers, store, scope, snapshots, cleanupStore } = setup(t);
   const sandbox = make();

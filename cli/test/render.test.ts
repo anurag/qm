@@ -1105,7 +1105,7 @@ test("Render rejects disk shrink, plain HTTP URLs, and a shared hostname", async
   const d = deployment(t);
   cloud(t, d);
   await d.backend.up({ dryRun: false });
-  if (d.ctx.config.render!.storage.type === "minio") d.ctx.config.render!.storage.diskSizeGB = 1;
+  d.ctx.config.render!.storage.diskSizeGB = 1;
   await assert.rejects(d.backend.up({ dryRun: false }), /cannot shrink/);
   for (const publicUrl of ["http://qm.example.com", "https://qm.example.com:8443"]) {
     d.ctx.config.publicUrl = publicUrl;
@@ -1383,7 +1383,7 @@ test("Render restores remote drift and grows storage without replacing resources
   const root = c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD;
   c.services.get("srv-acme-core")!.imagePath = "example.com/wrong:latest";
   c.envs.get("srv-acme-core")!.DEPLOY_PROVIDER = "fly";
-  if (d.ctx.config.render!.storage.type === "minio") d.ctx.config.render!.storage.diskSizeGB = 20;
+  d.ctx.config.render!.storage.diskSizeGB = 20;
   d.ctx.config.render!.postgresDiskSizeGB = 20;
   const mark = c.calls.length;
   await d.backend.up({ dryRun: false });

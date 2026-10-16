@@ -4,6 +4,7 @@ import { decryptSecret, deriveConnectorKey, encryptSecret } from "../connectors/
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { withPgTransaction, type Pool } from "../persistence/pg-pool.ts";
+import { swallowAs } from "../util/errors.ts";
 
 export interface StoredRenderAppDatabase {
   deploymentId: string;
@@ -40,9 +41,9 @@ function provisioningFailure(error: unknown): Error {
 
 async function connected<T>(connectionString: string, run: (pool: Pool) => Promise<T>): Promise<T> {
   const pool = new pg.Pool({ connectionString, max: 1, connectionTimeoutMillis: 10_000, statement_timeout: 30_000 });
-  pool.on("error", () => {});
+  pool.on("error", swallowAs("render app database pool", undefined));
   pool.on("connect", (client) => {
-    client.on("error", () => {});
+    client.on("error", swallowAs("render app database connection", undefined));
   });
   try {
     return await run(pool);

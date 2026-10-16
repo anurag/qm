@@ -93,7 +93,7 @@ test("Render uses Git builds for all services and rejects image overrides", (t) 
 
 test("Render init selects managed MinIO without generated infrastructure files or storage inputs", (t) => {
   const { config } = deployment(t);
-  assert.deepEqual(config.render?.storage, { type: "minio", plan: "0.5c-512mb", diskSizeGB: 10 });
+  assert.deepEqual(config.render?.storage, { plan: "0.5c-512mb", diskSizeGB: 10 });
   assert.deepEqual(
     renderScaffold.files(config).map((file) => file.segments),
     [["sandbox", "skills", "render-platform", "SKILL.md"]],

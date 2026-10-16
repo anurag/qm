@@ -450,7 +450,7 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
         while (service && service.suspended !== "suspended") {
           if (Date.now() >= deadline) throw new Error("Render app suspension is not confirmed");
           await sleep(Math.max(1, poll));
-          service = await find(deployment, record);
+          service = await retained(record);
         }
         await opts.resources.suspend(deployment.id);
         await opts.artifacts.revoke(deployment.id);

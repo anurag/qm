@@ -20,7 +20,6 @@ test("qm init --target render creates a Git deployment with native sandbox guida
   const config = loadConfigAt(join(dir, "qm.config.jsonc")).config;
   assert.deepEqual(config.render!.source, { repo: "https://github.com/yc-software/qm", branch: "main" });
   assert.equal(config.sandbox!.backend, "render");
-  assert.equal(config.render!.storage.type, "minio");
   assert.match(result.stdout, /Render builds .* branch main/);
   assert.match(readFileSync(join(dir, "AGENTS.md"), "utf8"), /Native Render Sandboxes are workspace resources/);
   const skill = readFileSync(join(dir, "sandbox", "skills", "render-platform", "SKILL.md"), "utf8");

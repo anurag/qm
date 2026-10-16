@@ -405,6 +405,9 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
   async function finishCleanup(scope: string): Promise<void> {
     let pending = await cleanupStore.get(scope);
     if (!pending) return;
+    const stored = await store.get(scope);
+    if (stored && pending.resources.some((resources) => resources.sandboxId === stored.sandboxId))
+      await store.delete(scope);
     try {
       if (pending.homeArchive) {
         await opts.snapshots.delete?.(scope);

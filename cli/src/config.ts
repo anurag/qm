@@ -80,7 +80,7 @@ export interface AwsServiceConfig {
 
 export interface RenderConfig {
   source: { repo: string; branch: string };
-  storage: { type: "minio"; plan: string; diskSizeGB: number };
+  storage: { plan: string; diskSizeGB: number };
   workspaceId: string;
   region: "oregon" | "ohio" | "virginia" | "frankfurt" | "singapore";
   appRegion?: RenderConfig["region"];
@@ -1580,10 +1580,9 @@ function validateRender(raw: unknown, path: string): RenderConfig {
     if (!allowed.has(key)) throw new CliError(`${path}: unknown render.${key}`);
   }
   const storageRaw = raw.storage ?? {};
-  if (!isPlainObject(storageRaw) || (storageRaw.type !== undefined && storageRaw.type !== "minio"))
-    throw new CliError(`${path}: render.storage.type must be minio`);
+  if (!isPlainObject(storageRaw)) throw new CliError(`${path}: render.storage must be an object`);
   for (const key of Object.keys(storageRaw)) {
-    if (!["type", "plan", "diskSizeGB"].includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
+    if (!["plan", "diskSizeGB"].includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
   }
   const plan = (key: string, value: unknown, compute = true): string => {
     if (compute && typeof value === "string" && retiredRenderPlans[value])
@@ -1598,7 +1597,7 @@ function validateRender(raw: unknown, path: string): RenderConfig {
   const diskSizeGB = storageRaw.diskSizeGB ?? 10;
   if (typeof diskSizeGB !== "number" || !Number.isInteger(diskSizeGB) || diskSizeGB < 1 || diskSizeGB > 1000)
     throw new CliError(`${path}: render.storage.diskSizeGB must be an integer from 1 to 1000`);
-  const storage: RenderConfig["storage"] = { type: "minio", plan: storagePlan, diskSizeGB };
+  const storage: RenderConfig["storage"] = { plan: storagePlan, diskSizeGB };
   const workspaceId = raw.workspaceId;
   if (typeof workspaceId !== "string" || !/^(tea|usr)-[a-z0-9]+$/.test(workspaceId)) {
     throw new CliError(`${path}: render.workspaceId must be a Render workspace ID (tea-... or usr-...)`);
