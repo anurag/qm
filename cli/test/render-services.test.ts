@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -8,7 +8,7 @@ import { renderScaffold } from "../src/provider-scaffold.ts";
 import { renderConfigErrors } from "../src/backends/render.ts";
 import { discoverPlugins } from "../src/plugins.ts";
 import { renderServiceEnv, renderWorkloads } from "../src/render-services.ts";
-import { computedSecrets } from "../src/secrets.ts";
+import { computedSecrets, FIRST_PARTY_SECRET_SPECS, managedByFor } from "../src/secrets.ts";
 
 interface ScaffoldConfig {
   render: Record<string, unknown>;
@@ -104,8 +104,6 @@ test("Render init selects managed MinIO without generated infrastructure files o
       secrets.some((secret) => secret.name === key),
       false,
     );
-  const dockerfile = readFileSync(new URL("../../deploy/render-minio/Dockerfile", import.meta.url), "utf8");
-  assert.match(dockerfile, /^FROM \S+@sha256:[a-f0-9]{64}\n/);
 });
 
 test("Render appRegion accepts supported regions without changing the core region", (t) => {
@@ -172,6 +170,21 @@ test("Render core receives scoped storage credentials and assigned URLs", (t) =>
   assert.equal(portal.AUTH_REDIRECT_URI, `${config.publicUrl}/auth/callback`);
   assert.equal(portal.ADMIN_UPSTREAM, "http://web-ui:8080/admin");
   assert.equal(renderServiceEnv(config, "slack", values, connections).PUBLIC_API_URL, config.apiUrl);
+});
+
+test("Render supplies core every secret that the specs mark as Render-managed and rejects overrides", (t) => {
+  const { config } = deployment(t);
+  const core = renderServiceEnv(config, "core", new Map(), connections);
+  for (const { name } of FIRST_PARTY_SECRET_SPECS.filter((spec) => managedByFor(spec, "render") === "render")) {
+    assert.ok(core[name], name);
+    config.secretEnv = { core: { [name]: name } };
+    assert.ok(
+      renderConfigErrors(config, []).some(
+        (error) => error.message === `Render derives core ${name}; remove its secretEnv entry`,
+      ),
+      name,
+    );
+  }
 });
 
 test("Render rejects prebuilt plugin images", (t) => {

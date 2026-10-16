@@ -1,6 +1,7 @@
 import { securityScreenEnv, type QmConfig, type RenderConfig } from "./config.ts";
 import { CliError } from "./log.ts";
 import { discoverPlugins, type ResolvedPlugin } from "./plugins.ts";
+import type { ServiceType } from "./render-api.ts";
 import { computedSecrets, runtimeSecretNames } from "./secrets.ts";
 import {
   brandEnvOf,
@@ -34,10 +35,20 @@ export function renderWorkloads(
   ];
 }
 
-export interface RenderBuild {
+interface RenderBuild {
   source: NonNullable<QmConfig["render"]>["source"];
   dockerfile: string;
 }
+
+export type RenderWorkload = RenderBuild & {
+  name: string;
+  type: ServiceType;
+  plan: string;
+  plugin?: ResolvedPlugin;
+  command?: string;
+  health?: string;
+  diskSizeGB?: number;
+};
 
 export function renderManagedCoreEnv(render: RenderConfig): Record<string, string> {
   return {
@@ -125,8 +136,7 @@ export function renderServiceEnv(
       HARNESS: config.env.core?.HARNESS ?? "pi",
       ...securityScreenEnv(config),
       ...renderManagedCoreEnv(render),
-      DATABASE_URL: connections.databaseUrl,
-      PUBLIC_API_URL: config.apiUrl,
+      ...managedValues,
       ...(connections.projectId ? { RENDER_PROJECT_ID: connections.projectId } : {}),
       ...(connections.minioServiceId ? { RENDER_MINIO_SERVICE_ID: connections.minioServiceId } : {}),
       ...(connections.postgresId ? { RENDER_POSTGRES_ID: connections.postgresId } : {}),

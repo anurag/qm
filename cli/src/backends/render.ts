@@ -1,14 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import {
-  appPrefixOf,
-  githubRepoUrl,
-  renderPlanId,
-  updateConfigUrls,
-  type QmConfig,
-  type RenderConfig,
-} from "../config.ts";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appPrefixOf, githubRepoUrl, renderPlanId, updateConfigUrls, type QmConfig } from "../config.ts";
 import {
   deploymentLayerRequest,
   httpDeploymentLayerTransport,
@@ -16,18 +7,45 @@ import {
   type DeploymentLayerTransport,
 } from "../deployment-layer.ts";
 import { CliError, errMessage, note, ok, step } from "../log.ts";
-import { renderMinioCommand, renderMinioInitCommand } from "../render-minio.ts";
 import type { ResolvedPlugin } from "../plugins.ts";
+import {
+  list,
+  RenderApiError,
+  renderClient,
+  requestArray,
+  type RenderRequest,
+  type RenderService,
+  type ServiceType,
+} from "../render-api.ts";
+import { bindUrl, customDomains, httpsOrigin, publicUrl, renderInternalUrl, verifiedUrl } from "../render-domains.ts";
+import {
+  renderMinioEnv,
+  renderMinioInitCommand,
+  renderMinioSecretNames,
+  renderMinioWorkload,
+} from "../render-minio.ts";
 import {
   renderManagedCoreEnv,
   renderServiceEnv,
   renderStorageEnv,
   renderWorkloads,
-  type RenderBuild,
+  type RenderWorkload,
 } from "../render-services.ts";
-import { computedSecrets, runtimeSecretNames } from "../secrets.ts";
+import {
+  coordinates,
+  createResource,
+  describeRelease,
+  locked,
+  readState,
+  recordRelease,
+  recoverPendingCreate,
+  resolveRollbackTarget,
+  saveState,
+  statePath,
+  type State,
+} from "../render-state.ts";
+import { computedSecrets, FIRST_PARTY_SECRET_SPECS, managedByFor, runtimeSecretNames } from "../secrets.ts";
 import { serviceHost } from "../services.ts";
-import { withDeploymentLock } from "../state.ts";
 import { capture, deploymentSecretValue, isInvalidSecret, sleep } from "../util.ts";
 import { doctorCommon, localDoctorSecrets } from "./doctor.ts";
 import type { DeployContext } from "./registry.ts";
@@ -46,54 +64,6 @@ export const renderDeploymentLayerTransport = layerTransport((config) => {
   return origin;
 });
 
-function httpsOrigin(value: string | undefined): string | undefined {
-  const url = URL.parse(value ?? "");
-  if (
-    !url ||
-    url.protocol !== "https:" ||
-    url.port ||
-    url.username ||
-    url.password ||
-    url.pathname !== "/" ||
-    url.search ||
-    url.hash
-  )
-    return undefined;
-  return url.origin;
-}
-function assignedOrigin(value: string | undefined): string | undefined {
-  const origin = httpsOrigin(value);
-  return origin && new URL(origin).hostname.endsWith(".onrender.com") ? origin : undefined;
-}
-
-type ServiceType = "web_service" | "private_service";
-interface SavedService {
-  id: string;
-  name: string;
-  type: ServiceType;
-}
-interface RenderService extends SavedService {
-  ownerId: string;
-  environmentId: string;
-  slug: string;
-  imagePath?: string;
-  repo?: string;
-  branch?: string;
-  rootDir?: string;
-  autoDeploy: string;
-  suspended: string;
-  serviceDetails: {
-    url?: string;
-    region: string;
-    plan: string;
-    numInstances: number;
-    runtime: string;
-    healthCheckPath?: string;
-    maxShutdownDelaySeconds?: number;
-    envSpecificDetails: { dockerCommand?: string; dockerfilePath?: string; dockerContext?: string };
-    disk?: { id: string; mountPath: string; sizeGB: number };
-  };
-}
 interface RenderPostgres {
   id: string;
   name: string;
@@ -117,7 +87,6 @@ interface RenderDeploy {
 }
 const bootstrapCommand = "/bin/sh -c exit 0";
 const failedDeployStatuses = ["build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"];
-type Collection = "projects" | "postgres" | "services";
 interface Project {
   id: string;
   name: string;
@@ -129,196 +98,6 @@ interface Environment {
   name: string;
   projectId: string;
 }
-interface State {
-  version: 1;
-  orgId: string;
-  workspaceId: string;
-  region: string;
-  appPrefix: string;
-  projectId?: string;
-  environmentId?: string;
-  postgresId?: string;
-  services: Record<string, SavedService>;
-  pendingPurge?: boolean;
-  pendingCreate?: { collection: Collection; name: string };
-  releases?: Release[];
-  releaseCount?: number;
-  updateInProgress?: boolean;
-  rollbackProgress?: RollbackProgress;
-}
-interface Release {
-  label: string;
-  commit: string;
-  createdAt: string;
-  services: Record<string, string>;
-}
-interface RollbackProgress {
-  mode: "restore" | "rebuild";
-  label?: string;
-  commit: string;
-  services: Record<string, string>;
-  interruptedUpdate: boolean;
-  restored: Record<string, string>;
-}
-const RETAINED_RELEASES = 10;
-function recordRelease(state: State, commit: string, services: Record<string, string>): Release {
-  state.releaseCount = (state.releaseCount ?? 0) + 1;
-  const release: Release = { label: `r${state.releaseCount}`, commit, createdAt: new Date().toISOString(), services };
-  state.releases = [release, ...(state.releases ?? [])].slice(0, RETAINED_RELEASES);
-  return release;
-}
-function describeRelease(release: Release): string {
-  return `${release.label} (${release.commit.slice(0, 7)}, ${release.createdAt})`;
-}
-type RollbackTarget = { mode: "restore"; release: Release } | { mode: "rebuild"; commit: string };
-function resolveRollbackTarget(state: State, to: string | undefined): RollbackTarget {
-  const releases = state.releases ?? [];
-  const retained = releases.length
-    ? `Retained releases: ${releases.map(describeRelease).join(", ")}`
-    : "No release is retained";
-  if (to === undefined) {
-    const release = releases[state.updateInProgress === true ? 0 : 1];
-    if (!release || !Object.keys(release.services).length)
-      throw new CliError(`No previous Render release is recorded for rollback. ${retained}`);
-    return { mode: "restore", release };
-  }
-  const value = to.trim();
-  const byLabel = releases.find((release) => release.label === value);
-  if (byLabel) return { mode: "restore", release: byLabel };
-  if (/^dep-[a-z0-9]+$/.test(value)) {
-    const byDeploy = releases.find((release) => Object.values(release.services).includes(value));
-    if (byDeploy) return { mode: "restore", release: byDeploy };
-    throw new CliError(`No retained Render release contains deploy ${value}. ${retained}`);
-  }
-  if (/^[0-9a-f]{7,40}$/i.test(value)) {
-    const commit = value.toLowerCase();
-    const matches = releases.filter((release) => release.commit.startsWith(commit));
-    if (matches.length === 1) return { mode: "restore", release: matches[0]! };
-    if (matches.length > 1)
-      throw new CliError(`Commit ${value} matches several retained releases; use a release label. ${retained}`);
-    if (commit.length === 40) return { mode: "rebuild", commit };
-    throw new CliError(
-      `No retained Render release was built from ${value}; give the full 40-character commit to build it. ${retained}`,
-    );
-  }
-  throw new CliError(`Rollback target ${JSON.stringify(to)} is not a release label, commit, or deploy ID. ${retained}`);
-}
-type Workload = RenderBuild & {
-  name: string;
-  type: ServiceType;
-  plan: string;
-  plugin?: ResolvedPlugin;
-  command?: string;
-  health?: string;
-  diskSizeGB?: number;
-};
-type RenderRequest = <T>(path: string, method?: string, body?: unknown) => Promise<T>;
-class RenderApiError extends CliError {
-  readonly status: number;
-  constructor(status: number, path: string, method: string, detail: string, requestId: string | null) {
-    super(
-      `Render ${method} ${path.split("?")[0]} failed (HTTP ${status})${detail ? `: ${detail}` : ""}${requestId ? ` [request id ${requestId}]` : ""}`,
-    );
-    this.status = status;
-  }
-  get rejected(): boolean {
-    return this.status >= 400 && this.status < 500 && this.status !== 408 && this.status !== 429;
-  }
-}
-const RENDER_ATTEMPTS = 4;
-const RENDER_TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
-function retryDelayMs(attempt: number, response?: Response): number {
-  const retryAfter = Number(response?.headers.get("retry-after")?.trim() || Number.NaN);
-  if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(retryAfter * 1000, 30_000);
-  return Math.round(Math.min(8_000, 500 * 2 ** (attempt - 1)) * (0.5 + Math.random() / 2));
-}
-function client(apiKey: string): RenderRequest {
-  return async <T>(path: string, method = "GET", body?: unknown): Promise<T> => {
-    const idempotent = method !== "POST";
-    let attempt = 1;
-    let response: Response;
-    for (; ; attempt++) {
-      try {
-        response = await fetch(`https://api.render.com/v1${path}`, {
-          method,
-          headers: {
-            authorization: `Bearer ${apiKey}`,
-            accept: "application/json",
-            "content-type": "application/json",
-          },
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-          signal: AbortSignal.timeout(60_000),
-          redirect: "error",
-        });
-      } catch (error) {
-        if (!idempotent || attempt >= RENDER_ATTEMPTS) throw error;
-        await sleep(retryDelayMs(attempt));
-        continue;
-      }
-      const transient = response.status === 429 || (idempotent && RENDER_TRANSIENT_STATUSES.has(response.status));
-      if (!transient || attempt >= RENDER_ATTEMPTS) break;
-      await response.body?.cancel().catch(() => undefined);
-      await sleep(retryDelayMs(attempt, response));
-    }
-    if (method === "DELETE" && attempt > 1 && response.status === 404) {
-      await response.body?.cancel().catch(() => undefined);
-      return undefined as T;
-    }
-    if (!response.ok)
-      throw new RenderApiError(
-        response.status,
-        path,
-        method,
-        (await response.text().catch(() => "")).slice(0, 200),
-        response.headers.get("render-request-id"),
-      );
-    const text = await response.text();
-    if (!text) return undefined as T;
-    return (response.headers.get("content-type")?.includes("json") ? JSON.parse(text) : text) as T;
-  };
-}
-function coordinates(config: QmConfig): RenderConfig {
-  if (!config.render || config.render.workspaceId === "tea-replaceme")
-    throw new CliError("Set render.workspaceId to your Render workspace ID before deployment");
-  return config.render;
-}
-function statePath(ctx: DeployContext): string {
-  return join(ctx.configDir, "render.resources.json");
-}
-function readState(ctx: DeployContext, optional = false): State {
-  const render = coordinates(ctx.config);
-  if (!existsSync(statePath(ctx))) {
-    if (!optional) throw new CliError("No Render resource record exists; run qm up");
-    return {
-      version: 1,
-      orgId: ctx.config.orgId,
-      workspaceId: render.workspaceId,
-      region: render.region,
-      appPrefix: appPrefixOf(ctx.config),
-      services: {},
-    };
-  }
-  const state = JSON.parse(readFileSync(statePath(ctx), "utf8")) as State;
-  if (state.version !== 1 || !state.services || Array.isArray(state.services))
-    throw new CliError(
-      "The Render resource record is not a direct API deployment record; do not use it to adopt existing resources",
-    );
-  if (
-    state.orgId !== ctx.config.orgId ||
-    state.workspaceId !== render.workspaceId ||
-    state.region !== render.region ||
-    state.appPrefix !== appPrefixOf(ctx.config)
-  )
-    throw new CliError("render.resources.json belongs to another organization, workspace, region, or app prefix");
-  return state;
-}
-function saveState(ctx: DeployContext, state: State): void {
-  const path = statePath(ctx);
-  writeFileSync(`${path}.tmp`, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  renameSync(`${path}.tmp`, path);
-}
-const locked = <T>(ctx: DeployContext, operation: () => Promise<T>): Promise<T> =>
-  withDeploymentLock(join(ctx.configDir, ".render.lock"), operation);
 function credentialValues(ctx: DeployContext, envFile = ctx.envFile): Map<string, string> {
   const values = localDoctorSecrets(ctx.configDir, envFile);
   for (const secret of computedSecrets(ctx.config)) {
@@ -334,7 +113,7 @@ function credentialValues(ctx: DeployContext, envFile = ctx.envFile): Map<string
 function api(ctx: DeployContext, envFile?: string): RenderRequest {
   const key = credentialValues(ctx, envFile ?? ctx.envFile).get("RENDER_API_KEY");
   if (!key || isInvalidSecret("RENDER_API_KEY", key)) throw new CliError("RENDER_API_KEY is required; run qm setup");
-  return client(key);
+  return renderClient(key);
 }
 function requireSecrets(ctx: DeployContext, values: ReadonlyMap<string, string>): void {
   const missing = computedSecrets(ctx.config).filter(
@@ -345,29 +124,6 @@ function requireSecrets(ctx: DeployContext, values: ReadonlyMap<string, string>)
     throw new CliError(
       `Required secrets are missing: ${missing.map((secret) => secret.name).join(", ")}; run qm setup`,
     );
-}
-async function requestArray<T>(request: RenderRequest, path: string): Promise<T[]> {
-  const page = await request<unknown>(path);
-  if (page === null) return [];
-  if (!Array.isArray(page)) throw new CliError(`Render GET ${path.split("?")[0]} returned an invalid list response`);
-  return page as T[];
-}
-async function list<T>(request: RenderRequest, path: string, key: string): Promise<T[]> {
-  const out: T[] = [];
-  const seen = new Set<string>();
-  let cursor: string | undefined;
-  for (;;) {
-    const url = new URL(path, "https://api.render.com");
-    url.searchParams.set("limit", "100");
-    if (cursor) url.searchParams.set("cursor", cursor);
-    const page = await requestArray<Record<string, unknown>>(request, `${url.pathname}${url.search}`);
-    out.push(...page.map((item) => item[key] as T));
-    if (page.length < 100) return out;
-    const next = page.at(-1)?.cursor;
-    if (typeof next !== "string" || seen.has(next)) throw new CliError("Render pagination did not advance");
-    seen.add(next);
-    cursor = next;
-  }
 }
 async function envVars(request: RenderRequest, id: string): Promise<Record<string, string>> {
   return Object.fromEntries(
@@ -385,20 +141,9 @@ function pairs(values: Record<string, string>): Array<{ key: string; value: stri
 function same(a: Record<string, string>, b: Record<string, string>): boolean {
   return JSON.stringify(pairs(a)) === JSON.stringify(pairs(b));
 }
-function workloads(ctx: DeployContext): Workload[] {
+function workloads(ctx: DeployContext): RenderWorkload[] {
   const render = coordinates(ctx.config);
-  const out: Workload[] = [
-    {
-      name: "minio",
-      source: render.source,
-      dockerfile: "deploy/render-minio/Dockerfile",
-      command: renderMinioCommand,
-      type: "web_service",
-      plan: render.storage.plan,
-      health: "/minio/health/live",
-      diskSizeGB: render.storage.diskSizeGB,
-    },
-  ];
+  const out: RenderWorkload[] = [renderMinioWorkload(render)];
   for (const item of renderWorkloads(ctx.config, ctx.configDir)) {
     const privateService = !!item.plugin || (item.name === "web-ui" && ctx.config.services.includes("portal"));
     const type: ServiceType = privateService ? "private_service" : "web_service";
@@ -493,39 +238,6 @@ async function assertAvailable(
       `Render ${name} already exists without a saved resource ID. Refusing to adopt it; inspect the resource and restore this deployment's render.resources.json`,
     );
 }
-async function recoverPendingCreate(ctx: DeployContext, request: RenderRequest, state: State): Promise<void> {
-  if (!state.pendingCreate) return;
-  const { collection, name } = state.pendingCreate;
-  const component = name.slice(state.appPrefix.length + 1);
-  const desiredType =
-    collection === "services" ? workloads(ctx).find((item) => item.name === component)?.type : undefined;
-  const scoped = collection === "postgres" || collection === "services";
-  const query = new URLSearchParams({ ownerId: state.workspaceId, name });
-  const found = (
-    await list<{ id: string; name: string; type: ServiceType; environmentId?: string }>(
-      request,
-      `/${collection}?${query}`,
-      collection === "postgres" ? collection : collection.slice(0, -1),
-    )
-  ).filter(
-    (item) =>
-      item.name === name &&
-      (!scoped || item.environmentId === state.environmentId) &&
-      (desiredType === undefined || item.type === desiredType),
-  );
-  if (found.length > 1)
-    throw new CliError(
-      `Render has several resources named ${name}; remove the duplicates and restore render.resources.json`,
-    );
-  const created = found[0];
-  if (created) {
-    if (collection === "projects") state.projectId ??= created.id;
-    else if (collection === "postgres") state.postgresId ??= created.id;
-    else state.services[component] ??= { id: created.id, name, type: created.type };
-  }
-  delete state.pendingCreate;
-  saveState(ctx, state);
-}
 async function poll(label: string, check: () => Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 20 * 60_000;
   let nextUpdate = Date.now() + 30_000;
@@ -538,89 +250,6 @@ async function poll(label: string, check: () => Promise<boolean>): Promise<void>
     }
     await sleep(3_000);
   }
-}
-export function renderInternalUrl(service: Pick<RenderService, "name" | "slug">): string {
-  if (!/^[a-z0-9][a-z0-9-]*$/.test(service.slug))
-    throw new CliError(`Render returned an invalid private hostname for ${service.name}`);
-  return `http://${service.slug}:8080`;
-}
-function publicUrl(service: RenderService): string {
-  const origin = assignedOrigin(service.serviceDetails.url);
-  if (!origin) throw new CliError(`Render returned an invalid public address for ${service.name}`);
-  return origin;
-}
-interface CustomDomain {
-  id: string;
-  name: string;
-  domainType: "apex" | "subdomain";
-  redirectForName: string;
-  verificationStatus: "verified" | "unverified";
-}
-function primaryDomain(domain: CustomDomain, service: RenderService): CustomDomain {
-  if (domain.redirectForName)
-    throw new CliError(
-      `${service.name}: ${domain.name} redirects to ${domain.redirectForName} on Render; configure https://${domain.redirectForName} or remove the redirect in the Render dashboard`,
-    );
-  return domain;
-}
-function customDomainPath(service: RenderService, name?: string): string {
-  return `/services/${service.id}/custom-domains${name ? `/${encodeURIComponent(name)}` : ""}`;
-}
-function dnsInstruction(domain: CustomDomain, service: RenderService): string {
-  const record = domain.domainType === "apex" ? "an ALIAS or ANAME record" : "a CNAME record";
-  return `point ${domain.name} at ${new URL(publicUrl(service)).hostname} with ${record}; Render verifies the domain and issues its certificate when the record resolves`;
-}
-async function ensureCustomDomain(request: RenderRequest, service: RenderService, origin: string): Promise<void> {
-  const name = new URL(origin).hostname;
-  const existing = (await list<CustomDomain>(request, customDomainPath(service), "customDomain")).find(
-    (item) => item.name === name,
-  );
-  let domain = existing;
-  if (!domain) {
-    const created = await request<CustomDomain | CustomDomain[]>(customDomainPath(service), "POST", { name });
-    domain = (Array.isArray(created) ? created : [created]).find((item) => item.name === name);
-    if (!domain) throw new CliError(`Render returned no custom domain ${name} for ${service.name}`);
-  }
-  primaryDomain(domain, service);
-  if (existing && domain.verificationStatus !== "verified")
-    await request(`${customDomainPath(service, domain.id)}/verify`, "POST");
-  if (domain.verificationStatus === "verified") ok(`${service.name}: custom domain ${name} verified`);
-  else note(`${service.name}: custom domain ${name} is unverified; ${dnsInstruction(domain, service)}`);
-}
-async function bindUrl(
-  request: RenderRequest,
-  service: RenderService,
-  configured: string | undefined,
-): Promise<string> {
-  const origin = httpsOrigin(configured);
-  if (!origin || assignedOrigin(origin)) return publicUrl(service);
-  await ensureCustomDomain(request, service, origin);
-  return origin;
-}
-async function verifiedUrl(
-  request: RenderRequest,
-  service: RenderService,
-  configured: string | undefined,
-): Promise<string> {
-  const origin = httpsOrigin(configured);
-  if (!origin) throw new CliError(`${service.name} has no HTTPS origin URL configured; run qm check`);
-  if (assignedOrigin(origin)) {
-    if (origin !== publicUrl(service))
-      throw new CliError("Configured Render URLs do not match the owned services; run qm up");
-    return origin;
-  }
-  const name = new URL(origin).hostname;
-  let domain: CustomDomain;
-  try {
-    domain = primaryDomain(await request<CustomDomain>(customDomainPath(service, name)), service);
-  } catch (error) {
-    if (error instanceof RenderApiError && error.status === 404)
-      throw new CliError(`${service.name} has no custom domain ${name}; run qm up`);
-    throw error;
-  }
-  if (domain.verificationStatus !== "verified")
-    throw new CliError(`${service.name}: custom domain ${name} is unverified; ${dnsInstruction(domain, service)}`);
-  return origin;
 }
 async function latestDeploy(request: RenderRequest, service: RenderService): Promise<RenderDeploy | undefined> {
   return (await requestArray<{ deploy: RenderDeploy }>(request, `/services/${service.id}/deploys?limit=1`))[0]?.deploy;
@@ -660,19 +289,12 @@ async function idleDeploys(request: RenderRequest, service: RenderService): Prom
 }
 async function prepareBootstrap(
   request: RenderRequest,
-  workload: Workload,
+  workload: RenderWorkload,
   service: RenderService,
 ): Promise<RenderService> {
   if (service.suspended !== "suspended") return service;
   const before = (await latestDeploy(request, service))?.id;
-  await request(`/services/${service.id}`, "PATCH", {
-    autoDeploy: "no",
-    ...buildSource(workload),
-    serviceDetails: {
-      runtime: "docker",
-      envSpecificDetails: { ...dockerSettings(workload), dockerCommand: bootstrapCommand },
-    },
-  });
+  await request(`/services/${service.id}`, "PATCH", serviceSpec(workload, bootstrapCommand));
   await request(`/services/${service.id}/resume`, "POST");
   await poll(`${service.name} resume`, async () => (await latestDeploy(request, service))?.id !== before);
   return request<RenderService>(`/services/${service.id}`);
@@ -748,27 +370,6 @@ async function liveSession(
     report,
   );
 }
-async function createResource<T>(
-  ctx: DeployContext,
-  request: RenderRequest,
-  state: State,
-  collection: Collection,
-  body: Record<string, unknown> & { name: string },
-): Promise<T> {
-  state.pendingCreate = { collection, name: body.name };
-  saveState(ctx, state);
-  try {
-    const created = await request<T>(`/${collection}`, "POST", body);
-    delete state.pendingCreate;
-    return created;
-  } catch (error) {
-    if (error instanceof RenderApiError && error.rejected) {
-      delete state.pendingCreate;
-      saveState(ctx, state);
-    }
-    throw error;
-  }
-}
 async function provision(
   ctx: DeployContext,
   request: RenderRequest,
@@ -837,29 +438,14 @@ interface Connections {
 }
 function serviceEnv(
   ctx: DeployContext,
-  workload: Workload,
+  workload: RenderWorkload,
   values: ReadonlyMap<string, string>,
   connections: Connections,
   state: State,
   services: Map<string, RenderService>,
   existing: Record<string, string>,
 ): Record<string, string> {
-  if (workload.name === "minio") {
-    for (const key of ["MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "QM_STORAGE_SECRET_KEY"])
-      if (state.services.minio && !existing[key])
-        throw new CliError(`Saved MinIO has no ${key}; restore its environment variable before deployment`);
-    return {
-      HOST: "0.0.0.0",
-      PORT: "9000",
-      MINIO_BROWSER: "off",
-      MINIO_ROOT_USER: existing.MINIO_ROOT_USER ?? `qm-root-${randomBytes(12).toString("hex")}`,
-      MINIO_ROOT_PASSWORD: existing.MINIO_ROOT_PASSWORD ?? randomBytes(32).toString("hex"),
-      QM_STORAGE_SECRET_KEY: existing.QM_STORAGE_SECRET_KEY ?? randomBytes(32).toString("hex"),
-      MINIO_API_STALE_UPLOADS_EXPIRY: "24h",
-      MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL: "6h",
-      MINIO_API_CORS_ALLOW_ORIGIN: ctx.config.publicUrl,
-    };
-  }
+  if (workload.name === "minio") return renderMinioEnv(ctx.config.publicUrl, existing, !!state.services.minio);
   const resolved = new Map(values);
   for (const secret of computedSecrets(ctx.config)) {
     if (secret.managedBy !== "operator" || resolved.has(secret.name)) continue;
@@ -889,18 +475,26 @@ function serviceEnv(
     workload.plugin,
   );
 }
-function buildSource(workload: Workload) {
-  return { repo: workload.source.repo, branch: workload.source.branch, rootDir: "" };
-}
-
-function dockerSettings(workload: Workload) {
-  return { dockerCommand: workload.command ?? "", dockerfilePath: workload.dockerfile, dockerContext: "." };
+function serviceSpec(workload: RenderWorkload, dockerCommand = workload.command ?? "") {
+  return {
+    autoDeploy: "no",
+    repo: workload.source.repo,
+    branch: workload.source.branch,
+    rootDir: "",
+    serviceDetails: {
+      runtime: "docker",
+      plan: workload.plan,
+      envSpecificDetails: { dockerCommand, dockerfilePath: workload.dockerfile, dockerContext: "." },
+      ...(workload.health ? { healthCheckPath: workload.health } : {}),
+      ...(!workload.diskSizeGB ? { maxShutdownDelaySeconds: 300 } : {}),
+    },
+  };
 }
 
 async function reconcileService(
   request: RenderRequest,
   state: State,
-  workload: Workload,
+  workload: RenderWorkload,
   service: RenderService,
   env: Record<string, string>,
   existing: Record<string, string>,
@@ -936,17 +530,7 @@ async function reconcileService(
     (workload.health !== undefined && details.healthCheckPath !== workload.health) ||
     (!workload.diskSizeGB && details.maxShutdownDelaySeconds !== 300)
   ) {
-    await request(`/services/${service.id}`, "PATCH", {
-      autoDeploy: "no",
-      ...buildSource(workload),
-      serviceDetails: {
-        runtime: "docker",
-        plan: workload.plan,
-        envSpecificDetails: dockerSettings(workload),
-        ...(workload.health ? { healthCheckPath: workload.health } : {}),
-        ...(!workload.diskSizeGB ? { maxShutdownDelaySeconds: 300 } : {}),
-      },
-    });
+    await request(`/services/${service.id}`, "PATCH", serviceSpec(workload));
     changed = true;
   }
   if (!same(env, existing)) {
@@ -996,7 +580,10 @@ export function renderConfigErrors(
     if (config.env.core?.[key] !== undefined && config.env.core[key] !== value)
       add(`Render requires env.core.${key}=${value}`);
   }
-  for (const key of [...Object.keys(managed), "DATABASE_URL", "PUBLIC_API_URL"]) {
+  const derived = FIRST_PARTY_SECRET_SPECS.filter((spec) => managedByFor(spec, "render") === "render").map(
+    (spec) => spec.name,
+  );
+  for (const key of [...Object.keys(managed), ...derived]) {
     if (config.secretEnv?.core?.[key]) add(`Render derives core ${key}; remove its secretEnv entry`);
   }
   for (const key of [
@@ -1013,12 +600,7 @@ export function renderConfigErrors(
     if (config.env.core?.[key] !== undefined || config.secretEnv?.core?.[key] !== undefined)
       add(`Render derives core ${key}; remove its env or secretEnv entry`);
   }
-  for (const key of [
-    ...Object.keys(renderStorageEnv()),
-    "MINIO_ROOT_USER",
-    "MINIO_ROOT_PASSWORD",
-    "QM_STORAGE_SECRET_KEY",
-  ]) {
+  for (const key of [...Object.keys(renderStorageEnv()), ...renderMinioSecretNames]) {
     if (config.env.core?.[key] !== undefined || config.secretEnv?.core?.[key] !== undefined)
       add(`Render manages core ${key}; remove its env or secretEnv entry`);
   }
@@ -1062,7 +644,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
         await doctorCommon(ctx.config, values, { requiredSecretValues: true, configDir: ctx.configDir });
         const request = api(ctx);
         await request(`/owners/${state.workspaceId}`);
-        await recoverPendingCreate(ctx, request, state);
+        await recoverPendingCreate(ctx, request, state, desired);
         const bound = await inventory(ctx, request, state);
         for (const name of Object.keys(state.services))
           if (!desired.some((item) => item.name === name) && !bound.services.has(name)) delete state.services[name];
@@ -1100,26 +682,22 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             const name = `${state.appPrefix}-${workload.name}`;
             await assertAvailable(request, "/services", "service", name, state.workspaceId);
             env = serviceEnv(ctx, workload, values, connections, state, services, env);
+            const spec = serviceSpec(workload, bootstrapCommand);
             const result = await createResource<{ service: RenderService }>(ctx, request, state, "services", {
+              ...spec,
               type: workload.type,
               name,
               ownerId: state.workspaceId,
               environmentId: state.environmentId,
-              ...buildSource(workload),
-              autoDeploy: "no",
               envVars: pairs(env),
               secretFiles: [],
               serviceDetails: {
-                runtime: "docker",
-                plan: workload.plan,
+                ...spec.serviceDetails,
                 region: state.region,
                 numInstances: 1,
-                envSpecificDetails: { ...dockerSettings(workload), dockerCommand: bootstrapCommand },
-                ...(workload.health ? { healthCheckPath: workload.health } : {}),
                 ...(workload.diskSizeGB
                   ? { disk: { name: "data", mountPath: "/data", sizeGB: workload.diskSizeGB } }
                   : {}),
-                ...(!workload.diskSizeGB ? { maxShutdownDelaySeconds: 300 } : {}),
               },
             });
             service = result.service;
@@ -1233,7 +811,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       }
       for (const service of bound.services.values()) {
         if (service.type !== "web_service" || service.serviceDetails.disk) continue;
-        for (const domain of await list<CustomDomain>(request, customDomainPath(service), "customDomain"))
+        for (const domain of await customDomains(request, service))
           note(`${service.name}: custom domain ${domain.name} ${domain.verificationStatus}`);
       }
       for (const [index, release] of (state.releases ?? []).entries())
@@ -1303,7 +881,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
       locked(ctx, async () => {
         const request = api(ctx);
         const state = readState(ctx);
-        await recoverPendingCreate(ctx, request, state);
+        await recoverPendingCreate(ctx, request, state, workloads(ctx));
         if (state.pendingPurge && !opts.purge) throw new CliError("Render cleanup is incomplete; run qm down --purge");
         const bound = await inventory(ctx, request, state, !!opts.purge);
         const hosted = await list<RenderService>(

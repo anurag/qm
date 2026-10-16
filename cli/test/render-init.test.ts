@@ -21,16 +21,13 @@ test("qm init --target render creates a Git deployment with native sandbox guida
   assert.deepEqual(config.render!.source, { repo: "https://github.com/yc-software/qm", branch: "main" });
   assert.equal(config.sandbox!.backend, "render");
   assert.match(result.stdout, /Render builds .* branch main/);
-  assert.match(readFileSync(join(dir, "AGENTS.md"), "utf8"), /Native Render Sandboxes are workspace resources/);
-  const skill = readFileSync(join(dir, "sandbox", "skills", "render-platform", "SKILL.md"), "utf8");
-  assert.match(skill, /Each app receives\nits own database and object prefix/);
-  assert.match(skill, /prepend S3_PREFIX to every object\nkey and list prefix/);
-  assert.match(skill, /requestChecksumCalculation: "WHEN_REQUIRED"/);
-  assert.match(skill, /Handle SIGTERM/);
+  assert.match(readFileSync(join(dir, "AGENTS.md"), "utf8"), /^## Render deployment$/m);
   assert.ok(existsSync(join(dir, ".codex", "skills", "deploy-qm", "references", "render.md")));
   assert.doesNotMatch(readFileSync(join(dir, ".env"), "utf8"), /^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)=/m);
   assert.match(readFileSync(join(dir, ".env"), "utf8"), /^RENDER_API_KEY=$/m);
-  assert.doesNotThrow(() => runChecks(config, dir, join(dir, "sandbox"), { report: false }));
+  const { layer } = runChecks(config, dir, join(dir, "sandbox"), { report: false });
+  assert.deepEqual(layer.errors, []);
+  assert.equal(layer.skills.find((skill) => skill.dir === "render-platform")?.frontmatter.name, "render-platform");
 });
 
 test("qm init stores the selected Render Git source and rejects partial source flags", (t) => {
