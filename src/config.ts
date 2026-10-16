@@ -6,6 +6,7 @@ import { parseSandboxCapabilityTtlMs } from "./auth/capability-token.ts";
 import { parseScopeId } from "./types.ts";
 import type { LegacySandboxScopeDefaults } from "./sandbox/sandbox-resource-upgrade.ts";
 import type { SandboxBackendName } from "./sandbox/sandbox-routing.ts";
+import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import {
   parseProviderBaseUrl,
@@ -486,32 +487,34 @@ interface RenderDeployEnv {
   appPrefix?: string;
 }
 
-function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
-  const repo = env.RENDER_DEPLOY_REPO?.trim()
+function githubRepoUrl(value: string): string | undefined {
+  const url = URL.parse(value.trim());
+  if (!url || url.protocol !== "https:" || url.host !== "github.com") return undefined;
+  if (url.username || url.password || url.search || url.hash) return undefined;
+  const segments = url.pathname
     .replace(/\/$/, "")
-    .replace(/\.git$/, "");
+    .replace(/\.git$/, "")
+    .split("/")
+    .slice(1);
+  if (segments.length !== 2 || !segments.every((segment) => /^[A-Za-z0-9_.-]+$/.test(segment))) return undefined;
+  return `https://github.com/${segments.join("/")}`;
+}
+
+function isGitBranchName(branch: string): boolean {
+  return spawnSync("git", ["check-ref-format", "--branch", branch], { stdio: "ignore" }).status === 0;
+}
+
+function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
+  const rawRepo = env.RENDER_DEPLOY_REPO?.trim();
+  const repo = rawRepo ? githubRepoUrl(rawRepo) : undefined;
   const branch = env.RENDER_DEPLOY_BRANCH?.trim();
   const commit = env.RENDER_DEPLOY_COMMIT?.trim();
   const minioServiceId = env.RENDER_MINIO_SERVICE_ID?.trim() || "";
-  if (Boolean(repo) !== Boolean(branch))
+  if (Boolean(rawRepo) !== Boolean(branch))
     throw new Error("RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH must be set together");
-  if (
-    repo &&
-    (!/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ||
-      repo.split("/").some((part) => part === "." || part === ".."))
-  )
+  if (rawRepo && !repo)
     throw new Error("RENDER_DEPLOY_REPO must be an HTTPS GitHub repository URL without credentials");
-  if (
-    branch &&
-    (/[\x00-\x20\x7f~^:?*[\\]/.test(branch) ||
-      branch.includes("..") ||
-      branch.includes("@{") ||
-      branch === "@" ||
-      branch.startsWith("-") ||
-      branch.endsWith(".") ||
-      branch.split("/").some((part) => !part || part.startsWith(".") || part.endsWith(".lock")))
-  )
-    throw new Error("RENDER_DEPLOY_BRANCH must be a valid Git branch name");
+  if (branch && !isGitBranchName(branch)) throw new Error("RENDER_DEPLOY_BRANCH must be a valid Git branch name");
   if (env.DEPLOY_PROVIDER === "render" && (!repo || !branch || !/^[a-f0-9]{40}$/.test(commit ?? "")))
     throw new Error(
       "DEPLOY_PROVIDER=render requires RENDER_DEPLOY_REPO, RENDER_DEPLOY_BRANCH, and RENDER_DEPLOY_COMMIT",

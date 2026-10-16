@@ -1,7 +1,14 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { appPrefixOf, renderPlanId, updateConfigUrls, type QmConfig, type RenderConfig } from "../config.ts";
+import {
+  appPrefixOf,
+  githubRepoUrl,
+  renderPlanId,
+  updateConfigUrls,
+  type QmConfig,
+  type RenderConfig,
+} from "../config.ts";
 import {
   deploymentLayerRequest,
   httpDeploymentLayerTransport,
@@ -11,10 +18,16 @@ import {
 import { CliError, errMessage, note, ok, step } from "../log.ts";
 import { renderMinioCommand, renderMinioInitCommand } from "../render-minio.ts";
 import type { ResolvedPlugin } from "../plugins.ts";
-import { renderServiceEnv, renderWorkloads, type RenderBuild } from "../render-services.ts";
+import {
+  renderManagedCoreEnv,
+  renderServiceEnv,
+  renderStorageEnv,
+  renderWorkloads,
+  type RenderBuild,
+} from "../render-services.ts";
 import { computedSecrets, runtimeSecretNames } from "../secrets.ts";
 import { serviceHost } from "../services.ts";
-import { withRenderLock } from "../render-lock.ts";
+import { withDeploymentLock } from "../state.ts";
 import { capture, deploymentSecretValue, isInvalidSecret, sleep } from "../util.ts";
 import { doctorCommon, localDoctorSecrets } from "./doctor.ts";
 import type { DeployContext } from "./registry.ts";
@@ -104,6 +117,7 @@ interface RenderDeploy {
 }
 const bootstrapCommand = "/bin/sh -c exit 0";
 const failedDeployStatuses = ["build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"];
+type Collection = "projects" | "postgres" | "services";
 interface Project {
   id: string;
   name: string;
@@ -126,7 +140,7 @@ interface State {
   postgresId?: string;
   services: Record<string, SavedService>;
   pendingPurge?: boolean;
-  pendingCreate?: string;
+  pendingCreate?: { collection: Collection; name: string };
   releases?: Release[];
   releaseCount?: number;
   updateInProgress?: boolean;
@@ -206,6 +220,9 @@ class RenderApiError extends CliError {
       `Render ${method} ${path.split("?")[0]} failed (HTTP ${status})${detail ? `: ${detail}` : ""}${requestId ? ` [request id ${requestId}]` : ""}`,
     );
     this.status = status;
+  }
+  get rejected(): boolean {
+    return this.status >= 400 && this.status < 500 && this.status !== 408 && this.status !== 429;
   }
 }
 const RENDER_ATTEMPTS = 4;
@@ -301,7 +318,7 @@ function saveState(ctx: DeployContext, state: State): void {
   renameSync(`${path}.tmp`, path);
 }
 const locked = <T>(ctx: DeployContext, operation: () => Promise<T>): Promise<T> =>
-  withRenderLock(join(ctx.configDir, ".render.lock"), operation);
+  withDeploymentLock(join(ctx.configDir, ".render.lock"), operation);
 function credentialValues(ctx: DeployContext, envFile = ctx.envFile): Map<string, string> {
   const values = localDoctorSecrets(ctx.configDir, envFile);
   for (const secret of computedSecrets(ctx.config)) {
@@ -478,10 +495,7 @@ async function assertAvailable(
 }
 async function recoverPendingCreate(ctx: DeployContext, request: RenderRequest, state: State): Promise<void> {
   if (!state.pendingCreate) return;
-  const pending = /^\/(projects|postgres|services): (.+)$/.exec(state.pendingCreate);
-  if (!pending) throw new CliError("The saved Render creation request is invalid; restore render.resources.json");
-  const collection = pending[1] as "projects" | "postgres" | "services";
-  const name = pending[2]!;
+  const { collection, name } = state.pendingCreate;
   const component = name.slice(state.appPrefix.length + 1);
   const desiredType =
     collection === "services" ? workloads(ctx).find((item) => item.name === component)?.type : undefined;
@@ -738,17 +752,17 @@ async function createResource<T>(
   ctx: DeployContext,
   request: RenderRequest,
   state: State,
-  path: string,
-  body: Record<string, unknown>,
+  collection: Collection,
+  body: Record<string, unknown> & { name: string },
 ): Promise<T> {
-  state.pendingCreate = `${path}: ${String(body.name)}`;
+  state.pendingCreate = { collection, name: body.name };
   saveState(ctx, state);
   try {
-    const created = await request<T>(path, "POST", body);
+    const created = await request<T>(`/${collection}`, "POST", body);
     delete state.pendingCreate;
     return created;
   } catch (error) {
-    if (error instanceof RenderApiError && error.status >= 400 && error.status < 500 && error.status !== 408) {
+    if (error instanceof RenderApiError && error.rejected) {
       delete state.pendingCreate;
       saveState(ctx, state);
     }
@@ -765,7 +779,7 @@ async function provision(
   if (!state.projectId) {
     const name = `${state.appPrefix}-qm`;
     await assertAvailable(request, "/projects", "project", name, state.workspaceId);
-    const project = await createResource<Project>(ctx, request, state, "/projects", {
+    const project = await createResource<Project>(ctx, request, state, "projects", {
       name,
       ownerId: state.workspaceId,
       environments: [{ name: "production" }],
@@ -786,7 +800,7 @@ async function provision(
   if (!state.postgresId) {
     const name = `${state.appPrefix}-pg`;
     await assertAvailable(request, "/postgres", "postgres", name, state.workspaceId);
-    const postgres = await createResource<RenderPostgres>(ctx, request, state, "/postgres", {
+    const postgres = await createResource<RenderPostgres>(ctx, request, state, "postgres", {
       name,
       ownerId: state.workspaceId,
       environmentId: state.environmentId,
@@ -908,10 +922,7 @@ async function reconcileService(
     }
   }
   const buildChanged =
-    (service.repo ?? "")
-      .replace(/\/$/, "")
-      .replace(/\.git$/, "")
-      .toLowerCase() !== workload.source.repo.toLowerCase() ||
+    githubRepoUrl(service.repo ?? "")?.toLowerCase() !== workload.source.repo.toLowerCase() ||
     service.branch !== workload.source.branch ||
     !!service.rootDir ||
     details.envSpecificDetails.dockerfilePath !== workload.dockerfile ||
@@ -980,19 +991,7 @@ export function renderConfigErrors(
   if (config.skills.length) add("Place extra Render deployment skills in sandbox/skills instead of skills[]");
   if (config.vms && Object.keys(config.vms).length)
     add("Use render.corePlan and render.servicePlan instead of vms for Render");
-  const managed = {
-    DATA_DIR: "/data",
-    SESSION_STORE: "postgres",
-    RUN_STORE: "postgres",
-    WORKSPACE_STORE: "postgres",
-    SNAPSHOT_STORE: "s3",
-    TRANSFER_STORE: "s3",
-    SANDBOX_BACKEND: "render",
-    DEPLOY_PROVIDER: "render",
-    RENDER_WORKSPACE_ID: config.render?.workspaceId ?? "",
-    RENDER_REGION: config.render?.region ?? "",
-    RENDER_APP_REGION: config.render?.appRegion ?? config.render?.region ?? "",
-  };
+  const managed = config.render ? renderManagedCoreEnv(config.render) : {};
   for (const [key, value] of Object.entries(managed)) {
     if (config.env.core?.[key] !== undefined && config.env.core[key] !== value)
       add(`Render requires env.core.${key}=${value}`);
@@ -1015,13 +1014,7 @@ export function renderConfigErrors(
       add(`Render derives core ${key}; remove its env or secretEnv entry`);
   }
   for (const key of [
-    "S3_BUCKET",
-    "S3_REGION",
-    "S3_FORCE_PATH_STYLE",
-    "AWS_ENDPOINT_URL_S3",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
+    ...Object.keys(renderStorageEnv()),
     "MINIO_ROOT_USER",
     "MINIO_ROOT_PASSWORD",
     "QM_STORAGE_SECRET_KEY",
@@ -1107,7 +1100,7 @@ export function createRenderBackend(ctx: DeployContext): Backend {
             const name = `${state.appPrefix}-${workload.name}`;
             await assertAvailable(request, "/services", "service", name, state.workspaceId);
             env = serviceEnv(ctx, workload, values, connections, state, services, env);
-            const result = await createResource<{ service: RenderService }>(ctx, request, state, "/services", {
+            const result = await createResource<{ service: RenderService }>(ctx, request, state, "services", {
               type: workload.type,
               name,
               ownerId: state.workspaceId,

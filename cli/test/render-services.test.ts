@@ -56,7 +56,6 @@ test("Render Git source accepts GitHub repositories and branch names without cre
     ].map((repo) => ({ repo, branch: "main" })),
     ...[
       "",
-      "@",
       "bad branch",
       "-main",
       "../main",

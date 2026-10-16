@@ -20,7 +20,7 @@ import {
   SANDBOX_BACKEND_POLICY,
   targetsAllowingSandboxBackend,
 } from "./providers.ts";
-import { envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
+import { capture, envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
 
 export const CONFIG_FILENAME = "qm.config.jsonc";
 
@@ -1517,40 +1517,40 @@ function validateAws(
   return out;
 }
 
+export function githubRepoUrl(value: string): string | undefined {
+  const url = URL.parse(value.trim());
+  if (!url || url.protocol !== "https:" || url.host !== "github.com") return undefined;
+  if (url.username || url.password || url.search || url.hash) return undefined;
+  const segments = url.pathname
+    .replace(/\/$/, "")
+    .replace(/\.git$/, "")
+    .split("/")
+    .slice(1);
+  if (segments.length !== 2 || !segments.every((segment) => /^[A-Za-z0-9_.-]+$/.test(segment))) return undefined;
+  return `https://github.com/${segments.join("/")}`;
+}
+
+export function isGitBranchName(branch: string): boolean {
+  try {
+    capture("git", ["check-ref-format", "--branch", branch]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function renderSource(raw: unknown, path: string): NonNullable<RenderConfig["source"]> {
   if (!isPlainObject(raw) || Object.keys(raw).some((key) => !["repo", "branch"].includes(key)))
     throw new CliError(`${path}: render.source must contain repo and branch`);
-  const repo =
-    typeof raw.repo === "string"
-      ? raw.repo
-          .trim()
-          .replace(/\/$/, "")
-          .replace(/\.git$/, "")
-      : "";
-  if (
-    !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ||
-    repo
-      .split("/")
-      .slice(-2)
-      .some((part) => [".", ".."].includes(part))
-  )
+  const repo = typeof raw.repo === "string" ? githubRepoUrl(raw.repo) : undefined;
+  if (!repo)
     throw new CliError(`${path}: render.source.repo must be an HTTPS GitHub repository URL without credentials`);
   const branch = typeof raw.branch === "string" ? raw.branch.trim() : "";
-  if (
-    !branch ||
-    branch === "@" ||
-    /[\x00-\x20\x7f~^:?*[\\]/.test(branch) ||
-    branch.startsWith("-") ||
-    branch.includes("..") ||
-    branch.includes("@{") ||
-    branch.endsWith(".") ||
-    branch.split("/").some((part) => !part || part.startsWith(".") || part.endsWith(".lock"))
-  )
-    throw new CliError(`${path}: render.source.branch must be a Git branch name`);
+  if (!isGitBranchName(branch)) throw new CliError(`${path}: render.source.branch must be a Git branch name`);
   return { repo, branch };
 }
 
-const legacyRenderPlans: Record<string, string> = {
+const retiredRenderPlans: Record<string, string> = {
   starter: "0.5c-512mb",
   standard: "1c-2g",
   pro: "2c-4g",
@@ -1559,8 +1559,8 @@ const legacyRenderPlans: Record<string, string> = {
   pro_ultra: "8c-32g",
 };
 
-export function renderPlanId(plan: unknown): unknown {
-  return typeof plan === "string" ? (legacyRenderPlans[plan] ?? plan) : plan;
+export function renderPlanId(plan: string): string {
+  return retiredRenderPlans[plan] ?? plan;
 }
 
 function validateRender(raw: unknown, path: string): RenderConfig {
@@ -1585,9 +1585,16 @@ function validateRender(raw: unknown, path: string): RenderConfig {
   for (const key of Object.keys(storageRaw)) {
     if (!["type", "plan", "diskSizeGB"].includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
   }
-  const storagePlan = renderPlanId(storageRaw.plan ?? "0.5c-512mb");
-  if (typeof storagePlan !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(storagePlan) || storagePlan === "free")
-    throw new CliError(`${path}: render.storage.plan must name a paid Render plan`);
+  const plan = (key: string, value: unknown, compute = true): string => {
+    if (compute && typeof value === "string" && retiredRenderPlans[value])
+      throw new CliError(
+        `${path}: render.${key} ${value} is a retired Render plan name; use ${retiredRenderPlans[value]}`,
+      );
+    if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free")
+      throw new CliError(`${path}: render.${key} must name a paid Render plan`);
+    return value;
+  };
+  const storagePlan = plan("storage.plan", storageRaw.plan ?? "0.5c-512mb");
   const diskSizeGB = storageRaw.diskSizeGB ?? 10;
   if (typeof diskSizeGB !== "number" || !Number.isInteger(diskSizeGB) || diskSizeGB < 1 || diskSizeGB > 1000)
     throw new CliError(`${path}: render.storage.diskSizeGB must be an integer from 1 to 1000`);
@@ -1604,13 +1611,6 @@ function validateRender(raw: unknown, path: string): RenderConfig {
   const appRegion = raw.appRegion;
   if (appRegion !== undefined && (typeof appRegion !== "string" || !regions.includes(appRegion)))
     throw new CliError(`${path}: render.appRegion must be a Render region`);
-  const plan = (key: string, fallback: string, compute = true): string => {
-    const value = compute ? renderPlanId(raw[key] ?? fallback) : (raw[key] ?? fallback);
-    if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free") {
-      throw new CliError(`${path}: render.${key} must name a paid Render plan`);
-    }
-    return value;
-  };
   const postgresDiskSizeGB = raw.postgresDiskSizeGB ?? 10;
   if (
     typeof postgresDiskSizeGB !== "number" ||
@@ -1629,9 +1629,9 @@ function validateRender(raw: unknown, path: string): RenderConfig {
     workspaceId,
     region: region as RenderConfig["region"],
     ...(appRegion === undefined ? {} : { appRegion: appRegion as RenderConfig["region"] }),
-    corePlan: plan("corePlan", "2c-4g"),
-    servicePlan: plan("servicePlan", "0.5c-512mb"),
-    postgresPlan: plan("postgresPlan", "0.5c-1g", false),
+    corePlan: plan("corePlan", raw.corePlan ?? "2c-4g"),
+    servicePlan: plan("servicePlan", raw.servicePlan ?? "0.5c-512mb"),
+    postgresPlan: plan("postgresPlan", raw.postgresPlan ?? "0.5c-1g", false),
     postgresDiskSizeGB,
   };
 }

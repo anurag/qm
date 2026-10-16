@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import {
   chmodSync,
@@ -11,7 +10,6 @@ import {
   readFileSync,
   rmSync,
   utimesSync,
-  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -170,7 +168,7 @@ function cloud(t: TestContext, d: Deployment) {
             .map((project) => ({ project, cursor: project.id })),
         );
       assert.deepEqual(body, { name: "acme-qm", ownerId: "tea-acme", environments: [{ name: "production" }] });
-      assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+      assert.deepEqual(d.saved().pendingCreate, { collection: "projects", name: "acme-qm" });
       const project = { id: "prj-acme", name: body.name, owner: { id: body.ownerId }, environmentIds: ["evm-acme"] };
       state.projects.set(project.id, project);
       return Response.json(project);
@@ -497,129 +495,32 @@ test("Render plan needs no API calls, Git repository, or state file", async (t) 
   assert.equal(existsSync(join(d.ctx.configDir, "render.resources.json")), false);
 });
 
-for (const pid of [undefined, "invalid", "0"]) {
-  test(`Render recovers an old lock with PID ${pid ?? "missing"}`, async (t) => {
-    const d = deployment(t);
-    const path = join(d.ctx.configDir, ".render.lock");
-    mkdirSync(path);
-    if (pid !== undefined) writeFileSync(join(path, "pid"), pid);
-    const expired = new Date(Date.now() - 10_000);
-    utimesSync(path, expired, expired);
-    await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
-    assert.equal(existsSync(path), false);
-  });
-}
+test("Render config rejects retired compute plan names and names their replacements", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-render-plans-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const raw = parseConfigJson(renderScaffold.renderConfig("acme", "anthropic", "resend")) as Record<string, any>;
+  raw.render.workspaceId = "tea-acme";
+  raw.render.postgresPlan = "standard";
+  delete raw.modelProvider;
+  delete raw.secretEnv;
+  const configPath = join(dir, "qm.config.jsonc");
+  const load = (render: Record<string, unknown>) => {
+    writeFileSync(configPath, JSON.stringify({ ...raw, render: { ...raw.render, ...render } }));
+    return loadConfigAt(configPath).config.render!;
+  };
+  assert.equal(load({}).postgresPlan, "standard");
+  assert.throws(
+    () => load({ corePlan: "standard" }),
+    /render\.corePlan standard is a retired Render plan name; use 1c-2g/,
+  );
+  assert.throws(() => load({ servicePlan: "starter" }), /render\.servicePlan starter is a retired.*use 0\.5c-512mb/);
+  assert.throws(() => load({ storage: { plan: "pro" } }), /render\.storage\.plan pro is a retired.*use 2c-4g/);
+});
 
 function hurryLockClock(t: TestContext): void {
   let now = Date.now();
   t.mock.method(Date, "now", () => (now += 1_000));
 }
-
-test("Render waits for a lock whose owner recorded no PID and reclaims it once it is stale", async (t) => {
-  const d = deployment(t);
-  const path = join(d.ctx.configDir, ".render.lock");
-  mkdirSync(path);
-  writeFileSync(join(path, "owner-unknown"), "not a pid");
-  let waited = 0;
-  const now = Date.now;
-  t.mock.method(Date, "now", () => now() + 1_000 * waited++);
-  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
-  assert.ok(waited > 5);
-  assert.equal(existsSync(path), false);
-});
-
-test("Render keeps waiting when a lock owner disappears during the probe", async (t) => {
-  const d = deployment(t);
-  const path = join(d.ctx.configDir, ".render.lock");
-  mkdirSync(path);
-  symlinkSync(join(path, "missing"), join(path, "owner-releasing"));
-  hurryLockClock(t);
-  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
-  assert.deepEqual(readdirSync(path), ["owner-releasing"]);
-});
-
-test("Render waits for a lock holder that releases normally", { timeout: 10_000 }, async (t) => {
-  const d = deployment(t);
-  const path = join(d.ctx.configDir, ".render.lock");
-  const child = spawn(
-    process.execPath,
-    [
-      "--input-type=module",
-      "-e",
-      `import { withRenderLock } from ${JSON.stringify(new URL("../src/render-lock.ts", import.meta.url).href)};
-await withRenderLock(${JSON.stringify(path)}, async () => {
-  process.send("locked");
-  await new Promise((resolve) => setTimeout(resolve, 400));
-});`,
-    ],
-    { stdio: ["ignore", "ignore", "inherit", "ipc"] },
-  );
-  const exited = once(child, "exit");
-  t.after(async () => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    await exited;
-  });
-  const [message] = await once(child, "message");
-  assert.equal(message, "locked");
-  assert.match(readdirSync(path)[0]!, /^owner-/);
-  await assert.rejects(async () => d.backend.down({}), /No Render resource record exists/);
-  assert.equal(existsSync(path), false);
-  assert.deepEqual(await exited, [0, null]);
-});
-
-test("Render config normalizes legacy compute plan names to plan IDs", (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-render-plans-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const raw = parseConfigJson(renderScaffold.renderConfig("acme", "anthropic", "resend")) as Record<string, any>;
-  raw.render.workspaceId = "tea-acme";
-  raw.render.corePlan = "standard";
-  raw.render.servicePlan = "starter";
-  raw.render.postgresPlan = "standard";
-  raw.render.storage = { plan: "pro" };
-  delete raw.modelProvider;
-  delete raw.secretEnv;
-  const configPath = join(dir, "qm.config.jsonc");
-  writeFileSync(configPath, JSON.stringify(raw));
-  const render = loadConfigAt(configPath).config.render!;
-  assert.equal(render.corePlan, "1c-2g");
-  assert.equal(render.servicePlan, "0.5c-512mb");
-  assert.equal(render.storage.plan, "2c-4g");
-  assert.equal(render.postgresPlan, "standard");
-});
-
-test("Render keeps a lock when its owner cannot be probed", async (t) => {
-  const d = deployment(t);
-  const path = join(d.ctx.configDir, ".render.lock");
-  mkdirSync(path);
-  writeFileSync(join(path, "pid"), String(process.pid));
-  t.mock.method(process, "kill", () => {
-    throw Object.assign(new Error("Operation not permitted"), { code: "EPERM" });
-  });
-  hurryLockClock(t);
-  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
-  assert.equal(readFileSync(join(path, "pid"), "utf8"), String(process.pid));
-});
-
-test("Render stale recovery preserves a replacement lock owner", async (t) => {
-  const d = deployment(t);
-  const path = join(d.ctx.configDir, ".render.lock");
-  mkdirSync(path);
-  hurryLockClock(t);
-  const stalePid = process.pid + 1;
-  writeFileSync(join(path, "pid"), String(stalePid));
-  const replacement = `owner-${randomUUID()}`;
-  const kill = process.kill;
-  t.mock.method(process, "kill", (pid: number, signal?: number | NodeJS.Signals) => {
-    if (pid !== stalePid) return kill(pid, signal);
-    rmSync(path, { recursive: true });
-    mkdirSync(path);
-    writeFileSync(join(path, replacement), String(process.pid));
-    throw Object.assign(new Error("No such process"), { code: "ESRCH" });
-  });
-  await assert.rejects(async () => d.backend.down({}), /Another qm operation holds/);
-  assert.deepEqual(readdirSync(path), [replacement]);
-  assert.equal(readFileSync(join(path, replacement), "utf8"), String(process.pid));
-});
 
 test("Render protects a live owner and recovers its lock after SIGKILL", { timeout: 10_000 }, async (t) => {
   const d = deployment(t);
@@ -883,7 +784,7 @@ for (const failure of ["connection closed", "HTTP 503"]) {
         return new Response(null, { status: 503 });
       };
       await assert.rejects(d.backend.up({ dryRun: false }), new RegExp(failure));
-      assert.ok(d.saved().pendingCreate.startsWith(`${path}: `));
+      assert.equal(d.saved().pendingCreate.collection, path.slice(1));
       c.intercept = undefined;
       const backend = hostingProvider("render").createBackend(d.ctx);
       await backend.up({ dryRun: false });
@@ -929,7 +830,7 @@ test("Render retains the creation request when its recovery lookup fails", async
     path === "/projects" && method === "GET" ? new Response(null, { status: 503 }) : undefined;
   const mark = c.calls.length;
   await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
-  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.deepEqual(d.saved().pendingCreate, { collection: "projects", name: "acme-qm" });
   assert.deepEqual(writes(c.calls.slice(mark)), []);
   c.intercept = undefined;
   await d.backend.up({ dryRun: false });
@@ -949,7 +850,7 @@ test("Render retains the creation request when its recovery lookup returns an em
   const mark = c.calls.length;
   await assert.rejects(d.backend.up({ dryRun: false }), /invalid list response/);
   await assert.rejects(async () => d.backend.down({ purge: true }), /invalid list response/);
-  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.deepEqual(d.saved().pendingCreate, { collection: "projects", name: "acme-qm" });
   assert.deepEqual(writes(c.calls.slice(mark)), []);
 });
 
@@ -967,7 +868,7 @@ test("Render records a resource after its accepted creation response is lost", a
     throw new TypeError("connection closed");
   };
   await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
-  assert.equal(d.saved().pendingCreate, "/projects: acme-qm");
+  assert.deepEqual(d.saved().pendingCreate, { collection: "projects", name: "acme-qm" });
   c.intercept = undefined;
   const mark = c.calls.length;
   await d.backend.up({ dryRun: false });
@@ -983,9 +884,10 @@ test("Render retries a resource creation rejected by rate limiting", async (t) =
   c.intercept = (call) =>
     call.path === "/services" && call.method === "POST" ? new Response(null, { status: 429 }) : undefined;
   await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 429/);
-  assert.equal(d.saved().pendingCreate, undefined);
+  assert.equal(d.saved().pendingCreate.collection, "services");
   c.intercept = undefined;
   await d.backend.up({ dryRun: false });
+  assert.equal(d.saved().pendingCreate, undefined);
   assert.equal(c.projects.size, 1);
   assert.equal(c.services.size, 3);
 });
@@ -1759,7 +1661,7 @@ test("Render records a service after its creation reply is lost and ignores same
   c.services.set("srv-elsewhere", { ...core, id: "srv-elsewhere", environmentId: "evm-other" });
   const state = d.saved();
   delete state.services.core;
-  state.pendingCreate = "/services: acme-core";
+  state.pendingCreate = { collection: "services", name: "acme-core" };
   writeFileSync(join(d.ctx.configDir, "render.resources.json"), JSON.stringify(state));
   const mark = c.calls.length;
   await d.backend.up({ dryRun: false });

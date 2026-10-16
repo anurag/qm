@@ -1,4 +1,4 @@
-import { securityScreenEnv, type QmConfig } from "./config.ts";
+import { securityScreenEnv, type QmConfig, type RenderConfig } from "./config.ts";
 import { CliError } from "./log.ts";
 import { discoverPlugins, type ResolvedPlugin } from "./plugins.ts";
 import { computedSecrets, runtimeSecretNames } from "./secrets.ts";
@@ -37,6 +37,34 @@ export function renderWorkloads(
 export interface RenderBuild {
   source: NonNullable<QmConfig["render"]>["source"];
   dockerfile: string;
+}
+
+export function renderManagedCoreEnv(render: RenderConfig): Record<string, string> {
+  return {
+    DATA_DIR: "/data",
+    SESSION_STORE: "postgres",
+    RUN_STORE: "postgres",
+    WORKSPACE_STORE: "postgres",
+    SNAPSHOT_STORE: "s3",
+    TRANSFER_STORE: "s3",
+    SANDBOX_BACKEND: "render",
+    DEPLOY_PROVIDER: "render",
+    RENDER_WORKSPACE_ID: render.workspaceId,
+    RENDER_REGION: render.region,
+    RENDER_APP_REGION: render.appRegion ?? render.region,
+  };
+}
+
+export function renderStorageEnv(storage?: { endpoint: string; secretKey: string }): Record<string, string> {
+  return {
+    S3_BUCKET: "qm-storage",
+    S3_REGION: "us-east-1",
+    S3_FORCE_PATH_STYLE: "true",
+    AWS_ENDPOINT_URL_S3: storage?.endpoint ?? "",
+    AWS_ACCESS_KEY_ID: "qm-storage",
+    AWS_SECRET_ACCESS_KEY: storage?.secretKey ?? "",
+    AWS_SESSION_TOKEN: "",
+  };
 }
 
 export function renderServiceEnv(
@@ -97,19 +125,9 @@ export function renderServiceEnv(
     Object.assign(out, {
       HARNESS: config.env.core?.HARNESS ?? "pi",
       ...securityScreenEnv(config),
-      DATA_DIR: "/data",
-      SESSION_STORE: "postgres",
-      RUN_STORE: "postgres",
-      WORKSPACE_STORE: "postgres",
-      SNAPSHOT_STORE: "s3",
-      TRANSFER_STORE: "s3",
+      ...renderManagedCoreEnv(render),
       DATABASE_URL: connections.databaseUrl,
       PUBLIC_API_URL: config.apiUrl,
-      SANDBOX_BACKEND: "render",
-      DEPLOY_PROVIDER: "render",
-      RENDER_WORKSPACE_ID: render.workspaceId,
-      RENDER_REGION: render.region,
-      RENDER_APP_REGION: render.appRegion ?? render.region,
       ...(connections.projectId ? { RENDER_PROJECT_ID: connections.projectId } : {}),
       ...(connections.minioServiceId ? { RENDER_MINIO_SERVICE_ID: connections.minioServiceId } : {}),
       ...(connections.postgresId ? { RENDER_POSTGRES_ID: connections.postgresId } : {}),
@@ -129,15 +147,7 @@ export function renderServiceEnv(
     if (!config.services.includes("slack")) {
       for (const key of ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET"]) out[key] = "";
     }
-    Object.assign(out, {
-      S3_BUCKET: "qm-storage",
-      S3_REGION: "us-east-1",
-      S3_FORCE_PATH_STYLE: "true",
-      AWS_ENDPOINT_URL_S3: connections.storage?.endpoint ?? "",
-      AWS_ACCESS_KEY_ID: "qm-storage",
-      AWS_SECRET_ACCESS_KEY: connections.storage?.secretKey ?? "",
-      AWS_SESSION_TOKEN: "",
-    });
+    Object.assign(out, renderStorageEnv(connections.storage));
   }
   if (service === "portal") {
     Object.assign(out, {
