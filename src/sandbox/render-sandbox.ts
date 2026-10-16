@@ -33,16 +33,11 @@ import {
   type SandboxHandle,
 } from "./sandbox.ts";
 import {
-  RenderCheckpointUnconfirmedError,
   RenderSnapshotGoneError,
   type RenderClient,
   type RenderSandboxInfo,
   type RenderSnapshot,
 } from "./render-client.ts";
-
-const UNCONFIRMED_CHECKPOINT_SKEW_MS = 60_000;
-const UNCONFIRMED_CHECKPOINT_SETTLE_MS = 5 * 60_000;
-const UNCONFIRMED_CHECKPOINT_EXPIRY_MS = 24 * 3600_000;
 
 interface RenderSandboxResources {
   sandboxId?: string;
@@ -51,14 +46,12 @@ interface RenderSandboxResources {
 
 export interface StoredRenderSandbox extends RenderSandboxResources {
   sandboxId: string;
-  discarded?: boolean;
   expiresAtMs: number;
   lastActivityMs: number;
   homeCheckpointAtMs?: number;
   homeDirty?: boolean;
   savedAtMs?: number;
   checkpointBehindHome?: boolean;
-  unconfirmedCheckpoints?: Array<{ sandboxId: string; requestedAtMs: number; lastRequestedAtMs: number }>;
   retiredResources?: RenderSandboxResources[];
   retirementError?: string;
   recoveryError?: string;
@@ -68,10 +61,17 @@ export interface StoredRenderScratch extends RenderSandboxInfo {
   cleanupPending?: boolean;
 }
 
+export interface StoredRenderCleanup {
+  resources: RenderSandboxResources[];
+  homeArchive?: boolean;
+  error?: string;
+}
+
 export interface RenderSandboxOptions extends BlobStagingOptions {
   client: RenderClient;
   store: DurableMap<StoredRenderSandbox>;
   scratchStore: DurableMap<StoredRenderScratch>;
+  cleanupStore: DurableMap<StoredRenderCleanup>;
   advisoryLock: AdvisoryLock;
   snapshots: HomeSnapshotStore;
   namePrefix?: string;
@@ -85,7 +85,7 @@ export interface RenderSandboxOptions extends BlobStagingOptions {
 }
 
 export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandboxOptions): Sandbox {
-  const { client, store, scratchStore, advisoryLock } = opts;
+  const { client, store, scratchStore, cleanupStore, advisoryLock } = opts;
   const prefix = opts.namePrefix ?? "qm";
   const homeDir = opts.homeDir ?? "/root";
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
@@ -127,7 +127,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     if (!scope) throw new Error(`Render sandbox scope is unknown: ${name}`);
     return scope;
   };
-  const cleanupOnly = (stored: StoredRenderSandbox): boolean => stored.discarded === true;
   const recentlySaved = (stored: StoredRenderSandbox): boolean =>
     stored.savedAtMs !== undefined && Date.now() - stored.savedAtMs < checkpointIntervalMs;
   const idFor = async (name: string): Promise<string> => {
@@ -139,7 +138,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     }
     const scope = scopeFor(name);
     const stored = await store.get(scope);
-    if (!stored || cleanupOnly(stored)) throw new Error(`Render sandbox is not provisioned: ${name}`);
+    if (!stored) throw new Error(`Render sandbox is not provisioned: ${name}`);
     if (Date.now() - stored.lastActivityMs >= 60_000) await store.merge(scope, { lastActivityMs: Date.now() });
     return stored.sandboxId;
   };
@@ -190,70 +189,7 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     if (resources.checkpoint) await client.deleteSnapshot(resources.checkpoint);
   }
 
-  const unconfirmed = (
-    stored: StoredRenderSandbox,
-    error: RenderCheckpointUnconfirmedError,
-  ): NonNullable<StoredRenderSandbox["unconfirmedCheckpoints"]> => {
-    const pending = stored.unconfirmedCheckpoints ?? [];
-    const earlier = pending.find((request) => request.sandboxId === error.sandboxId);
-    return [
-      ...pending.filter((request) => request !== earlier),
-      {
-        sandboxId: error.sandboxId,
-        requestedAtMs: Math.min(error.requestedAtMs, earlier?.requestedAtMs ?? Infinity),
-        lastRequestedAtMs: Math.max(error.requestedAtMs, earlier?.lastRequestedAtMs ?? 0),
-      },
-    ];
-  };
-
-  async function retireUnconfirmed(scope: string, stored: StoredRenderSandbox): Promise<StoredRenderSandbox> {
-    const pending = stored.unconfirmedCheckpoints ?? [];
-    if (!pending.length) return stored;
-    const known = new Set([
-      stored.checkpoint?.id,
-      ...(stored.retiredResources ?? []).map((resources) => resources.checkpoint?.id),
-    ]);
-    const strays: RenderSnapshot[] = [];
-    const remaining: typeof pending = [];
-    for (const request of pending) {
-      const age = Date.now() - request.lastRequestedAtMs;
-      let settled = false;
-      try {
-        const found = await client.findSnapshots(
-          request.sandboxId,
-          request.requestedAtMs - UNCONFIRMED_CHECKPOINT_SKEW_MS,
-        );
-        const unknown = found.filter((snapshot) => !known.has(snapshot.id));
-        const ready = unknown.filter((snapshot) => snapshot.status !== "creating");
-        for (const snapshot of ready) {
-          known.add(snapshot.id);
-          strays.push(snapshot);
-        }
-        settled = ready.length === unknown.length && age >= UNCONFIRMED_CHECKPOINT_SETTLE_MS;
-      } catch (error) {
-        reportError("unconfirmed_checkpoint_search_failed", error, scope);
-      }
-      if (settled) continue;
-      if (age < UNCONFIRMED_CHECKPOINT_EXPIRY_MS) remaining.push(request);
-      else
-        reportError(
-          "unconfirmed_checkpoint_abandoned",
-          new Error(`Render did not confirm the checkpoints of sandbox ${request.sandboxId} within a day`),
-          scope,
-        );
-    }
-    if (!strays.length && remaining.length === pending.length) return stored;
-    const retired = [...(stored.retiredResources ?? []), ...strays.map((checkpoint) => ({ checkpoint }))];
-    return (
-      (await store.merge(scope, {
-        unconfirmedCheckpoints: remaining.length ? remaining : undefined,
-        retiredResources: retired.length ? retired : undefined,
-      })) ?? stored
-    );
-  }
-
   async function cleanupRetired(scope: string, stored: StoredRenderSandbox): Promise<StoredRenderSandbox> {
-    stored = await retireUnconfirmed(scope, stored);
     const retired = [...(stored.retiredResources ?? [])];
     while (retired.length) {
       try {
@@ -271,17 +207,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     return stored;
   }
 
-  async function recoverStored(scope: string, stored: StoredRenderSandbox): Promise<StoredRenderSandbox | null> {
-    stored = await cleanupRetired(scope, stored);
-    if (!cleanupOnly(stored)) return stored;
-    if (stored.retiredResources?.length || stored.unconfirmedCheckpoints?.length)
-      throw new Error(
-        `Render sandbox cleanup is incomplete${stored.retirementError ? `: ${stored.retirementError}` : ""}`,
-      );
-    await store.delete(scope);
-    return null;
-  }
-
   const retire = (stored: StoredRenderSandbox, resources: RenderSandboxResources): RenderSandboxResources[] => [
     ...(stored.retiredResources ?? []),
     resources,
@@ -292,7 +217,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     stored: StoredRenderSandbox,
     active?: boolean,
   ): Promise<StoredRenderSandbox> {
-    if (cleanupOnly(stored)) throw new Error(`Render sandbox is not provisioned: ${scope}`);
     const live =
       active ??
       ((await hasLiveProcesses(stored.sandboxId)) || (await tryUse(nameFor(scope), async () => true)) === null);
@@ -336,9 +260,6 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
       const failed = await store.merge(scope, {
         recoveryError: errMessage(error),
         ...(snapshot ? { retiredResources: retire(stored, { checkpoint: snapshot }) } : {}),
-        ...(error instanceof RenderCheckpointUnconfirmedError
-          ? { unconfirmedCheckpoints: unconfirmed(stored, error) }
-          : {}),
       });
       if (homeError !== undefined) throw homeError;
       return failed ? cleanupRetired(scope, failed) : stored;
@@ -360,8 +281,12 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
 
   async function ensureResident(name: string, onStatus?: (text: string) => void): Promise<{ coldStart: boolean }> {
     const scope = scopeFor(name);
+    if ((await cleanupStore.get(scope))?.homeArchive)
+      await finishCleanup(scope).catch(async (error: unknown) => {
+        if ((await cleanupStore.get(scope))?.homeArchive) throw error;
+      });
     let stored = await store.get(scope);
-    if (stored) stored = await recoverStored(scope, stored);
+    if (stored) stored = await cleanupRetired(scope, stored);
     const info = stored ? await client.get(stored.sandboxId) : null;
     if (!stored || info?.status !== "running") return withUse(name, () => replace(scope, stored, info, onStatus));
     const running = stored;
@@ -477,25 +402,42 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     }
   }
 
+  async function finishCleanup(scope: string): Promise<void> {
+    let pending = await cleanupStore.get(scope);
+    if (!pending) return;
+    try {
+      if (pending.homeArchive) {
+        await opts.snapshots.delete?.(scope);
+        pending = { resources: pending.resources };
+        await cleanupStore.put(scope, pending);
+      }
+      while (pending.resources.length) {
+        await disposeResources(pending.resources[0]!);
+        pending = { resources: pending.resources.slice(1) };
+        await cleanupStore.put(scope, pending);
+      }
+      await cleanupStore.delete(scope);
+    } catch (error) {
+      reportError("retirement_failed", error, scope);
+      await cleanupStore.put(scope, { ...pending, error: errMessage(error) });
+      throw error;
+    }
+  }
+
   async function destroyScope(scope: string): Promise<void> {
     const name = nameFor(scope);
     return withLifecycle(name, () =>
       withUse(name, async () => {
         const stored = await store.get(scope);
-        if (!stored) return;
-        await disposeResources(resourcesFor(stored));
-        await opts.snapshots.delete?.(scope);
-        const discarded: StoredRenderSandbox = {
-          sandboxId: stored.sandboxId,
-          discarded: true,
-          expiresAtMs: stored.expiresAtMs,
-          lastActivityMs: 0,
-          retiredResources: stored.retiredResources,
-          unconfirmedCheckpoints: stored.unconfirmedCheckpoints,
-        };
-        await store.put(scope, discarded);
-        const cleaned = await cleanupRetired(scope, discarded);
-        if (!cleaned.retiredResources?.length && !cleaned.unconfirmedCheckpoints?.length) await store.delete(scope);
+        if (stored) {
+          const earlier = await cleanupStore.get(scope);
+          await cleanupStore.put(scope, {
+            resources: [...(earlier?.resources ?? []), resourcesFor(stored), ...(stored.retiredResources ?? [])],
+            homeArchive: true,
+          });
+          await store.delete(scope);
+        }
+        await finishCleanup(scope);
       }),
     );
   }
@@ -687,18 +629,16 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
         (stored.lastActivityMs <= cutoff ||
           stored.expiresAtMs <= Date.now() + expiryCheckpointWindowMs ||
           stale(stored));
+      for (const [scope] of await cleanupStore.entries())
+        await tryLock(lifecycleKey(nameFor(scope)), () => finishCleanup(scope)).catch(
+          swallowAs(`render-sandbox: finish cleanup of ${scope}`, undefined),
+        );
       for (const [scope, candidate] of await store.entries()) {
-        if (
-          !due(candidate) &&
-          !candidate.discarded &&
-          !candidate.retiredResources?.length &&
-          !candidate.unconfirmedCheckpoints?.length
-        )
-          continue;
+        if (!due(candidate) && !candidate.retiredResources?.length) continue;
         const name = nameFor(scope);
         await tryLock(lifecycleKey(name), async () => {
           let stored = await store.get(scope);
-          if (stored) stored = await recoverStored(scope, stored);
+          if (stored) stored = await cleanupRetired(scope, stored);
           if (!stored || !due(stored)) return;
           const info = await client.get(stored.sandboxId);
           if (info?.status !== "running") return;
@@ -727,14 +667,16 @@ export function createRenderSandbox(workspace: WorkspaceStore, opts: RenderSandb
     },
     async computerStatus(scope): Promise<ComputerStatus> {
       const stored = await store.get(scope);
-      if (!stored) return { machine: "no sandbox provisioned yet", provisioned: false, guestResponsive: false };
-      if (cleanupOnly(stored))
+      if (!stored) {
+        const pending = await cleanupStore.get(scope);
+        if (!pending) return { machine: "no sandbox provisioned yet", provisioned: false, guestResponsive: false };
         return {
           machine: "Render cleanup pending",
           provisioned: false,
           guestResponsive: false,
-          recovery: { strategy: "provider_snapshot", state: "cleanup_pending", error: stored.retirementError },
+          recovery: { strategy: "provider_snapshot", state: "cleanup_pending", error: pending.error },
         };
+      }
       const recovery = {
         strategy: "provider_snapshot" as const,
         ...(stored.checkpoint

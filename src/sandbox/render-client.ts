@@ -2,7 +2,7 @@ import { ClientError, Render, SandboxSnapshotNotFoundError, ServerError } from "
 import { randomUUID } from "node:crypto";
 import { dirname } from "node:path/posix";
 import { retryOperation, sleep, withAbort } from "../util/async.ts";
-import { errMessage, swallowAs } from "../util/errors.ts";
+import { swallowAs } from "../util/errors.ts";
 import { shq } from "../util/shell.ts";
 
 type RenderSandboxPlan = "starter" | "standard" | "pro";
@@ -50,7 +50,6 @@ export interface RenderClient {
   createSnapshot(sandboxId: string, name: string): Promise<RenderSnapshot>;
   getSnapshot(snapshot: RenderSnapshot): Promise<RenderSnapshot>;
   deleteSnapshot(snapshot: RenderSnapshot): Promise<void>;
-  findSnapshots(sourceSandboxId: string, sinceMs: number): Promise<RenderSnapshot[]>;
 }
 
 export interface SdkRenderClientOptions {
@@ -72,17 +71,6 @@ export class RenderSnapshotGoneError extends Error {
   constructor(snapshotId: string) {
     super(`Render checkpoint ${snapshotId} is no longer available`);
     this.name = "RenderSnapshotGoneError";
-  }
-}
-
-export class RenderCheckpointUnconfirmedError extends Error {
-  readonly sandboxId: string;
-  readonly requestedAtMs: number;
-  constructor(sandboxId: string, requestedAtMs: number, cause: unknown) {
-    super(`Render did not confirm a checkpoint of sandbox ${sandboxId}: ${errMessage(cause)}`, { cause });
-    this.name = "RenderCheckpointUnconfirmedError";
-    this.sandboxId = sandboxId;
-    this.requestedAtMs = requestedAtMs;
   }
 }
 
@@ -250,51 +238,18 @@ export function createSdkRenderClient(opts: SdkRenderClientOptions): RenderClien
       });
     },
     async createSnapshot(sandboxId, name) {
-      const requestedAtMs = Date.now();
-      try {
-        return normalizeSnapshot(
-          await retryOperation(() => api.snapshots.create({ sandboxId, kind: "filesystem", name }), "refused", {
-            ...sdkErrors,
-            timeoutMs: SUBMIT_TIMEOUT_MS,
-            onLate: (late) =>
-              discardLateCheckpoint(normalizeSnapshot(late)).catch(
-                swallowAs(`render-client: delete late checkpoint ${late.id}`, undefined),
-              ),
-          }),
-        );
-      } catch (error) {
-        if (error instanceof ClientError) throw error;
-        throw new RenderCheckpointUnconfirmedError(sandboxId, requestedAtMs, error);
-      }
+      return normalizeSnapshot(
+        await retryOperation(() => api.snapshots.create({ sandboxId, kind: "filesystem", name }), "refused", {
+          ...sdkErrors,
+          timeoutMs: SUBMIT_TIMEOUT_MS,
+          onLate: (late) =>
+            discardLateCheckpoint(normalizeSnapshot(late)).catch(
+              swallowAs(`render-client: delete late checkpoint ${late.id}`, undefined),
+            ),
+        }),
+      );
     },
     getSnapshot,
     deleteSnapshot,
-    async findSnapshots(sourceSandboxId, sinceMs) {
-      const control = { ...sdkErrors, timeoutMs: CONTROL_TIMEOUT_MS };
-      const found: RenderSnapshot[] = [];
-      for (const { sandboxGroup } of await retryOperation(() => api.listGroups(), "idempotent", control)) {
-        let cursor: string | undefined;
-        for (;;) {
-          const page = await retryOperation(
-            () =>
-              api.snapshots.list({
-                sandboxGroupId: sandboxGroup.id,
-                status: ["creating", "available"],
-                limit: 100,
-                ...(cursor ? { cursor } : {}),
-              }),
-            "idempotent",
-            control,
-          );
-          for (const { snapshot } of page)
-            if (snapshot.sourceSandboxId === sourceSandboxId && Date.parse(snapshot.requestedAt) >= sinceMs)
-              found.push(normalizeSnapshot(snapshot));
-          const last = page.at(-1);
-          if (page.length < 100 || !last?.cursor || Date.parse(last.snapshot.requestedAt) < sinceMs) break;
-          cursor = last.cursor;
-        }
-      }
-      return found;
-    },
   };
 }

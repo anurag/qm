@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   createRenderSandbox,
   type StoredRenderSandbox,
+  type StoredRenderCleanup,
   type StoredRenderScratch,
 } from "../src/sandbox/render-sandbox.ts";
 import { createMemoryMap } from "../src/persistence/durable-map.ts";
@@ -44,6 +45,7 @@ function setup(
   const blobTransfer = createLocalBlobTransferStore(join(dir, "blobs"));
   const store = createMemoryMap<StoredRenderSandbox>();
   const scratchStore = createMemoryMap<StoredRenderScratch>();
+  const cleanupStore = createMemoryMap<StoredRenderCleanup>();
   const advisoryLock = createMemoryAdvisoryLock();
   const snapshots = createMemorySnapshotStore();
   const errors: Array<{ code: string; message: string }> = [];
@@ -52,6 +54,7 @@ function setup(
       client,
       store,
       scratchStore,
+      cleanupStore,
       advisoryLock,
       blobTransfer,
       snapshots: snapshotStore,
@@ -69,6 +72,7 @@ function setup(
     http,
     store,
     scratchStore,
+    cleanupStore,
     make,
     scope,
     layers,
@@ -589,8 +593,8 @@ test("Render keeps a running process during monitor provisioning near sandbox ex
   assert.equal(fake.sandboxes.get(stored.sandboxId)?.status, "terminated");
 });
 
-test("Render keeps its record while the home archive cannot be deleted and removes both once it can", async (t) => {
-  const { make, fake, layers, store, scope, snapshots } = setup(t);
+test("Render keeps a cleanup record while the home archive cannot be deleted and finishes it once it can", async (t) => {
+  const { make, fake, layers, store, scope, snapshots, cleanupStore } = setup(t);
   let blocked = false;
   const sandbox = make({
     ...snapshots,
@@ -606,11 +610,15 @@ test("Render keeps its record while the home archive cannot be deleted and remov
   assert.ok(await readBackup(snapshots, scope));
   blocked = true;
   await assert.rejects(sandbox.destroyScope!(scope), /archive delete outage/);
-  assert.ok(await store.get(scope));
-  assert.ok(await readBackup(snapshots, scope));
-  blocked = false;
-  await sandbox.destroyScope!(scope);
   assert.equal(await store.get(scope), null);
+  assert.equal((await cleanupStore.get(scope))?.homeArchive, true);
+  assert.match((await cleanupStore.get(scope))!.error!, /archive delete outage/);
+  assert.ok(await readBackup(snapshots, scope));
+  await assert.rejects(sandbox.provision(layers), /archive delete outage/);
+  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "running");
+  blocked = false;
+  await sandbox.reapDeepIdle!(3600_000);
+  assert.equal(await cleanupStore.get(scope), null);
   assert.equal(await snapshots.open(scope), null);
   assert.equal(fake.snapshots.size, 0);
   assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "terminated");
@@ -775,98 +783,28 @@ test("Render stops saving an unchanged home that is too large for its archive", 
   assert.equal(natives, 1);
 });
 
-test("Render waits for a stray native checkpoint to finish before it deletes the checkpoint", async (t) => {
-  const { make, fake, layers, store, scope, errors } = setup(t);
+test("Render removes a destroyed scope at once and deletes a retired checkpoint that is still being created later", async (t) => {
+  const { make, fake, layers, store, scope, snapshots, cleanupStore } = setup(t);
   const sandbox = make();
   const handle = await sandbox.provision(layers);
-  const before = (await store.get(scope))!;
-  fake.loseCheckpointReply("creating");
   await sandbox.teardown(handle);
-  const stray = [...fake.snapshots.keys()].find((id) => id !== before.checkpoint!.id)!;
-  assert.ok(stray);
-  assert.equal((await store.get(scope))!.retirementError, undefined);
-  assert.equal(
-    errors.some((error) => error.code === "retirement_failed"),
-    false,
-  );
-  fake.snapshots.get(stray)!.status = "available";
-  await sandbox.persistHomeSnapshot!(scope);
-  assert.equal(fake.snapshots.has(stray), false);
-  assert.ok(fake.deleted.includes(stray));
-});
-
-test("Render removes a destroyed scope at once and deletes a checkpoint that was still being created later", async (t) => {
-  const { make, fake, layers, store, scope, snapshots } = setup(t);
-  let now = Date.now();
-  t.mock.method(Date, "now", () => now);
-  const sandbox = make();
-  const handle = await sandbox.provision(layers);
   const before = (await store.get(scope))!;
-  fake.loseCheckpointReply("creating");
-  await sandbox.teardown(handle);
-  const stray = [...fake.snapshots.keys()].find((id) => id !== before.checkpoint!.id)!;
-  await sandbox.destroyScope!(scope);
-  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "terminated");
-  assert.deepEqual([...fake.snapshots.keys()], [stray]);
-  assert.equal(await snapshots.open(scope), null);
-  assert.equal((await store.get(scope))!.discarded, true);
-  await assert.rejects(make().provision(layers), /cleanup is incomplete/);
-  fake.snapshots.get(stray)!.status = "available";
-  now += 6 * 60_000;
-  await make().reapDeepIdle!(3600_000);
+  const stray = await fake.client.createSnapshot(before.sandboxId, "qm-stray");
+  fake.snapshots.get(stray.id)!.status = "creating";
+  await store.merge(scope, { retiredResources: [{ checkpoint: { ...stray, status: "creating" } }] });
+  await assert.rejects(sandbox.destroyScope!(scope), /snapshot_creating/);
   assert.equal(await store.get(scope), null);
-  assert.equal(fake.snapshots.size, 0);
-});
-
-test("Render searches once more for an unconfirmed checkpoint before it gives up on it after a day", async (t) => {
-  const { make, fake, layers, store, scope, errors } = setup(t);
-  let now = Date.now();
-  t.mock.method(Date, "now", () => now);
-  const sandbox = make();
-  const handle = await sandbox.provision(layers);
-  const kept = (await store.get(scope))!.checkpoint!.id;
-  const find = fake.client.findSnapshots;
-  let visible = false;
-  fake.client.findSnapshots = async (sandboxId, sinceMs) => (visible ? find(sandboxId, sinceMs) : []);
-  fake.loseCheckpointReply();
-  await sandbox.teardown(handle);
-  assert.equal(fake.snapshots.size, 2);
-  visible = true;
-  now += 25 * 3600_000;
+  assert.equal(fake.sandboxes.get(before.sandboxId)?.status, "terminated");
+  assert.deepEqual([...fake.snapshots.keys()], [stray.id]);
+  assert.equal(await snapshots.open(scope), null);
+  assert.equal((await sandbox.computerStatus!(scope)).recovery?.state, "cleanup_pending");
+  const replacement = await make().provision(layers);
+  assert.equal(replacement.coldStart, true);
+  fake.snapshots.get(stray.id)!.status = "available";
   await make().reapDeepIdle!(3600_000);
-  assert.deepEqual([...fake.snapshots.keys()], [kept]);
-  assert.equal((await store.get(scope))!.unconfirmedCheckpoints, undefined);
-  assert.equal(
-    errors.some((error) => error.code === "unconfirmed_checkpoint_abandoned"),
-    false,
-  );
+  assert.equal(await cleanupStore.get(scope), null);
+  assert.equal(fake.snapshots.has(stray.id), false);
 });
-
-test("Render finds and deletes a native checkpoint whose creation reply was lost", async (t) => {
-  const { make, fake, layers, store, scope } = setup(t);
-  let now = Date.now();
-  t.mock.method(Date, "now", () => now);
-  const sandbox = make();
-  const handle = await sandbox.provision(layers);
-  const before = (await store.get(scope))!;
-  await sandbox.writeFile(handle, "work", "saved in the home backup");
-  fake.loseCheckpointReply();
-  await sandbox.teardown(handle);
-  const failed = (await store.get(scope))!;
-  assert.equal(failed.checkpoint?.id, before.checkpoint!.id);
-  assert.equal(failed.checkpointBehindHome, true);
-  assert.deepEqual(failed.unconfirmedCheckpoints, [
-    { sandboxId: before.sandboxId, requestedAtMs: now, lastRequestedAtMs: now },
-  ]);
-  assert.equal(failed.retiredResources, undefined);
-  assert.deepEqual([...fake.snapshots.keys()], [before.checkpoint!.id]);
-  assert.equal(fake.deleted.length, 1);
-  now += 6 * 60_000;
-  assert.deepEqual(await make().reapDeepIdle!(3600_000), { reaped: 0 });
-  assert.equal((await store.get(scope))!.unconfirmedCheckpoints, undefined);
-  assert.deepEqual([...fake.snapshots.keys()], [before.checkpoint!.id]);
-});
-
 test("Render saves portable files before it disposes a staged native snapshot", async (t) => {
   const { make, fake, layers, store, scope } = setup(t);
   const sandbox = make();

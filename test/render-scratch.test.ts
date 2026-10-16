@@ -11,6 +11,7 @@ import type { RenderClient, RenderSandboxInfo } from "../src/sandbox/render-clie
 import {
   createRenderSandbox,
   type StoredRenderSandbox,
+  type StoredRenderCleanup,
   type StoredRenderScratch,
 } from "../src/sandbox/render-sandbox.ts";
 import { SandboxProvisionCleanupError, type SandboxHandle } from "../src/sandbox/sandbox.ts";
@@ -22,6 +23,7 @@ function setup(t: TestContext) {
   const workspace = createLocalWorkspaceStore(dir);
   const store = createMemoryMap<StoredRenderSandbox>();
   const scratchStore = createMemoryMap<StoredRenderScratch>();
+  const cleanupStore = createMemoryMap<StoredRenderCleanup>();
   const advisoryLock = createMemoryAdvisoryLock();
   const snapshots = createMemorySnapshotStore();
   const bodies = new Map<string, RenderSandboxInfo>();
@@ -60,15 +62,13 @@ function setup(t: TestContext) {
     async deleteSnapshot() {
       throw new Error("Disposable sandboxes must not delete checkpoints");
     },
-    async findSnapshots() {
-      throw new Error("Disposable sandboxes must not find checkpoints");
-    },
   };
   const make = (backing = scratchStore, lock = advisoryLock) =>
     createRenderSandbox(workspace, {
       client,
       store,
       scratchStore: backing,
+      cleanupStore,
       advisoryLock: lock,
       snapshots,
       onError: ({ code }) => errors.push(code),

@@ -14,9 +14,13 @@ import { createRenderDeployArtifacts, type StoredRenderDeployCredential } from "
 import { createRenderAppDatabase, type StoredRenderAppDatabase } from "./deploy/render-app-database.ts";
 import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/render-app-storage.ts";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { S3Client } from "@aws-sdk/client-s3";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
-import { createRenderSandbox, type StoredRenderSandbox, type StoredRenderScratch } from "./sandbox/render-sandbox.ts";
+import {
+  createRenderSandbox,
+  type StoredRenderCleanup,
+  type StoredRenderSandbox,
+  type StoredRenderScratch,
+} from "./sandbox/render-sandbox.ts";
 import { createSdkRenderClient } from "./sandbox/render-client.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { flushErrorReporting, startTiming } from "../plugins/chassis/src/error-reporting.ts";
@@ -256,6 +260,7 @@ import {
   type StoredManagedAgentsSandbox,
 } from "./sandbox/managed-agents-sandbox.ts";
 import { createSdkManagedAgentsClient } from "./sandbox/managed-agents-client.ts";
+import { s3Client } from "./persistence/s3.ts";
 import { createS3SnapshotStore } from "./sandbox/home-snapshot.ts";
 import { createModalSandbox, type StoredModalSandbox } from "./sandbox/modal-sandbox.ts";
 import { createSdkModalClient } from "./sandbox/modal-client.ts";
@@ -824,12 +829,7 @@ export function buildApp(
     return config.databaseUrl;
   };
   const s3 = config.s3Endpoint
-    ? new S3Client({
-        ...(config.s3Region ? { region: config.s3Region } : {}),
-        endpoint: config.s3Endpoint,
-        forcePathStyle: config.s3ForcePathStyle,
-        requestChecksumCalculation: "WHEN_REQUIRED",
-      })
+    ? s3Client({ region: config.s3Region, endpoint: config.s3Endpoint, forcePathStyle: config.s3ForcePathStyle })
     : undefined;
   const s3Override = s3 ? { _client: s3 } : {};
   const workspace =
@@ -958,6 +958,7 @@ export function buildApp(
   const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
   const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
   const renderScratch = artifactMap<StoredRenderScratch>("render_scratch_bodies");
+  const renderCleanup = artifactMap<StoredRenderCleanup>("render_sandbox_cleanup");
   const buildE2b = (): Sandbox => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey) throw new Error("SANDBOX_BACKEND=e2b requires E2B_API_KEY");
@@ -1185,6 +1186,7 @@ export function buildApp(
       ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
       store: renderBodies,
       scratchStore: renderScratch,
+      cleanupStore: renderCleanup,
       snapshots: createS3SnapshotStore({
         bucket: config.s3Bucket,
         prefix: `${config.s3Prefix ?? ""}render-home`,
@@ -1243,20 +1245,16 @@ export function buildApp(
           ...(await environments.list()).map((environment) => environment.id),
         ],
         legacySandboxes: async () => {
-          const [e2b, modal, aws, render, superserve] = await Promise.all([
+          const [e2b, modal, aws, superserve] = await Promise.all([
             e2bBodies.entries(),
             modalBodies.entries(),
             awsBodies.entries(),
-            renderBodies.entries(),
             superserveBodies.entries(),
           ]);
           return [
             ...e2b.map(([scopeId, body]) => ({ scopeId, backend: "e2b" as const, machineId: body.sandboxId })),
             ...modal.map(([scopeId, body]) => ({ scopeId, backend: "modal" as const, machineId: body.sandboxId })),
             ...aws.map(([scopeId, body]) => ({ scopeId, backend: "aws" as const, machineId: body.microvmId })),
-            ...render
-              .filter(([, body]) => !body.discarded)
-              .map(([scopeId, body]) => ({ scopeId, backend: "render" as const, machineId: body.sandboxId })),
             ...superserve.map(([scopeId, body]) => ({
               scopeId,
               backend: "superserve" as const,

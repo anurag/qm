@@ -2,11 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import {
-  createSdkRenderClient,
-  RENDER_SCRIPT_DIR,
-  RenderCheckpointUnconfirmedError,
-} from "../src/sandbox/render-client.ts";
+import { createSdkRenderClient, RENDER_SCRIPT_DIR } from "../src/sandbox/render-client.ts";
 import { createFakeRender, serveFakeRenderApi } from "./support/fake-render.ts";
 
 const SPOOLED = new RegExp(`^timeout (\\d+) sh '${RENDER_SCRIPT_DIR.replaceAll(".", "\\.")}/[0-9a-f-]{36}\\.sh'$`);
@@ -228,19 +224,7 @@ test("Render SDK adapter retries a file transfer after an error response without
   assert.equal(attempts("POST /v1/sandboxes/sbx-test/files/download/token"), 2);
 });
 
-test("Render SDK adapter reports unconfirmed checkpoints and finds the snapshots of one sandbox in every group", async (t) => {
-  const since = Date.parse("2026-09-12T00:00:00Z");
-  const at = (offsetMs: number) => new Date(since + offsetMs).toISOString();
-  const entry = (id: string, source: string, offsetMs: number) => ({
-    snapshot: {
-      ...snapshot,
-      id,
-      sandboxGroupId: id.startsWith("snp-b") ? "sbg-b" : "sbg-a",
-      sourceSandboxId: source,
-      requestedAt: at(offsetMs),
-    },
-    cursor: id,
-  });
+test("Render SDK adapter rejects a checkpoint whose creation fails with the API's answer", async (t) => {
   const creations = [503, 409];
   t.mock.method(globalThis, "fetch", async (input: Request | string | URL, init?: RequestInit) => {
     const request = new Request(input, init);
@@ -249,35 +233,12 @@ test("Render SDK adapter reports unconfirmed checkpoints and finds the snapshots
       const status = creations.shift()!;
       return Response.json({ message: `injected ${status}` }, { status });
     }
-    if (url.pathname === "/v1/sandbox-groups")
-      return Response.json(["sbg-a", "sbg-b"].map((id) => ({ sandboxGroup: { id, ownerId: "tea-test" }, cursor: id })));
-    if (url.pathname === "/v1/sandbox-groups/sbg-a/snapshots") {
-      assert.deepEqual(url.searchParams.getAll("status"), ["creating", "available"]);
-      return Response.json([
-        entry("snp-new", "sbx-test", 10_000),
-        entry("snp-other", "sbx-other", 5_000),
-        entry("snp-old", "sbx-test", -3600_000),
-      ]);
-    }
-    if (url.pathname === "/v1/sandbox-groups/sbg-b/snapshots")
-      return Response.json([entry("snp-b", "sbx-test", 20_000)]);
     throw new Error(`Unexpected request ${request.method} ${url.pathname}`);
   });
   const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
-  const unconfirmed = await client.createSnapshot("sbx-test", "qm-test").catch((error: unknown) => error);
-  assert.ok(unconfirmed instanceof RenderCheckpointUnconfirmedError);
-  assert.equal(unconfirmed.sandboxId, "sbx-test");
-  assert.match(unconfirmed.message, /injected 503/);
-  const refused = await client.createSnapshot("sbx-test", "qm-test").catch((error: unknown) => error);
-  assert.ok(!(refused instanceof RenderCheckpointUnconfirmedError));
-  assert.match(String(refused), /injected 409/);
-  assert.deepEqual(
-    (await client.findSnapshots("sbx-test", since)).map((found) => [found.id, found.sandboxGroupId]),
-    [
-      ["snp-new", "sbg-a"],
-      ["snp-b", "sbg-b"],
-    ],
-  );
+  await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), /injected 503/);
+  await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), /injected 409/);
+  assert.deepEqual(creations, []);
 });
 
 test("Render SDK adapter retries sandbox and checkpoint creation only on 429", async (t) => {
@@ -352,11 +313,7 @@ test(
     const client = createSdkRenderClient({ apiKey: "secret", workspaceId: "tea-test" });
     await assert.rejects(client.create(), { name: "TimeoutError" });
     await cleaned.sandbox.promise;
-    await assert.rejects(
-      client.createSnapshot("sbx-test", "qm-test"),
-      (error: unknown) =>
-        error instanceof RenderCheckpointUnconfirmedError && (error.cause as Error).name === "TimeoutError",
-    );
+    await assert.rejects(client.createSnapshot("sbx-test", "qm-test"), { name: "TimeoutError" });
     await cleaned.checkpoint.promise;
     assert.deepEqual(deletes, ["available"]);
   },

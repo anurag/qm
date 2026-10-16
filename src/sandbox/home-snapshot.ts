@@ -113,7 +113,7 @@ export interface S3SnapshotStoreOptions {
 }
 
 export function createS3SnapshotStore(opts: S3SnapshotStoreOptions): HomeSnapshotStore {
-  const s3 = opts.s3 ?? s3Client(opts.region);
+  const s3 = opts.s3 ?? s3Client({ region: opts.region });
   const keyFor = opts.keyFor ?? ((scope: string): string => `${opts.prefix}/${encodeURIComponent(scope)}.tar`);
   const Bucket = opts.bucket;
   return {
@@ -305,7 +305,7 @@ export function createHomeSnapshotOps<S>(opts: HomeSnapshotOpsOptions<S>): HomeS
   return {
     async snapshotHome(scope, session): Promise<void> {
       const left = startClock();
-      const script = `cd ${shq(homeDir)} 2>/dev/null || exit 0; n=0; while :; do n=$((n + 1)); find . ${prune}\\( ! -type d -o -exec test -r {} \\; \\) -print0 > ${shq(listPath)} 2>/dev/null; tar --no-recursion --null -T ${shq(listPath)} -cf ${shq(homeTarPath)}; rc=$?; if [ "$rc" = 0 ] || [ "$n" -ge 3 ]; then break; fi; sleep 1; done; rm -f ${shq(listPath)}; exit $rc`;
+      const script = `cd ${shq(homeDir)} 2>/dev/null || exit 0; find . ${prune}\\( ! -type d -o -exec test -r {} \\; \\) -print0 > ${shq(listPath)} 2>/dev/null; tar --no-recursion --null -T ${shq(listPath)} -cf ${shq(homeTarPath)}; rc=$?; [ "$rc" = 1 ] && rc=0; rm -f ${shq(listPath)}; exit $rc`;
       try {
         const made = await run(session, script, 180_000, left);
         if (made.exitCode !== 0) throw new Error(`${label} snapshot tar failed: ${made.stderr.slice(0, 200)}`);

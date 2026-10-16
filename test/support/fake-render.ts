@@ -7,7 +7,6 @@ import { dirname, join } from "node:path";
 import type { TestContext } from "node:test";
 import {
   RENDER_SCRIPT_DIR,
-  RenderCheckpointUnconfirmedError,
   RenderSandboxGoneError,
   RenderSnapshotGoneError,
   type RenderClient,
@@ -166,7 +165,7 @@ export function createFakeRender() {
       if (loseCheckpointReply) {
         snapshot.status = loseCheckpointReply;
         loseCheckpointReply = undefined;
-        throw new RenderCheckpointUnconfirmedError(id, snapshot.capturedAtMs!, new Error("connection reset"));
+        throw new Error("connection reset");
       }
       return { ...snapshot };
     },
@@ -180,14 +179,6 @@ export function createFakeRender() {
       deleted.push(snapshot.id);
       snapshots.delete(snapshot.id);
       rmSync(join(root, snapshot.id), { recursive: true, force: true });
-    },
-    async findSnapshots(sourceSandboxId, sinceMs) {
-      return [...snapshots.values()]
-        .filter((snapshot) => {
-          const source = snapshotSources.get(snapshot.id);
-          return source?.sandboxId === sourceSandboxId && source.requestedAtMs >= sinceMs;
-        })
-        .map((snapshot) => ({ ...snapshot }));
     },
   };
   return {
