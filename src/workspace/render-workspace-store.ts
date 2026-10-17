@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { createPgPool, type PoolClient } from "../persistence/pg-pool.ts";
+import { createPgPool, withPgTransaction, type PoolClient } from "../persistence/pg-pool.ts";
 import type { ScopeId } from "../types.ts";
 import { createKeyedQueue } from "../util/async.ts";
 import { createLocalWorkspaceStore, safeJoin, type WorkspaceStore } from "./workspace-store.ts";
@@ -65,22 +65,10 @@ export function createRenderWorkspaceStore(rootDir: string, connectionString: st
     return path;
   };
   async function transaction<T>(scope: ScopeId, fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    const client = await (await db.pool()).connect();
-    let releaseError: Error | undefined;
-    try {
-      await client.query("BEGIN");
+    return withPgTransaction(await db.pool(), async (client) => {
       await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`render-workspace:${scope}`]);
-      const result = await fn(client);
-      await client.query("COMMIT");
-      return result;
-    } catch (error) {
-      await client.query("ROLLBACK").catch((rollbackError: unknown) => {
-        releaseError = rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError));
-      });
-      throw error;
-    } finally {
-      client.release(releaseError);
-    }
+      return fn(client);
+    });
   }
   async function clearShape(scope: ScopeId, path: string): Promise<void> {
     let dir = local.scopeDir(scope);
