@@ -98,6 +98,7 @@ export function rowToSession(r: Record<string, unknown>): Session {
     scopeId: r.scope_id as ScopeId,
     threadRef: r.thread_ref as string,
     ...(r.surface != null ? { surface: r.surface as string } : {}),
+    ...(r.client_tools ? { clientTools: r.client_tools as Session["clientTools"] } : {}),
     createdAt: Number(r.created_at),
     ...(r.title != null ? { title: r.title as string } : {}),
     ...(r.channel_name != null ? { channelName: r.channel_name as string } : {}),
@@ -863,6 +864,10 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
            )`,
         ],
       },
+      {
+        id: "sessions/store/0033-client-tools",
+        statements: [`ALTER TABLE sessions ADD COLUMN IF NOT EXISTS client_tools JSONB`],
+      },
     ],
     [
       {
@@ -1014,7 +1019,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
 
   return {
     leaseTtlMs,
-    async getOrCreateByThread(threadRef, type, scopeId, channelName, surface): Promise<Session> {
+    async getOrCreateByThread(threadRef, type, scopeId, channelName, surface, clientTools): Promise<Session> {
       const heal = async (row: Record<string, unknown>): Promise<Session> => {
         const s = rowToSession(row);
         if (channelName && s.channelName !== channelName) {
@@ -1035,11 +1040,12 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         scopeId,
         threadRef,
         createdAt: now(),
+        ...(clientTools?.length ? { clientTools: structuredClone(clientTools) } : {}),
         ...(channelName ? { channelName } : {}),
         ...(surface ? { surface } : {}),
       };
       await q(
-        "INSERT INTO sessions(id, type, scope_id, thread_ref, created_at, channel_name, surface, last_activity, messages, turns, origin, origin_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$5,0,0,$8,$9) ON CONFLICT (thread_ref) DO NOTHING",
+        "INSERT INTO sessions(id, type, scope_id, thread_ref, created_at, channel_name, surface, last_activity, messages, turns, origin, origin_id, client_tools) VALUES ($1,$2,$3,$4,$5,$6,$7,$5,0,0,$8,$9,$10::jsonb) ON CONFLICT (thread_ref) DO NOTHING",
         [
           session.id,
           session.type,
@@ -1050,6 +1056,7 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
           surface ?? null,
           sessionOrigin(threadRef),
           cronIdOf(threadRef),
+          clientTools?.length ? JSON.stringify(clientTools) : null,
         ],
       );
       const rows = await q("SELECT * FROM sessions WHERE thread_ref = $1", [threadRef]);
@@ -1569,6 +1576,19 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         sql += ` LIMIT $${params.length}`;
       }
       return (await q(sql, params)).map(rowToEntry).reverse();
+    },
+
+    async searchSessionTitles(principalId, query, limit = 20): Promise<Session[]> {
+      const needle = query.trim();
+      if (needle.length < 2) return [];
+      const like = `%${needle.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+      const rows = await q(
+        participantSessionsSql(" AND COALESCE(p.title, s.title) ILIKE $2") +
+          " ORDER BY COALESCE(s.last_activity, s.created_at) DESC, s.id LIMIT $3",
+        [principalId, like, Math.max(1, Math.min(Math.floor(limit), 100))],
+        { timeoutMs: SEARCH_TIMEOUT_MS },
+      );
+      return rows.map(rowToParticipantSession);
     },
 
     async searchEntries(principalId, query, limit = 40): Promise<EntrySearchHit[]> {

@@ -1,5 +1,9 @@
 import { codexAuthFileForEnv, loadCodexAuthFile } from "./model/chatgpt-auth-file.ts";
 import { RENDER_SANDBOX_TTL_SEC } from "./sandbox/render-client.ts";
+import {
+  deploymentBrokerCredentialsFromEnv,
+  type DeploymentBrokerCredential,
+} from "./credentials/deployment-credentials.ts";
 import { errMessage } from "./util/errors.ts";
 import { commitShaSchema } from "./util/ids.ts";
 import type { ExternalSlackPolicies } from "./resolution/external-slack.ts";
@@ -81,7 +85,7 @@ export interface Config {
   legacySandboxScopeDefaults?: LegacySandboxScopeDefaults;
   sandboxBackend: SandboxBackendName;
   sandboxSecondaryBackend?: SandboxBackendName;
-  deployProvider: "docker" | "aws" | "fly" | "porter" | "render";
+  deployProvider: "docker" | "aws" | "fly" | "porter" | "e2b" | "render";
   egressServiceHosts?: string[];
   brandingDefault?: OrgBranding;
   modelId?: string;
@@ -102,6 +106,7 @@ export interface Config {
   modelProvider?: ModelProvider;
   providerBaseUrls: ProviderBaseUrls;
   modelGateway?: ModelGatewayTransportConfig;
+  brokerCredentials?: DeploymentBrokerCredential[];
   piCaptureRequests: boolean;
   piSystemCacheSplit: boolean;
   adminGrants?: string;
@@ -921,6 +926,7 @@ const SHARED_PLATFORM_SUFFIXES = [
   "github.io",
   "pages.dev",
   "workers.dev",
+  "e2b.app",
 ];
 
 function sharedPlatformSuffixOf(domain: string): string | undefined {
@@ -1546,16 +1552,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     deployProvider !== "docker" &&
     deployProvider !== "fly" &&
     deployProvider !== "porter" &&
+    deployProvider !== "e2b" &&
     deployProvider !== "render"
   ) {
     throw new Error(
-      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, porter, or render)`,
+      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, porter, e2b, or render)`,
     );
   }
   let runStore: "memory" | "postgres" = env.SESSION_STORE === "postgres" ? "postgres" : "memory";
   if (env.RUN_STORE === "memory" || env.RUN_STORE === "postgres") runStore = env.RUN_STORE;
   const providerBaseUrls = providerBaseUrlsFromEnv(env);
   const modelGateway = modelGatewayFromEnv(env);
+  const brokerCredentials = deploymentBrokerCredentialsFromEnv(env);
   const claudeProcessEnv = Object.fromEntries(
     [
       "PATH",
@@ -1653,6 +1661,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(modelProvider ? { modelProvider } : {}),
     providerBaseUrls,
     ...(modelGateway ? { modelGateway } : {}),
+    ...(brokerCredentials.length ? { brokerCredentials } : {}),
     ...(env.TRUSTED_OIDC_ADMIN_ISSUER ? { trustedOidcAdminIssuer: env.TRUSTED_OIDC_ADMIN_ISSUER } : {}),
     ...(env.ADMIN_GRANTS ? { adminGrants: env.ADMIN_GRANTS } : {}),
     ...(env.AUTH_ALLOWED_EMAILS

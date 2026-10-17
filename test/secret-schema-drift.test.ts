@@ -149,6 +149,12 @@ test("both porter roles share PORTER_DEPLOY_API_TOKEN", () => {
   );
 });
 
+test("E2B sandboxes and E2B publishing share E2B_API_KEY", () => {
+  assert.deepEqual(validateCoreSecretEnv({ DEPLOY_PROVIDER: "e2b" } as NodeJS.ProcessEnv), ["E2B_API_KEY"]);
+  assert.deepEqual(validateCoreSecretEnv({ SANDBOX_BACKEND: "e2b" } as NodeJS.ProcessEnv), ["E2B_API_KEY"]);
+  assert.deepEqual(validateCoreSecretEnv({ DEPLOY_PROVIDER: "e2b", E2B_API_KEY: "k" } as NodeJS.ProcessEnv), []);
+});
+
 test("shared Fly publishing validates its private peer secret", () => {
   const env = { DEPLOY_PROVIDER: "fly", FLY_DEPLOY_API_TOKEN: "token", FLY_DEPLOY_SHARED_APP_NAME: "acme-apps" };
   assert.deepEqual(validateCoreSecretEnv(env), ["FLY_DEPLOY_WIREGUARD_PEERS"]);

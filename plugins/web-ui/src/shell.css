@@ -1778,6 +1778,51 @@ a.chat-row-open {
   user-select: none;
 }
 
+.named-user-row > .speaker-label,
+.named-assistant-row > .speaker-label {
+  margin: 0 0 4px;
+  min-height: 20px;
+  gap: 6px;
+  font-size: var(--font-13);
+  font-weight: 600;
+  color: var(--foreground);
+  line-height: 1.4;
+  pointer-events: auto;
+}
+.named-user-row > .speaker-label {
+  max-width: 72%;
+  margin-right: 12px;
+}
+.named-user-row > .speaker-label > .inbox-avatar,
+.named-assistant-row > .speaker-label > .brand-mark {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  font-size: 9px;
+}
+.named-user-row > .speaker-label > span[title] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.named-user-row > .user-bubble {
+  padding: 8px 12px;
+}
+.named-user-row > .user-bubble > .pin-toggle {
+  right: 12px;
+  bottom: 8px;
+}
+.named-assistant-row + .named-user-row:not(.latest-prompt) {
+  margin-top: 0;
+}
+.message-stack .named-user-row.latest-prompt {
+  margin-bottom: 0;
+}
+.message-stack .named-user-row.stuck > .speaker-label {
+  background: var(--background);
+}
+
 .revision-badge {
   font-size: 11px;
   color: var(--muted-foreground);
@@ -5974,15 +6019,15 @@ a.connector-widget:focus-visible {
 }
 .project-member-list {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  grid-template-columns: minmax(0, 1fr);
 }
 .project-member-row,
 .project-member-result {
   min-width: 0;
-  min-height: 44px;
+  min-height: 50px;
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 12px;
   padding: 7px 8px;
   box-sizing: border-box;
   border: 0;
@@ -6001,7 +6046,7 @@ a.connector-widget:focus-visible {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 50%;
+  border-radius: 5px;
   background: var(--secondary);
   color: var(--muted-foreground);
   font-size: 10px;
@@ -6010,15 +6055,17 @@ a.connector-widget:focus-visible {
 .speaker-label > .inbox-avatar {
   width: 18px;
   height: 18px;
-  border-radius: 50%;
 }
 .project-member-row > .inbox-avatar,
-.project-member-result > .inbox-avatar,
+.project-member-result > .inbox-avatar {
+  width: 36px;
+  height: 36px;
+  font-size: 12px;
+}
 .permission-person > .inbox-avatar,
 .permission-row > .inbox-avatar {
   width: 28px;
   height: 28px;
-  border-radius: 50%;
   font-size: 10px;
 }
 .project-member-name {
@@ -6027,7 +6074,7 @@ a.connector-widget:focus-visible {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--font-13);
+  font-size: var(--font-14);
 }
 .project-icon-button {
   width: 30px;
@@ -12527,13 +12574,51 @@ body.app-edit-embed .custom-chat-shell.app-edit-chat > .chat-bottom-dock {
   min-width: 80px;
 }
 
-.split-canvas:not(.single-pane) .dv-groupview:not(.dv-active-group) .composer-wrap {
-  display: none;
-}
-
 .split-canvas:not(.single-pane)
   .dv-groupview:not(.dv-active-group):not(:hover):not(:focus-within)
   :is(.dv-right-actions-container, .split-tab-actions) {
   opacity: 0;
   pointer-events: none;
+}
+.ui-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  pointer-events: none;
+}
+.ui-canvas-body {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.ui-canvas.collapsed .ui-canvas-body {
+  display: none;
+}
+.ui-canvas-dock {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.ui-canvas-dock:empty {
+  display: none;
+}
+.ui-canvas-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 2px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border, #d0d0d0);
+  border-radius: 999px;
+  background: var(--background, #fff);
+  pointer-events: auto;
+}
+.ui-canvas-title {
+  font-weight: 600;
+  margin-right: 4px;
 }

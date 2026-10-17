@@ -5,6 +5,7 @@ import { errMessage, swallow } from "../util/errors.ts";
 import { redactSecrets } from "../harness/redact-secrets.ts";
 import { createSecretValueMasker } from "../security/secret-masking.ts";
 import type { Deployment } from "./deploy-store.ts";
+import { normalizeRelPath, readTree } from "./deploy-fs.ts";
 
 const EXIT_APP_SERVER_ERROR = 96;
 const EXIT_APP_EXITED = 98;
@@ -16,8 +17,36 @@ const READY_EXEC_GRACE_SEC = 15;
 const APP_PROBE_TIMEOUT_SEC = 5;
 const EXITED_MARK = "qm: entrypoint exited";
 const APP_CHECK_CACHE_MS = 15_000;
-export const APP_PID_PATH = "/tmp/qm-app.pid";
+const APP_PID_PATH = "/tmp/qm-app.pid";
 const APP_LOG_PATH = "/tmp/qm-app.log";
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function appEnv(
+  declared: Record<string, string> | undefined,
+  platform: Record<string, string> = {},
+): Record<string, string> {
+  return { ...Object.fromEntries(Object.entries(declared ?? {}).filter(([k]) => ENV_NAME.test(k))), ...platform };
+}
+
+export const exportEnv = (env: Record<string, string>): string =>
+  Object.entries(env)
+    .map(([k, v]) => `export ${k}=${shq(v)}`)
+    .join("; ");
+
+export const STOP_APP = [
+  `old=$(cat ${shq(APP_PID_PATH)} 2>/dev/null || true)`,
+  `if [ -n "$old" ]; then kill -TERM "-$old" 2>/dev/null || true; sleep 0.5; kill -KILL "-$old" 2>/dev/null || true; fi`,
+  `rm -f ${shq(APP_PID_PATH)}`,
+].join("; ");
+
+export async function bundleEntries(dir: string): Promise<Array<{ path: string; data: Uint8Array }>> {
+  const files = await readTree(dir, { tolerateMissing: true });
+  return files.map((f) => ({ path: normalizeRelPath(f.path), data: f.data }));
+}
+
+export const extractBundle = (bundle: string, guestDir: string, cleanup = ""): string =>
+  `mkdir -p ${shq(guestDir)} && tar -xmf ${shq(bundle)} -C ${shq(guestDir)}; rc=$?; rm -f ${shq(bundle)}; ${cleanup ? `${cleanup}; ` : ""}exit $rc`;
 
 export type Exec = (script: string, timeoutSec: number) => Promise<Pick<ExecResult, "stdout" | "stderr" | "code">>;
 

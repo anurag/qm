@@ -58,7 +58,20 @@ const clientToolsSchema = z
 
 const clientResultSchema = z.object({
   callId: z.string().min(1).max(256),
-  result: z.object({ content: z.string(), structured: z.unknown().optional(), isError: z.boolean().optional() }),
+  result: z.object({
+    content: z.string(),
+    structured: z.unknown().optional(),
+    isError: z.boolean().optional(),
+    images: z
+      .array(
+        z.object({
+          data: z.string().max(4_000_000).base64(),
+          mimeType: z.enum(["image/png", "image/jpeg"]),
+        }),
+      )
+      .max(4)
+      .optional(),
+  }),
 });
 
 function zodMessage(field: string, error: z.ZodError): string {
@@ -102,6 +115,8 @@ function sanitizedTurnRequest(body: TurnRequest): { request: TurnRequest } | { e
   if (resolvedOrigin.error) return { error: resolvedOrigin.error };
   const origin = resolvedOrigin.origin;
   const { clientTools: rawClientTools, ...rest } = safeBody;
+  if (rest.desktopClientId !== undefined && !z.uuid().safeParse(rest.desktopClientId).success)
+    return { error: "desktopClientId must be a UUID" };
   let clientTools: ClientToolDeclaration[] | undefined;
   if (rawClientTools !== undefined) {
     const parsed = clientToolsSchema.safeParse(rawClientTools);
@@ -158,6 +173,9 @@ async function postRunSignal(ctx: ApiCtx): Promise<void> {
     return sendJson(res, 400, { error: "bad_request", message: "kind must be abort, steer or client_result" });
   }
   if (kind === "client_result") {
+    const run = await ctx.deps.runs?.get(id);
+    if (run?.request.desktopClientId && (!isObj(body) || body.desktopClientId !== run.request.desktopClientId))
+      return sendJson(res, 403, { error: "wrong_desktop_client" });
     const parsed = clientResultSchema.safeParse(body);
     if (!parsed.success)
       return sendJson(res, 400, { error: "bad_request", message: zodMessage("client_result", parsed.error) });
@@ -294,7 +312,7 @@ export const turnRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/approvals/pending", auth: "source", handle: getPendingApproval },
   { method: "GET", path: "/v1/approvals/:id", auth: "source", handle: getApproval },
   { method: "POST", path: "/v1/runs/:id/delivery-state", auth: "source", handle: postRunDeliveryState },
-  { method: "POST", path: "/v1/runs/:id/signal", auth: "source", handle: postRunSignal },
+  { method: "POST", path: "/v1/runs/:id/signal", auth: "source", maxBodyBytes: 6_000_000, handle: postRunSignal },
   { method: "PATCH", path: "/v1/runs/:id/input", auth: "source", handle: patchQueuedRun },
   { method: "POST", path: "/v1/runs/:id/withdraw", auth: "source", handle: postRunWithdraw },
   { method: "GET", path: "/v1/runs/:id", auth: "source", handle: getRun },

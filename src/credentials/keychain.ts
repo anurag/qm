@@ -190,6 +190,8 @@ export interface PublicServiceCredential {
   deployments: boolean;
   enabled: boolean;
   hasSecret: boolean;
+  maxRequestsPerDay?: number;
+  source?: "deployment";
   updatedBy?: string;
   updatedAt: number;
 }
@@ -206,6 +208,8 @@ export interface DecryptedServiceCredential {
   allowedPathPrefixes?: string[];
   deployments: boolean;
   enabled: boolean;
+  maxRequestsPerDay?: number;
+  source?: "deployment";
 }
 
 export function isValidCredentialSlug(slug: string): boolean {
@@ -214,6 +218,18 @@ export function isValidCredentialSlug(slug: string): boolean {
 
 export function isValidServiceCredentialEnvKey(envKey: string): boolean {
   return /^[A-Z][A-Z0-9_]*$/.test(envKey) && !envKey.startsWith("AGENT_");
+}
+
+export function isValidBrokerHost(host: string): boolean {
+  return Boolean(host) && host === host.toLowerCase() && !/[/:\s]/.test(host);
+}
+
+export function isValidBrokerMethod(method: string): boolean {
+  return /^[A-Z]+$/.test(method);
+}
+
+export function isValidBrokerPathPrefix(path: string): boolean {
+  return path.startsWith("/") && !/[\r\n]/.test(path);
 }
 
 export interface ServiceCredentialReader {

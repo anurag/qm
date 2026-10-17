@@ -1,4 +1,5 @@
 import type { MemoryEmbedder } from "./model/embeddings.ts";
+import { nonDeploymentCredential, withDeploymentCredentials } from "./credentials/deployment-credentials.ts";
 import { resolveEmbeddingModel } from "./model/pi-models.ts";
 import { createPostgresTeamStore, type TeamStore } from "./teams/teams.ts";
 import { brokerCredentialAuthHeader } from "./api/credential-broker.ts";
@@ -119,6 +120,7 @@ import {
   type PersistedWebuiModels,
   type PersistedPeopleDirectoryUrl,
   type PersistedAckEmoji,
+  type PersistedPinnedSkills,
   type PersistedSlackEmojiCatalog,
   type PersistedBranding,
   type PersistedBrowseMaxSteps,
@@ -136,6 +138,7 @@ import { createGitFetcher, resolvePackAuth, type SkillPackFetcher } from "./skil
 import { installSeedSkills } from "./skills/seed.ts";
 import { createMemoryMap, createPostgresMapFactory, type DurableMap } from "./persistence/durable-map.ts";
 import type { PersistedUiState, UiStateStore } from "./surfaces/ui-state.ts";
+import { installSharedCanvas } from "./surfaces/ui-canvas.ts";
 import { slackUserClientFactory } from "./loops/sources/slack.ts";
 import { configurePgCaTrust, configurePgPooling } from "./persistence/pg-pool.ts";
 import { createPostgresLeaderLease, createNoopLeaderLease, type LeaderLease } from "./persistence/leader-lease.ts";
@@ -208,6 +211,11 @@ import { createDockerDeployProvider } from "./deploy/docker-deploy-provider.ts";
 import { createAwsDeployProvider, type StoredDeployBody } from "./deploy/aws-deploy-provider.ts";
 import { createFlyDeployProvider, type FlyMachineConfig } from "./deploy/fly-deploy-provider.ts";
 import { createPorterDeployProvider, type StoredPorterDeployBody } from "./deploy/porter-deploy-provider.ts";
+import {
+  createE2bDeployProvider,
+  E2B_DEPLOY_IDLE_TIMEOUT_SEC,
+  type StoredE2bDeployBody,
+} from "./deploy/e2b-deploy-provider.ts";
 import type { DeployProvider } from "./deploy/deploy-provider.ts";
 import { createDeployService } from "./deploy/deploy-service.ts";
 import {
@@ -253,8 +261,8 @@ import {
   type StoredSuperserveSandbox,
 } from "./sandbox/superserve-sandbox.ts";
 import { createSdkSuperserveClient } from "./sandbox/superserve-client.ts";
-import { createE2bSandbox, type StoredE2bSandbox } from "./sandbox/e2b-sandbox.ts";
-import { createSdkE2bClient } from "./sandbox/e2b-client.ts";
+import { createE2bSandbox, E2B_TEMPLATE_TOOLS, type StoredE2bSandbox } from "./sandbox/e2b-sandbox.ts";
+import { createSdkE2bClient, type E2bClient } from "./sandbox/e2b-client.ts";
 import {
   createManagedAgentsSandbox,
   QM_TEMPLATE_TOOLS,
@@ -359,7 +367,7 @@ import { createPostgresRunStore } from "./runs/postgres-run-store.ts";
 import { createMemoryRunSignalStore, type RunSignalStore } from "./runs/run-signal-store.ts";
 import { createPostgresRunSignalStore } from "./runs/postgres-run-signal-store.ts";
 import { isTerminal, type Run, type RunStore } from "./runs/run-store.ts";
-import { createWorker, type Worker } from "./runs/worker.ts";
+import { createRunPreemption, createWorker, type Worker } from "./runs/worker.ts";
 import {
   createNoopInstanceRegistry,
   createPostgresInstanceRegistry,
@@ -713,6 +721,7 @@ export function buildApp(
     webuiModels: artifactMap<PersistedWebuiModels>("webui_model_configs"),
     peopleDirectoryUrls: artifactMap<PersistedPeopleDirectoryUrl>("people_directory_urls"),
     ackEmoji: artifactMap<PersistedAckEmoji>("ack_emoji"),
+    pinnedSkills: artifactMap<PersistedPinnedSkills>("pinned_skills"),
     slackEmojiCatalog: artifactMap<PersistedSlackEmojiCatalog>("slack_emoji_catalog"),
     branding: artifactMap<PersistedBranding>("branding_configs"),
     browseMaxSteps: artifactMap<PersistedBrowseMaxSteps>("browse_max_steps_configs"),
@@ -784,7 +793,7 @@ export function buildApp(
   let skillsReady: Promise<void>;
   if (config.seedSkills) {
     const installCatalogs = async (): Promise<void> => {
-      await installSeedSkills(skills, { dir: config.skillsSeedDir, scopeId: orgScope });
+      await installSeedSkills(skills, { dir: config.skillsSeedDir, scopeId: orgScope, respectArchived: true });
       for (const dir of config.pluginSkillDirs) {
         if (layerSkillsDir && resolve(dir) === layerSkillsDir) continue;
         await installSeedSkills(skills, {
@@ -792,6 +801,7 @@ export function buildApp(
           scopeId: orgScope,
           createdBy: "system:plugin-skills",
           reviewer: "system:plugin-skills-reviewer",
+          respectArchived: true,
         });
       }
     };
@@ -958,19 +968,25 @@ export function buildApp(
   const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
   const renderScratch = artifactMap<StoredRenderScratch>("render_scratch_bodies");
   const renderCleanup = artifactMap<StoredRenderCleanup>("render_sandbox_cleanup");
+  const e2bClient = (use: "computers" | "apps"): E2bClient => {
+    const e2b = config.e2bSandbox;
+    if (!e2b.apiKey)
+      throw new Error(`${use === "apps" ? "DEPLOY_PROVIDER" : "SANDBOX_BACKEND"}=e2b requires E2B_API_KEY`);
+    const ttlSec = use === "apps" ? E2B_DEPLOY_IDLE_TIMEOUT_SEC : e2b.sandboxTtlSec;
+    return createSdkE2bClient({
+      apiKey: e2b.apiKey,
+      ...(e2b.templateId ? { templateId: e2b.templateId } : {}),
+      ...(ttlSec ? { sandboxTtlMs: ttlSec * 1000 } : {}),
+      ...(e2b.maxLifetimeSec ? { maxLifetimeMs: e2b.maxLifetimeSec * 1000 } : {}),
+      ...(e2b.proxy ? { proxy: e2b.proxy } : {}),
+      ...(use === "computers" && e2b.egressProxyUrl ? { egressProxyUrl: e2b.egressProxyUrl } : {}),
+    });
+  };
   const buildE2b = (): Sandbox => {
     const e2b = config.e2bSandbox;
-    if (!e2b.apiKey) throw new Error("SANDBOX_BACKEND=e2b requires E2B_API_KEY");
     return createE2bSandbox(workspace, {
       advisoryLock,
-      client: createSdkE2bClient({
-        apiKey: e2b.apiKey,
-        ...(e2b.templateId ? { templateId: e2b.templateId } : {}),
-        ...(e2b.sandboxTtlSec ? { sandboxTtlMs: e2b.sandboxTtlSec * 1000 } : {}),
-        ...(e2b.maxLifetimeSec ? { maxLifetimeMs: e2b.maxLifetimeSec * 1000 } : {}),
-        ...(e2b.proxy ? { proxy: e2b.proxy } : {}),
-        ...(e2b.egressProxyUrl ? { egressProxyUrl: e2b.egressProxyUrl } : {}),
-      }),
+      client: e2bClient("computers"),
       ...(e2b.namePrefix ? { namePrefix: e2b.namePrefix } : {}),
       ...(e2b.defaultTimeoutSec ? { defaultTimeoutSec: e2b.defaultTimeoutSec } : {}),
       keepWarmSec: Math.ceil(config.backgroundJobTtlMaxMs / 1000),
@@ -979,7 +995,7 @@ export function buildApp(
         ? { nativeSnapshotIntervalMs: e2b.nativeSnapshotIntervalSec * 1000 }
         : {}),
       ...(e2b.egressProxyUrl ? { egressProxyUrl: e2b.egressProxyUrl } : {}),
-      extraTools: deploymentLayer.advertisedTools,
+      extraTools: [...(e2b.templateId ? E2B_TEMPLATE_TOOLS : []), ...deploymentLayer.advertisedTools],
       credentialPaths: deploymentLayer.credentialPaths,
       layerToolFiles: () => deploymentLayer.installFiles,
       blobTransfer,
@@ -1364,6 +1380,23 @@ export function buildApp(
   // every other personal credential.
   const userModelCredentials = createUserModelCredentialStore({ keychain: credentialStore });
   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
+  const serviceCreds = withDeploymentCredentials(
+    credentialStore,
+    scopeId("org", config.orgId),
+    config.brokerCredentials ?? [],
+  );
+  if (config.brokerCredentials?.length) {
+    const reserved = new Set(config.brokerCredentials.map((c) => c.slug));
+    void credentialStore.listServiceCredentials(scopeId("org", config.orgId)).then(
+      (stored) => {
+        const shadowed = stored.filter((c) => reserved.has(c.slug)).map((c) => c.slug);
+        if (shadowed.length)
+          console.warn(`[broker-credentials] BROKER_CREDENTIALS overrides stored credentials: ${shadowed.join(", ")}`);
+      },
+      (error) =>
+        console.warn(`[broker-credentials] could not check for overridden stored credentials: ${errMessage(error)}`),
+    );
+  }
   const mcpToolService = createMcpToolService({
     servers: mcpServers,
     audit: auditLog,
@@ -1549,7 +1582,9 @@ export function buildApp(
             }
           : {}),
         credential: async (slug) => {
-          const rec = await keychain?.getServiceCredentialSecret(scopeId("org", config.orgId), slug);
+          const rec = keychain
+            ? nonDeploymentCredential(await serviceCreds.getServiceCredentialSecret(scopeId("org", config.orgId), slug))
+            : null;
           return rec ? { host: rec.host, enabled: rec.enabled, header: brokerCredentialAuthHeader(rec) } : null;
         },
       }),
@@ -1864,6 +1899,16 @@ export function buildApp(
         store: artifactMap<StoredPorterDeployBody>("porter_deploy_bodies"),
         onError: sandboxOnError,
       }),
+    e2b: () => {
+      const e2b = config.e2bSandbox;
+      return createE2bDeployProvider({
+        client: e2bClient("apps"),
+        ...(e2b.namePrefix ? { namePrefix: e2b.namePrefix } : {}),
+        advisoryLock,
+        store: artifactMap<StoredE2bDeployBody>("e2b_deploy_bodies"),
+        onError: sandboxOnError,
+      });
+    },
   };
   if (
     config.deployProvider === "fly" &&
@@ -1919,6 +1964,7 @@ export function buildApp(
   const deployService = createDeployService({
     deliveries,
     deployAppsDomain: config.awsDeploy.appsDomain,
+    publicLinksAvailable: !!(config.awsDeploy.appsDomain && config.awsDeploy.gateSecret),
     publicWebUrl: config.publicWebUrl,
     appPublished: productAnalytics.appPublished,
     deployStore,
@@ -1950,7 +1996,7 @@ export function buildApp(
             };
             const orgScope = scopeId("org", config.orgId);
             const credentials = await deploymentCredentialSlugs(
-              await credentialStore.listServiceCredentials(orgScope),
+              await serviceCreds.listServiceCredentials(orgScope),
               orgScope,
               acl,
             );
@@ -2136,7 +2182,22 @@ export function buildApp(
       );
     },
   });
+  const uiState = artifactMap<PersistedUiState>("web_ui_state");
   const orchestratorDeps: OrchestratorDeps = {
+    installSharedCanvas: async (actorId, fileId, where) => {
+      const canvas = await installSharedCanvas(uiState, actorId, await app.openFileForViewer(fileId, actorId));
+      if (typeof canvas === "string") return canvas;
+      auditLog.record({
+        at: Date.now(),
+        principalId: actorId,
+        action: "ui.canvas.install",
+        resource: `file:${fileId}`,
+        scopeLabel: personalScope(actorId),
+        detail: `rev ${canvas.rev}`,
+      });
+      sessionStateBus.emit({ ...where, participants: [actorId], state: "ui", at: Date.now(), ui: { kind: "canvas" } });
+      return null;
+    },
     sessionStateBus,
     externalSlackPolicies: config.externalSlackPolicies,
     sessionSyscalls,
@@ -2205,7 +2266,7 @@ export function buildApp(
     connectorStatusCache,
     resolveConnectorClient: resolveClient,
     ...(keychain ? { keychain } : {}),
-    serviceCreds: credentialStore,
+    serviceCreds,
     deliveries,
     approvals,
     approvalGrants: artifactMap<CommandApprovalGrant>("approval_grants"),
@@ -2245,7 +2306,9 @@ export function buildApp(
             resolvePackAuth(
               {
                 serviceCredential: async (slug) => {
-                  const record = await keychain.getServiceCredentialSecret(scopeId("org", config.orgId), slug);
+                  const record = nonDeploymentCredential(
+                    await serviceCreds.getServiceCredentialSecret(scopeId("org", config.orgId), slug),
+                  );
                   return record && record.delivery !== "env" ? record : undefined;
                 },
                 connectorToken: async (host, principalId) =>
@@ -2803,6 +2866,7 @@ export function buildApp(
         })
       : createNoopInstanceRegistry();
   const drain: DrainController = createDrainController({ registry: instanceRegistry });
+  const canClaimRuns = () => backgroundAdmission() && drain.canClaim();
   const workers: Worker[] = Array.from({ length: Math.max(1, config.workers) }, () =>
     createWorker({
       admittedWork,
@@ -2812,9 +2876,11 @@ export function buildApp(
       heartbeatIntervalMs: config.heartbeatIntervalMs,
       errors,
       pollMs: 250,
-      canClaim: () => backgroundAdmission() && drain.canClaim(),
+      canClaim: canClaimRuns,
     }),
   );
+  const preemption = createRunPreemption({ runs, workers, canClaim: canClaimRuns });
+  const preemptionSweeper = createSweeper(() => preemption.sweep(), 1_000, { label: "run-preemption" });
   const processReaper: ProcessReaper | null = processes
     ? createProcessReaper(processes, {
         intervalMs: config.processReaperIntervalMs,
@@ -2894,6 +2960,7 @@ export function buildApp(
         })
         .catch(swallowAs("wiring: worker resume failed", undefined));
     }
+    preemptionSweeper.start();
     const startPeriodic = () => {
       if (!backgroundRunning || generation !== backgroundGeneration) return;
       reaper.start();
@@ -2951,6 +3018,7 @@ export function buildApp(
       sessionReturnSweeper.stop(),
       runResultSweeper.stop(),
       approvalDeliverySweeper.stop(),
+      preemptionSweeper.stop(),
       ...workers.map((worker) => worker.stopClaims()),
     ];
     backgroundClaimsStopping = Promise.all(stopping).then(() => {});
@@ -3017,6 +3085,7 @@ export function buildApp(
       await harness.turns.close?.();
       await semanticMemory.close();
       await flyTunnel?.stop();
+      await errors.flush();
     },
   };
 
@@ -3080,7 +3149,7 @@ export function buildApp(
     workspace,
     memory,
     ...(keychain ? { keychain } : {}),
-    serviceCreds: credentialStore,
+    serviceCreds,
     deliveries,
     ...(keychainApprovals ? { keychainApprovals } : {}),
     ...(askResolution ? { fireAskResolution: askResolution } : {}),
@@ -3111,7 +3180,7 @@ export function buildApp(
       ? { suggestedActivities }
       : {}),
     ...(backgroundOwnership ? { backgroundOwnership } : {}),
-    uiState: artifactMap<PersistedUiState>("web_ui_state"),
+    uiState,
     sessionShares: artifactMap<SessionShare>("session_shares"),
     sessionShareBytes:
       config.snapshotStore === "s3" && config.s3Bucket
@@ -3229,6 +3298,7 @@ export function serverDeps(
     ...(built.fireAskResolution ? { fireAskResolution: built.fireAskResolution } : {}),
     runs: built.runs,
     signals: built.signals,
+    sessionStateBus: built.sessionStateBus,
     workspace: built.workspace,
     files: built.files,
     ...(built.fileUploads ? { fileUploads: built.fileUploads } : {}),

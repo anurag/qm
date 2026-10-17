@@ -218,29 +218,23 @@ export function definePgMigration(
   };
 }
 
-const SCHEMA_LOCK_RETRY_MS = 250;
+const SCHEMA_LOCK_POLL_MS = 50;
 
-async function acquireSchemaLock(client: PoolClient, name: string): Promise<void> {
+async function lockSchema(client: PoolClient, name: string): Promise<void> {
   for (;;) {
-    const attempt = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_lock(hashtext($1)) AS locked", [
+    const result = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_lock(hashtext($1)) AS locked", [
       name,
     ]);
-    if (attempt.rows[0]?.locked) return;
-    await sleep(SCHEMA_LOCK_RETRY_MS);
+    if (result.rows[0]?.locked) return;
+    await sleep(SCHEMA_LOCK_POLL_MS);
   }
-}
-
-async function releaseSchemaLock(client: PoolClient, name: string): Promise<void> {
-  await client
-    .query("SELECT pg_advisory_unlock(hashtext($1))", [name])
-    .catch(swallowAs(`pg-pool: ${name} unlock`, undefined));
 }
 
 export async function applyPgMigrations(pool: Pool, migrations: readonly PgMigration[]): Promise<void> {
   if (!migrations.length) return;
   const client = await pool.connect();
   try {
-    await acquireSchemaLock(client, "qm:schema-migrations");
+    await lockSchema(client, "qm:schema-migrations");
     await client.query(
       `CREATE TABLE IF NOT EXISTS ${PG_MIGRATIONS_TABLE}(
         id TEXT PRIMARY KEY,
@@ -333,7 +327,9 @@ export async function applyPgMigrations(pool: Pool, migrations: readonly PgMigra
       }
     }
   } finally {
-    await releaseSchemaLock(client, "qm:schema-migrations");
+    await client
+      .query("SELECT pg_advisory_unlock(hashtext('qm:schema-migrations'))")
+      .catch(swallowAs("pg-pool: schema-migrations unlock", undefined));
     client.release();
   }
 }
@@ -397,7 +393,7 @@ async function applyPgMaintenance(pool: Pool, maintenance: readonly PgMigration[
   if (!maintenance.length) return;
   const client = await pool.connect();
   try {
-    await acquireSchemaLock(client, "qm:schema-maintenance");
+    await lockSchema(client, "qm:schema-maintenance");
     for (const operation of maintenance) {
       await client.query("BEGIN");
       try {
@@ -409,7 +405,9 @@ async function applyPgMaintenance(pool: Pool, maintenance: readonly PgMigration[
       }
     }
   } finally {
-    await releaseSchemaLock(client, "qm:schema-maintenance");
+    await client
+      .query("SELECT pg_advisory_unlock(hashtext('qm:schema-maintenance'))")
+      .catch(swallowAs("pg-pool: schema-maintenance unlock", undefined));
     client.release();
   }
 }

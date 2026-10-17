@@ -11,12 +11,14 @@ test("project speaker photos follow authenticated identity, not duplicate or rea
     threadRef: "web:project:chat",
   };
   const speakers = [
-    { name: "Alex", speakerId: "person-a" },
-    { name: "Alex", speakerId: "person-b" },
-    { name: "Old Name", speakerId: "person-c" },
-    { name: "Alex" },
-    { name: "Old Name" },
-    { name: "Departed", speakerId: "missing-person" },
+    { name: "Alex", label: "alex", speakerId: "person-a" },
+    { name: "Alex", label: "alex", speakerId: "person-b" },
+    { name: "Old Name", label: "old", speakerId: "person-c" },
+    { name: "Alex", label: "alex" },
+    { name: "Old Name", label: "old" },
+    { name: "Departed", label: "departed", speakerId: "missing-person" },
+    { name: "  ÉLODIE\tMoreau  ", label: "élodie" },
+    { name: "Mary-Jane Watson", label: "mary-jane" },
   ];
   const h = await harness({
     path: `/s/${session.id}`,
@@ -45,26 +47,72 @@ test("project speaker photos follow authenticated identity, not duplicate or rea
         },
       },
     ],
-    entries: speakers.map((speaker, seq) => ({
-      seq,
-      type: "user",
-      createdAt: 1000 + seq,
-      payload: { text: `Message ${seq}`, ...speaker },
-    })),
+    entries: [
+      ...speakers.map((speaker, seq) => ({
+        seq,
+        type: "user",
+        createdAt: 1000 + seq,
+        payload: { text: `Message ${seq}`, ...speaker },
+      })),
+      { seq: speakers.length, type: "assistant", createdAt: 2000, payload: { text: "Here is the plan." } },
+    ],
   });
   try {
     h.releaseSessions();
     await h.boot();
     await h.sessionsReady();
-    const labels = [...document.querySelectorAll(".message-stack .speaker-label")];
+    const labels = [...document.querySelectorAll(".message-stack .user-row > .speaker-label")];
     assert.equal(labels.length, speakers.length);
+    for (const [index, label] of labels.entries()) {
+      const row = label.closest(".named-user-row")!;
+      assert.ok(row);
+      assert.equal(label.parentElement, row);
+      assert.equal(label.querySelector(":scope > span:not(.inbox-avatar)")?.textContent, speakers[index]!.label);
+      assert.equal(label.querySelector(":scope > span[title]")?.getAttribute("title"), speakers[index]!.name.trim());
+      assert.equal(
+        row.querySelector<HTMLElement & { content: string }>(":scope > .user-bubble > .pin-content > qm-markdown")
+          ?.content,
+        `Message ${index}`,
+      );
+      assert.ok(row.querySelector(":scope > .user-bubble > .pin-toggle"));
+      assert.ok(row.querySelector(":scope > .message-meta"));
+    }
     assert.deepEqual(
       labels.map((label) => label.querySelector("img")?.getAttribute("src") ?? null),
-      ["https://example.com/a.png", "https://example.com/b.png", "https://example.com/c.png", null, null, null],
+      [
+        "https://example.com/a.png",
+        "https://example.com/b.png",
+        "https://example.com/c.png",
+        null,
+        null,
+        null,
+        null,
+        null,
+      ],
     );
-    assert.match(labels[2]!.textContent!, /Old Name/);
-    assert.match(labels[3]!.textContent!, /AL\s+Alex/);
-    assert.match(labels[4]!.textContent!, /ON\s+Old Name/);
+    assert.match(labels[2]!.textContent!, /old/);
+    assert.match(labels[3]!.textContent!, /AL\s+alex/);
+    assert.match(labels[4]!.textContent!, /ON\s+old/);
+    const assistantLabel = () => document.querySelector(".named-assistant-row > .speaker-label");
+    assert.equal(assistantLabel()?.textContent?.trim(), "QM");
+    assert.ok(assistantLabel()?.querySelector(".brand-mark"));
+    const conversation = h.visibleConversation();
+    for (const message of conversation.state.agent!.state.messages) {
+      (message as { speaker?: string }).speaker = undefined;
+    }
+    conversation.drawActiveChat();
+    assert.equal(document.querySelector(".named-user-row"), null);
+    assert.equal(document.querySelector(".speaker-label"), null);
+    assert.equal(document.querySelector(".named-assistant-row"), null);
+    assert.equal(
+      document.querySelector<HTMLElement & { content: string }>(".user-row > .user-bubble > .pin-content > qm-markdown")
+        ?.content,
+      "Message 0",
+    );
+    (conversation.state.agent!.state.messages[0] as { speaker?: string }).speaker = "Alex";
+    (conversation.state.agent!.state.messages[1] as { speaker?: string }).speaker = "Blair";
+    conversation.drawActiveChat();
+    assert.equal(assistantLabel()?.textContent?.trim(), "QM");
   } finally {
     await h.close();
   }

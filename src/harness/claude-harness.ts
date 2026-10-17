@@ -39,13 +39,13 @@ import { coreToolOptions } from "./agent-tools.ts";
 import {
   bridgedTools,
   nativeChildToolAllowed,
-  bridgedToolText,
+  bridgedToolContent,
   harnessToolContext,
   harnessToolOptions,
   oneShotModelUtilities,
   oneShotRunner,
   recordSteerIntake,
-  recordStoppedReply,
+  recordStoppedTurn,
   type SteerIntake,
   type HarnessToolPlumbing,
   withResumedToolCall,
@@ -54,6 +54,7 @@ import {
   recordedMessageTimestamps,
   reconstructMessagesFromHistory,
   seedPriorTurns,
+  userPromptText,
   zeroUsage,
   OMITTED_IMAGE_TEXT,
   type PiReplayMessage,
@@ -234,7 +235,7 @@ export function claudeReplayTranscript(messages: readonly PiReplayMessage[]): st
 }
 
 function promptText(turn: HarnessTurnInput): string {
-  const replay = claudeReplayTranscript(reconstructMessagesFromHistory(turn.history));
+  const replay = claudeReplayTranscript(reconstructMessagesFromHistory(turn.history, { requireUserStart: false }));
   const prior = turn.history.length
     ? ""
     : seedPriorTurns(turn.priorTurns ?? [])
@@ -354,7 +355,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
         try {
           const result = await definition.execute(callId, args);
           if (result.terminate || ref.pausedOnApproval || ref.silentRequested) setImmediate(terminateProvider);
-          return { content: [{ type: "text", text: bridgedToolText(result) }] };
+          return { content: bridgedToolContent(result) };
         } catch (error) {
           return {
             content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
@@ -364,19 +365,40 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       });
     });
     const server = createSdkMcpServer({ name: "qm", version: "1", tools: definitions, alwaysLoad: true });
-    const userEntry = await turn.emit({
-      type: "user",
-      payload: {
-        text: turn.input,
-        ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
-        ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
-      },
-      scopeLabel: turn.scopeLabel,
-    });
+    const continueTurn = !!turn.continueTurn && turn.history.some((e) => e.seq === turn.resumeUserSeq);
+    const userEntry = continueTurn
+      ? turn.history.find((e) => e.seq === turn.resumeUserSeq)
+      : await turn.emit({
+          type: "user",
+          payload: {
+            text: turn.input,
+            ...((turn.triggerTs ?? turn.entryTs) ? { ts: turn.triggerTs ?? turn.entryTs } : {}),
+            ...(turn.attachments?.length ? { attachments: turn.attachments } : {}),
+          },
+          scopeLabel: turn.scopeLabel,
+        });
     const requestedModel = turn.runtime?.modelId;
     const model = modelSupportedByHarness(requestedModel, "claude") ? requestedModel! : resolveModelId(turn.scopeLabel);
     const turnEffort = effort(turn.runtime?.effortLevel);
-    const text = promptText(turn);
+    const text = continueTurn
+      ? [
+          claudeReplayTranscript(
+            reconstructMessagesFromHistory(
+              turn.history.filter((e) => e.seq < turn.resumeUserSeq!),
+              { requireUserStart: false },
+            ),
+          ),
+          userPromptText((userEntry?.payload ?? {}) as Parameters<typeof userPromptText>[0]),
+          claudeReplayTranscript(
+            reconstructMessagesFromHistory(
+              turn.history.filter((e) => e.seq > turn.resumeUserSeq!),
+              { requireUserStart: false },
+            ),
+          ),
+        ]
+          .filter((value) => value.trim())
+          .join("\n\n")
+      : promptText(turn);
     const initial = userMessage(text, turn.images);
     if (turn.documents?.length && Array.isArray(initial.message.content)) {
       initial.message.content.push(...(preparedDocuments as unknown as typeof initial.message.content));
@@ -468,8 +490,10 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       },
     });
     active.add(sdkQuery);
-    const interrupt = async (fromUser: boolean) => {
+    let stopReason: string | undefined;
+    const interrupt = async (fromUser: boolean, reason?: string) => {
       stopped ||= fromUser;
+      if (fromUser && reason) stopReason ??= reason;
       interrupted = true;
       queue.close();
       await sdkQuery.interrupt().catch(() => undefined);
@@ -492,7 +516,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             opts.signals,
             turn.runId,
             {
-              onAbort: async () => interrupt(true),
+              onAbort: async (reason) => interrupt(true, reason),
               onSteer: async (steer, ts, request, acknowledge) => {
                 if (ts && recordedMessageTimestamps(turn.history).has(ts)) return;
                 const prepared = await turn.prepareSteer?.(steer, request);
@@ -553,7 +577,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       const step = recordedSteps++;
       try {
         await turn.recordLlmRequest?.({
-          turnSeq: userEntry.seq,
+          turnSeq: userEntry?.seq ?? null,
           step,
           model,
           promptEnvelope: recordedEnvelope,
@@ -719,9 +743,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
         const terminal = ref.runtimeHandoff || ref.silentRequested || ref.pausedOnApproval;
         const reply = terminal ? "" : streamedText.trim();
         await flushThinking();
-        if (reply && !terminal) {
-          await recordStoppedReply(turn, reply);
-        }
+        if (!terminal) await recordStoppedTurn(turn, reply, stopped ? stopReason : "because the run was cancelled");
         return {
           reply,
           ...(!ref.runtimeHandoff || stopped ? { stopped: true as const } : {}),
@@ -791,7 +813,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
         recordedSteps++;
         try {
           await turn.recordLlmRequest?.({
-            turnSeq: userEntry.seq,
+            turnSeq: userEntry?.seq ?? null,
             step: 0,
             model,
             promptEnvelope: recordedEnvelope,

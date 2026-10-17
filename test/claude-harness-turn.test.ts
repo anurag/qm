@@ -6,7 +6,7 @@ import { createMemoryRunSignalStore } from "../src/runs/run-signal-store.ts";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import type { NewEntry } from "../src/sessions/session-store.ts";
 import type { ScopeId, SessionEntry } from "../src/types.ts";
-import { findTrailingPartialTurn, resumeNote, resumeStrategy, turnAtSeq } from "../src/core/turn-resume.ts";
+import { findTrailingPartialTurn, resumeStrategy, turnAtSeq } from "../src/core/turn-resume.ts";
 
 type FakeSdkMessage = Record<string, unknown>;
 type Script = (prompts: AsyncIterable<{ message: { content: unknown } }>) => AsyncGenerator<FakeSdkMessage>;
@@ -741,7 +741,7 @@ test("Claude retains a queued message which the SDK never consumes", async () =>
   assert.equal((await signals.pending("no-echo"))[0]?.signal.ts, "pending");
 });
 
-test("Claude ignores continueTurn and still prompts the resume note as a user message", async () => {
+test("Claude continues a resumed turn with its recorded request live and no new prompt or user entry", async () => {
   const prompted: string[] = [];
   currentScript = async function* (prompts) {
     for await (const prompt of prompts) {
@@ -751,14 +751,59 @@ test("Claude ignores continueTurn and still prompts the resume note as a user me
     yield assistantMessage("msg_A", "picking up", { input_tokens: 3, output_tokens: 2 });
     yield resultMessage("picking up");
   };
-  const note = resumeNote({ strategy: { kind: "continue" } });
-  const harness = createClaudeHarness({});
-  const { turn, entries } = harnessTurn({ input: note, continueTurn: true, runId: "run-resume" });
-  const result = await harness.turns.runTurn(turn);
+  const ask = "list the files";
+  const history = [
+    {
+      sessionId: "session-1",
+      seq: 1,
+      parentSeq: null,
+      type: "user",
+      payload: { text: ask, runId: "run-resume" },
+      scopeLabel: "org:test",
+      createdAt: 1,
+    },
+    {
+      sessionId: "session-1",
+      seq: 2,
+      parentSeq: null,
+      type: "tool_call",
+      payload: { tool: "execute", callId: "c1", command: "ls" },
+      scopeLabel: "org:test",
+      createdAt: 2,
+    },
+    {
+      sessionId: "session-1",
+      seq: 3,
+      parentSeq: null,
+      type: "tool_result",
+      payload: { tool: "execute", callId: "c1", result: "a.txt" },
+      scopeLabel: "org:test",
+      createdAt: 3,
+    },
+  ] as SessionEntry[];
+  const { turn, entries, llmRequests } = harnessTurn({
+    input: "fallback input",
+    history,
+    continueTurn: true,
+    resumeUserSeq: 1,
+    runId: "run-resume",
+    environment: "ENV-NOTE",
+  });
+  const result = await createClaudeHarness({}).turns.runTurn(turn);
   assert.equal(result.reply, "picking up");
-  assert.equal(entries[0]?.type, "user");
-  assert.equal((entries[0]!.payload as { text: string }).text, note);
-  assert.ok(prompted[0]!.includes("(system note:"), "the note reaches the model as a user prompt");
+  assert.deepEqual(
+    entries.map((entry) => entry.type).filter((type) => type !== "thinking"),
+    ["assistant"],
+  );
+  assert.equal(prompted.length, 1);
+  const prompt = JSON.parse(prompted[0]!) as Array<{ text: string }>;
+  const text = prompt[0]!.text;
+  assert.equal(text.match(/list the files/g)?.length, 1, "the request appears once");
+  assert.ok(text.indexOf(ask) < text.indexOf("Tool result"), "the request precedes the work already done");
+  assert.ok(!text.slice(0, text.indexOf(ask)).includes("BEGIN TRANSCRIPT"), "the request is not quoted history");
+  assert.match(text, /Tool result \(execute, call c1\): a\.txt/);
+  assert.doesNotMatch(text, /fallback input|ENV-NOTE/);
+  assert.equal(llmRequests[0]?.turnSeq, 1);
 });
 
 for (const shutdown of [false, true]) {
@@ -795,7 +840,7 @@ for (const shutdown of [false, true]) {
     assert.equal(result.stoppedByUser, undefined);
     assert.deepEqual(
       entries.map((entry) => entry.type).filter((type) => type !== "thinking"),
-      shutdown ? ["user", "tool_call", "tool_result"] : ["user", "tool_call", "tool_result", "assistant"],
+      shutdown ? ["user", "tool_call", "tool_result"] : ["user", "tool_call", "tool_result", "assistant", "system"],
     );
     const partial = findTrailingPartialTurn(entries, turn.input);
     if (shutdown) {
@@ -803,8 +848,34 @@ for (const shutdown of [false, true]) {
       assert.notEqual(resumeStrategy(entries, partial).kind, "restart");
       assert.equal(turnAtSeq(entries, partial.userSeq)?.answer, undefined);
     } else {
-      assert.deepEqual(entries.at(-1)!.payload, { text: "Visible partial", stopped: true });
+      assert.deepEqual(entries.at(-2)!.payload, { text: "Visible partial", stopped: true });
+      assert.deepEqual(entries.at(-1)!.payload, {
+        kind: "turn_stopped",
+        reason: "because the run was cancelled",
+      });
       assert.equal(partial, null);
     }
   });
 }
+
+test("Claude records the stop when the worker cancels a turn before any output", async () => {
+  const waiting = Promise.withResolvers<void>();
+  const cancel = new AbortController();
+  currentScript = async function* () {
+    waiting.resolve();
+    await new Promise((resolve) => cancel.signal.addEventListener("abort", resolve, { once: true }));
+    yield* [];
+  };
+  const harness = createClaudeHarness({});
+  const { turn, entries } = harnessTurn({ input: "go", cancel: cancel.signal });
+  const running = harness.turns.runTurn(turn);
+  await waiting.promise;
+  cancel.abort();
+  const result = await running;
+  assert.equal(result.stopped, true);
+  assert.equal(result.reply, "");
+  assert.deepEqual(
+    entries.filter((e) => e.type !== "user").map((e) => e.payload),
+    [{ kind: "turn_stopped", reason: "because the run was cancelled" }],
+  );
+});

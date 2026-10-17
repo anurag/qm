@@ -46,7 +46,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "local" | "sprites" | "aws" | "agent37" | "superserve" | "render";
+  backend?: "local" | "sprites" | "aws" | "agent37" | "superserve" | "e2b" | "render";
   app?: string;
   image?: string;
   baseImage?: string;
@@ -249,7 +249,7 @@ export function sandboxCoreEnv(
     sb.backend === "superserve" || effectiveSandboxBackend(config) === "superserve"
       ? effectiveSandboxBackend(config)
       : sb.backend;
-  if (backend === "agent37" || backend === "superserve") {
+  if (backend === "agent37" || backend === "superserve" || backend === "e2b") {
     env.SANDBOX_BACKEND = backend;
     return { env, missingSecrets };
   }
@@ -1670,10 +1670,11 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       o["backend"] !== "aws" &&
       o["backend"] !== "agent37" &&
       o["backend"] !== "superserve" &&
+      o["backend"] !== "e2b" &&
       o["backend"] !== "render"
     ) {
       throw new CliError(
-        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), "agent37", "superserve" (Superserve sandboxes), or "render"`,
+        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), "agent37", "superserve" (Superserve sandboxes), "e2b" (E2B sandboxes), or "render" (Render Sandboxes)`,
       );
     }
     out.backend = o["backend"];
@@ -1737,7 +1738,7 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
-  if (out.backend === "agent37" || out.backend === "superserve" || out.backend === "render") {
+  if (out.backend === "agent37" || out.backend === "superserve" || out.backend === "e2b" || out.backend === "render") {
     const stray = (["app", "image", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
     if (stray.length) {
       throw new CliError(

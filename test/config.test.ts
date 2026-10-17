@@ -608,6 +608,11 @@ test("DEPLOY_PROVIDER=porter selects the Porter deploy provider and reads its en
   });
 });
 
+test("DEPLOY_PROVIDER=e2b selects E2B publishing and needs the E2B key", () => {
+  assert.equal(loadConfig({ DEPLOY_PROVIDER: "e2b", E2B_API_KEY: "e2b-key" }).deployProvider, "e2b");
+  assert.throws(() => loadConfig({ DEPLOY_PROVIDER: "e2b" }), /missing or insecure required core secrets: E2B_API_KEY/);
+});
+
 test("the deploy runner image falls back to the sandbox image", () => {
   const config = loadConfig({
     DEPLOY_PROVIDER: "porter",
@@ -736,6 +741,7 @@ test("the active provider's own apps domain reaches the gate when DEPLOY_APPS_DO
 test("DEPLOY_APPS_DOMAIN refuses shared platform domains that cannot carry per-app subdomains", () => {
   assert.throws(() => loadConfig({ DEPLOY_APPS_DOMAIN: "myapp.onporter.run" }), /shared platform domain/);
   assert.throws(() => loadConfig({ DEPLOY_APPS_DOMAIN: "myapp.fly.dev" }), /shared platform domain/);
+  assert.throws(() => loadConfig({ DEPLOY_APPS_DOMAIN: "8081-abc.e2b.app" }), /shared platform domain/);
   assert.equal(
     loadConfig({ DEPLOY_APPS_DOMAIN: "apps.example.com", AWS_DEPLOY_GATE_SECRET: "0123456789abcdef0123456789abcdef" })
       .deployAppsDomain,

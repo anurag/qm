@@ -1,3 +1,4 @@
+import type { RunStop } from "../../runs/run-store.ts";
 import type { ExternalSlackPolicies } from "../../resolution/external-slack.ts";
 import type { RuntimeService } from "../../harness/runtime-types.ts";
 import type { SandboxResources } from "../../sandbox/sandbox-resources.ts";
@@ -96,6 +97,7 @@ export interface OrchestratorInput extends Omit<
   origin: TurnOrigin;
   runId?: string;
   attempt?: number;
+  resumeCause?: RunStop;
   runLeaseToken?: string;
 
   runStartedAt?: number;
@@ -189,6 +191,11 @@ export interface OrchestratorDeps {
   resolveConnectorClient?: OAuthClientResolver;
   scratchExec?: boolean;
   featureFlags?: FeatureFlagStore;
+  installSharedCanvas?: (
+    actorId: string,
+    fileId: string,
+    at: { threadRef: string; sessionId: string },
+  ) => Promise<string | null>;
   teams?: TeamStore;
   credentialUsage?: CredentialUsageSink;
   keychain?: Keychain;

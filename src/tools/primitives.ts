@@ -191,6 +191,7 @@ export type AttachResult = { ok: true; files: AttachedFileMeta[]; staged: number
 export type AttachFiles = (files: readonly OutboundFile[], sandboxId?: string) => Promise<AttachResult>;
 
 export interface ToolContext extends SurfaceToolDeps {
+  installSharedCanvas?: (fileId: string) => Promise<string | null>;
   admin?: AdminToolAccess;
   runtime?(request: RuntimeRequest, signal?: AbortSignal): Promise<RuntimeResult>;
   attach: AttachFiles;
@@ -248,6 +249,7 @@ export interface ToolContext extends SurfaceToolDeps {
     callId: string,
     timeoutMs: number,
     signal?: AbortSignal,
+    toolName?: string,
   ): Promise<ClientToolResult | "timeout" | "cancelled">;
   backgroundStart(
     command: string,
@@ -466,7 +468,9 @@ export const CONTROL_UNAVAILABLE: ControlUnavailable = {
 };
 
 export interface ToolContextDeps {
+  desktopClientId?: string;
   admin?: AdminToolAccess;
+  installSharedCanvas?: (fileId: string) => Promise<string | null>;
   sandbox: Sandbox;
   commandCredentials?: readonly CommandCredential[];
   resolveCommandCredentials?: (handles: readonly string[]) => Promise<readonly CommandCredential[]>;
@@ -748,6 +752,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
 
   return {
     ...(deps.admin ? { admin: deps.admin } : {}),
+    ...(deps.installSharedCanvas ? { installSharedCanvas: deps.installSharedCanvas } : {}),
     ...(deps.commandCredentials?.length
       ? { commandCredentialHandles: deps.commandCredentials.map((credential) => credential.handle) }
       : {}),
@@ -1209,7 +1214,9 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
       return deps.mcp.call(name, args, deps.createdBy);
     },
 
-    async awaitClientResult(callId, timeoutMs, signal) {
+    async awaitClientResult(callId, timeoutMs, signal, toolName) {
+      if (toolName === "desktop" && !deps.desktopClientId)
+        return { content: "Computer access unavailable; continue from QM desktop.", isError: true };
       if (!deps.signals || runId === undefined) throw new Error("client tools need a queued run");
       return waitForClientResult(deps.signals, runId, callId, { timeoutMs, ...(signal ? { signal } : {}) });
     },

@@ -3,8 +3,18 @@ import { LRUCache } from "lru-cache";
 import { NotFoundError } from "porter-sandbox";
 import type { Deployment, DeploymentVersion } from "./deploy-store.ts";
 import type { DeployEndpoint, DeployProvider } from "./deploy-provider.ts";
-import { appGone, appLaunch, appLogs, appReporter, waitAppReady, type AppErrorSink } from "./shared-deploy-provider.ts";
-import { normalizeRelPath, posixJoin, readTree } from "./deploy-fs.ts";
+import {
+  appEnv as declaredAppEnv,
+  appGone,
+  appLaunch,
+  appLogs,
+  appReporter,
+  bundleEntries,
+  extractBundle,
+  waitAppReady,
+  type AppErrorSink,
+} from "./shared-deploy-provider.ts";
+import { posixJoin } from "./deploy-fs.ts";
 import { makeTar } from "../sandbox/tar.ts";
 import {
   createPorterClient,
@@ -22,7 +32,7 @@ import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts"
 import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { createKeyedQueue } from "../util/async.ts";
 import { shq } from "../util/shell.ts";
-import { errMessage, swallow, swallowAs } from "../util/errors.ts";
+import { errMessage, execFailure, swallow, swallowAs } from "../util/errors.ts";
 
 const APP_DIR = "/app";
 const HOME_DIR = "/root";
@@ -39,7 +49,6 @@ const RESOLVE_CACHE_MAX = 500;
 const KIND_TAG = "qm-kind";
 const DEPLOY_TAG = "qm-deploy";
 const DEFAULT_RUNNER_IMAGE = "ghcr.io/porter-dev/qm-app-runner:latest";
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface StoredPorterDeployBody {
   deploymentId: string;
@@ -112,14 +121,12 @@ export function createPorterDeployProvider(opts: PorterDeployProviderOptions): D
   }
 
   function appEnv(version: DeploymentVersion): Record<string, string> {
-    const declared = Object.fromEntries(Object.entries(version.env ?? {}).filter(([k]) => ENV_NAME.test(k)));
-    return { ...declared, HOME: HOME_DIR, PORT: String(appPort), DATA_DIR };
+    return declaredAppEnv(version.env, { HOME: HOME_DIR, PORT: String(appPort), DATA_DIR });
   }
 
   async function unpackTree(sandboxId: string, volumeId: string, guestDir: string, dir: string): Promise<void> {
-    const files = await readTree(dir, { tolerateMissing: true });
-    if (!files.length) return;
-    const entries = files.map((f) => ({ path: normalizeRelPath(f.path), data: f.data }));
+    const entries = await bundleEntries(dir);
+    if (!entries.length) return;
     const bundle = `${BUNDLE_DIR}/${randomUUID()}.tar`;
     const uploaded = await client.volumes.raw
       .writeFile(volumeId, await makeTar(entries), { path: `/${bundle}` }, { timeoutMs: BUNDLE_UPLOAD_TIMEOUT_MS })
@@ -131,12 +138,10 @@ export function createPorterDeployProvider(opts: PorterDeployProviderOptions): D
     const guestBundle = posixJoin(DATA_DIR, bundle);
     const r = await execRaw(
       sandboxId,
-      `mkdir -p ${shq(guestDir)} && tar -xmf ${shq(guestBundle)} -C ${shq(guestDir)}; rc=$?; ` +
-        `rm -f ${shq(guestBundle)}; rmdir ${shq(posixJoin(DATA_DIR, BUNDLE_DIR))} 2>/dev/null; exit $rc`,
+      extractBundle(guestBundle, guestDir, `rmdir ${shq(posixJoin(DATA_DIR, BUNDLE_DIR))} 2>/dev/null`),
       BUNDLE_EXTRACT_TIMEOUT_SEC,
     );
-    if (r.code !== 0)
-      throw new Error(`porter deploy: unpacking into ${guestDir} failed: ${(r.stderr || r.stdout).slice(0, 300)}`);
+    if (r.code !== 0) throw execFailure(`porter deploy: unpacking into ${guestDir}`, r);
   }
 
   async function materialize(sandboxId: string, volumeId: string, version: DeploymentVersion): Promise<void> {
@@ -152,7 +157,7 @@ export function createPorterDeployProvider(opts: PorterDeployProviderOptions): D
       appLaunch(inner, appPort),
     ].join("; ");
     const r = await execRaw(sandboxId, script, APP_START_EXEC_TIMEOUT_SEC);
-    if (r.code !== 0) throw new Error(`porter deploy app start failed: ${r.stderr.slice(0, 300)}`);
+    if (r.code !== 0) throw execFailure("porter deploy app start", r);
     await waitAppReady((script, timeoutSec) => execRaw(sandboxId, script, timeoutSec), {
       appPort,
       windowSec: readyWindowSec,

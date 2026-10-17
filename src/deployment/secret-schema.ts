@@ -14,6 +14,7 @@ type SecretGate =
   | "render"
   | "do-managed-agents"
   | "porter-deploy"
+  | "e2b-deploy"
   | "fly-shared-deploy"
   | "fly-deploy"
   | "aws-deploy-gate"
@@ -47,7 +48,7 @@ export const CORE_SECRET_SPECS: readonly RuntimeSecretSpec[] = [
   { name: "AGENT37_API_KEY", requiredWhen: "agent37" },
   { name: "RENDER_API_KEY", requiredWhen: "render" },
   { name: "SUPERSERVE_API_KEY", requiredWhen: "superserve" },
-  { name: "E2B_API_KEY", requiredWhen: "e2b" },
+  { name: "E2B_API_KEY", requiredWhen: ["e2b", "e2b-deploy"] },
   { name: "DO_AGENTS_API_TOKEN", requiredWhen: "do-managed-agents" },
   { name: "MODAL_TOKEN_ID", requiredWhen: "modal" },
   { name: "MODAL_TOKEN_SECRET", requiredWhen: "modal" },
@@ -78,6 +79,7 @@ const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => b
   render: (env) => sandboxBackendSelected(env, "render") || env.DEPLOY_PROVIDER === "render",
   "do-managed-agents": (env) => sandboxBackendSelected(env, "do-managed-agents"),
   "porter-deploy": (env) => env.DEPLOY_PROVIDER === "porter",
+  "e2b-deploy": (env) => env.DEPLOY_PROVIDER === "e2b",
   "fly-shared-deploy": (env) => env.DEPLOY_PROVIDER === "fly" && Boolean(env.FLY_DEPLOY_SHARED_APP_NAME?.trim()),
   "fly-deploy": (env) => env.DEPLOY_PROVIDER === "fly",
   "aws-deploy-gate": (env) => Boolean(env.AWS_DEPLOY_APPS_DOMAIN || env.DEPLOY_APPS_DOMAIN),

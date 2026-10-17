@@ -63,7 +63,7 @@ const FAMILIES: AgentApiFamily[] = [
     match: (method, path) => path === "/v1/swarm" && (method === "GET" || method === "POST"),
     when: (view) => view.swarmsEnabled,
     guidance:
-      "Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker.",
+      "Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead. Spawn accepts model, effort and fastMode to choose the runtime for the workers it creates; children inherit it unless they choose again. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker.",
     routes: [
       {
         method: "GET",
@@ -377,6 +377,17 @@ const FAMILIES: AgentApiFamily[] = [
     ],
   },
   {
+    match: (m, p) =>
+      (p === "/v1/ui/canvas" && ["GET", "POST", "DELETE"].includes(m)) || (m === "POST" && p === "/v1/ui/observe"),
+    when: () => false,
+    routes: [
+      { method: "GET", path: "/v1/ui/canvas", summary: "read this conversation's web UI canvas" },
+      { method: "POST", path: "/v1/ui/canvas", summary: "write, update, replace or pin the canvas (ui-canvas skill)" },
+      { method: "DELETE", path: "/v1/ui/canvas", summary: "dismiss the canvas" },
+      { method: "POST", path: "/v1/ui/observe", summary: "snapshot the person's open web UI (ui-state skill)" },
+    ],
+  },
+  {
     match: onPath("POST", "/v1/share"),
     when: () => false,
     routes: [
@@ -556,6 +567,18 @@ const FAMILIES: AgentApiFamily[] = [
         summary: "update a webhook task in place (URL and secret unchanged)",
       },
       { method: "POST", path: "/v1/webhooks/:id/enable", summary: "re-enable a webhook" },
+    ],
+  },
+  {
+    match: (m, p) => p === "/v1/pinned-skills" && (m === "GET" || m === "PUT"),
+    routes: [
+      { method: "GET", path: "/v1/pinned-skills", summary: "list the skills pinned to this conversation's scope" },
+      {
+        method: "PUT",
+        path: "/v1/pinned-skills",
+        summary:
+          "replace this scope's pinned skills — body {names: string[]} in display order (max 6; [] clears); they always lead the per-turn skills shortlist. Personal pins apply to that person's DMs, channel pins to that channel. Live person turns only",
+      },
     ],
   },
   {

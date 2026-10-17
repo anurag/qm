@@ -118,6 +118,8 @@ import {
   type TurnRuntime,
   type WorkBlock,
   fileContentUrl,
+  onChatPrefsChange,
+  pinLatestPrompt,
   switchedDefault,
 } from "./core-bridge";
 import {
@@ -152,6 +154,8 @@ import {
 import {
   attachmentGallery,
   avatarTpl,
+  brandMark,
+  brandName,
   browserRenderableImage,
   chipBadge,
   copyText,
@@ -212,6 +216,7 @@ import { decorateTextCodeBlocks } from "./text-code";
 import { createTranscriptViewport } from "./transcript-viewport";
 import { suggestedActivities } from "./suggested-activities";
 import { reportHandledError } from "./browser-errors.ts";
+import { uiCanvasPanel } from "./ui-canvas";
 
 installMarkdownSanitizer();
 
@@ -275,7 +280,8 @@ export function createChatSurface(
     ctx.composer.state.error = message;
   });
   let pendingFork: { index: number } | null = null;
-  const transcriptViewport = createTranscriptViewport();
+  const transcriptViewport = createTranscriptViewport({ pinPrompt: pinLatestPrompt });
+  const stopPrefsWatch = onChatPrefsChange(() => transcriptViewport.refresh());
   let preserveConnectionScroll = isConnectionReturn();
   let connectionReturnMessageCount: number | null = null;
   const transcriptFetcher = dependencies.fetchTranscript ?? fetchTranscript;
@@ -310,6 +316,7 @@ export function createChatSurface(
     pins: [] as SessionPin[],
     pinsExpanded: false,
     labelSpeakers: false,
+    assistantSpeakerLabel: "",
   };
 
   const inlineSteers = new Map<number, { message: AgentMessage; index: number }>();
@@ -353,6 +360,7 @@ export function createChatSurface(
     }
     const viewer = appState.me?.displayName?.trim().toLowerCase();
     chatState.labelSpeakers = names.size > 1 || (Boolean(viewer) && [...names].some((n) => n.toLowerCase() !== viewer));
+    chatState.assistantSpeakerLabel = chatState.labelSpeakers ? brandName() : "";
   }
 
   function speakerLabelFor(message: AgentMessage): string | undefined {
@@ -372,7 +380,10 @@ export function createChatSurface(
     if (!speaker) return nothing;
     const member = speakerMember(message);
     return html`<div class="speaker-label">
-      ${avatarTpl({ key: member?.principalId ?? speaker, name: speaker, avatarUrl: member?.avatarUrl })}${speaker}
+      ${avatarTpl({ key: member?.principalId ?? speaker, name: speaker, avatarUrl: member?.avatarUrl })}<span
+        title=${speaker}
+        >${speaker.split(/\s+/, 1)[0]!.toLowerCase()}</span
+      >
     </div>`;
   }
   let transcriptRefreshGeneration = 0;
@@ -787,6 +798,7 @@ export function createChatSurface(
 
   function dispose(): void {
     redrawHooks.delete(redrawForConnector);
+    stopPrefsWatch();
     teardownActiveChat();
   }
 
@@ -1621,7 +1633,7 @@ export function createChatSurface(
                 </div>`
               : nothing
           }
-          ${glanceTier || ctx.pane || editingApp ? nothing : sessionTopbar()}
+          ${uiCanvasPanel(ctx)} ${glanceTier || ctx.pane || editingApp ? nothing : sessionTopbar()}
           ${glanceTier ? paneGlance(agent, messages, glanceTier) : nothing}
           <section class="chat-scroll" tabindex="0" aria-label="Conversation">
             ${pinnedStrip()}
@@ -1757,7 +1769,10 @@ export function createChatSurface(
     const forkable = Boolean(chatState.threadRef && chatState.sessionId && chatState.agent);
     const forking = pendingFork !== null;
     const speaker = speakerLabelFor(message);
-    const speakerLabel = speaker && `${speaker}\n${speakerMember(message)?.avatarUrl ?? ""}`;
+    const speakerLabel =
+      message.role === "assistant" && chatState.labelSpeakers
+        ? chatState.assistantSpeakerLabel
+        : speaker && `${speaker}\n${speakerMember(message)?.avatarUrl ?? ""}`;
     const edited = Boolean((message as { edited?: boolean }).edited);
     const deleted = Boolean((message as { deleted?: boolean }).deleted);
     const day = new Date().toDateString();
@@ -1854,7 +1869,7 @@ export function createChatSurface(
         });
       return html`
         <article
-          class="message-row user-row ${steered ? "steered-row" : ""}"
+          class="message-row user-row ${speaker ? "named-user-row" : ""} ${steered ? "steered-row" : ""}"
           data-index=${index}
           data-entry-seqs=${messageEntrySeqs(message).join(" ")}
         >
@@ -1974,12 +1989,17 @@ export function createChatSurface(
         });
       return html`
         <article
-          class="message-row assistant-row ${isStreaming ? "streaming" : ""}"
+          class="message-row assistant-row ${chatState.labelSpeakers ? "named-assistant-row" : ""} ${isStreaming ? "streaming" : ""}"
           data-index=${index}
           data-entry-seqs=${messageEntrySeqs(message)
             .filter((seq) => !inlineSteers.has(seq))
             .join(" ")}
         >
+          ${
+            chatState.labelSpeakers
+              ? html`<div class="speaker-label">${brandMark()}<span>${chatState.assistantSpeakerLabel}</span></div>`
+              : nothing
+          }
           <div class="assistant-body">
             ${workView} ${assistantContent(msg, isStreaming, showWork)} ${assistantFileList(deliveredFiles)}
             ${msg.stopReason === "error" && msg.errorMessage ? html`<div class="composer-error inline">${msg.errorMessage}</div>` : nothing}

@@ -1,4 +1,4 @@
-import type { ReplayImageRef } from "./replay.ts";
+import { TURN_STOPPED_KIND, type ReplayImageRef } from "./replay.ts";
 import { randomBytes } from "node:crypto";
 import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import {
@@ -35,7 +35,10 @@ export type BridgedTool = {
   execute(
     callId: string,
     args: unknown,
-  ): Promise<{ content?: Array<{ type?: string; text?: string }>; terminate?: boolean }>;
+  ): Promise<{
+    content?: Array<{ type?: string; text?: string; data?: string; mimeType?: string }>;
+    terminate?: boolean;
+  }>;
 };
 
 export interface SteerIntake {
@@ -73,13 +76,28 @@ export async function recordSteerIntake(turn: HarnessTurnInput, steer: SteerInta
   await steer.acknowledge?.().catch(swallowAs("steer acknowledge", undefined));
 }
 
-export async function recordStoppedReply(
+const STOPPED_FALLBACK_REASON = "unexpectedly";
+
+export async function recordStoppedTurn(
   turn: HarnessTurnInput,
-  text: string,
+  partial: string,
+  reason: string = STOPPED_FALLBACK_REASON,
   replay: Record<string, unknown> = {},
 ): Promise<SessionEntry | null> {
   if (turn.shutdown?.aborted) return null;
-  return turn.emit({ type: "assistant", payload: { text, stopped: true, ...replay }, scopeLabel: turn.scopeLabel });
+  const answer = partial.trim()
+    ? await turn.emit({
+        type: "assistant",
+        payload: { text: partial, stopped: true, ...replay },
+        scopeLabel: turn.scopeLabel,
+      })
+    : null;
+  const note = await turn.emit({
+    type: "system",
+    payload: { kind: TURN_STOPPED_KIND, reason },
+    scopeLabel: turn.scopeLabel,
+  });
+  return note ?? answer;
 }
 
 export function harnessToolContext(turn: HarnessTurnInput): ToolContextRef {
@@ -231,11 +249,14 @@ export async function resumeInterruptedToolCall(
   };
 }
 
-export function bridgedToolText(result: Awaited<ReturnType<BridgedTool["execute"]>>): string {
-  return (result.content ?? [])
-    .filter((item): item is { type?: string; text: string } => typeof item.text === "string")
-    .map((item) => item.text)
-    .join("\n");
+export function bridgedToolContent(result: Awaited<ReturnType<BridgedTool["execute"]>>) {
+  return (result.content ?? []).flatMap<
+    { type: "text"; text: string } | { type: "image"; data: string; mimeType: string }
+  >((item) => {
+    if (item.type === "image" && item.data && item.mimeType)
+      return [{ type: "image", data: item.data, mimeType: item.mimeType }];
+    return typeof item.text === "string" ? [{ type: "text", text: item.text }] : [];
+  });
 }
 
 export type OneShotRunner = (

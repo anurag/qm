@@ -106,3 +106,30 @@ export function turnOriginRequestFields(origin: TurnOrigin): Partial<LegacyTurnO
 export function isPersonAuthored(kind: TurnOrigin["kind"]): boolean {
   return kind === "human" || kind === "direct";
 }
+
+export function isSessionTurn(input: Pick<TurnRequest, "sessionSenderId" | "delegatingRunId">): boolean {
+  return !!input.sessionSenderId || !!input.delegatingRunId;
+}
+
+export function sessionTurnOrigin(origin: TurnOrigin | undefined, text: string): TurnOrigin {
+  if (!origin || origin.kind === "automation") return { ...origin, kind: "automation", screenData: text };
+  if (origin.kind === "human") return { kind: "human" };
+  if (origin.kind === "ambient") return { kind: "ambient", ...(origin.live ? { live: true } : {}) };
+  return origin;
+}
+
+export function desktopClientForTurn(
+  input: Partial<LegacyTurnOrigin> &
+    Partial<
+      Pick<TurnRequest, "origin" | "surface" | "desktopClientId" | "proactiveOpener" | "spawned" | "botActor">
+    > & { attempt?: number },
+): string | undefined {
+  return resolveTurnOrigin(input).kind === "human" &&
+    input.surface === "web" &&
+    !input.proactiveOpener &&
+    !input.spawned &&
+    !input.botActor &&
+    (input.attempt ?? 1) <= 1
+    ? input.desktopClientId
+    : undefined;
+}

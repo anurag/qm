@@ -5,6 +5,7 @@ import { flushErrorReporting, reportBackendError } from "../../chassis/src/error
 import { appEditSlug } from "../src/app-edit.ts";
 import { composioCallbackUrl } from "./composio-return.ts";
 import { sharedSessionHtml } from "./shared-session.ts";
+import { uiCanvasRoutes } from "./ui-canvas-routes.ts";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
@@ -732,9 +733,10 @@ async function readJson<T extends object>(
   req: IncomingMessage,
   res: ServerResponse,
   allowEmpty = true,
+  maxBytes = MAX_BODY_BYTES,
 ): Promise<T | null> {
   try {
-    const raw = await readBody(req);
+    const raw = await readBodyCapped(req, maxBytes);
     if (!raw && !allowEmpty) {
       json(res, 400, { error: "bad_request" });
       return null;
@@ -1668,6 +1670,14 @@ const apiRoutes: readonly WebRoute[] = [
       return relayCore(res, "PUT", "/v1/ui-state", JSON.stringify({ ...body, principalId: user }));
     },
   },
+  ...uiCanvasRoutes({
+    impersonated: (req) => Boolean(resolveIdentity(req)?.impersonator),
+    coreFetch,
+    relayCore,
+    relay,
+    json,
+    readJson,
+  }),
   {
     method: "GET",
     path: "/api/inbox",
@@ -2483,11 +2493,14 @@ const apiRoutes: readonly WebRoute[] = [
       let channelName: string | undefined;
       const attachments: CoreAttachment[] = [];
       let approval: { requestId: string; approved: boolean; scope?: string } | undefined;
+      let desktopClientId: string | undefined;
       let proactiveOpener = false;
       let idempotencyKey: string | undefined;
       try {
         const p = JSON.parse(await readBody(req));
         text = String(p.text ?? "");
+        if (typeof p.desktopClientId === "string" && p.desktopClientId.length === 36)
+          desktopClientId = p.desktopClientId;
         idempotencyKey = namespacedSendKey(user, p.idempotencyKey);
         if (
           !idempotencyKey &&
@@ -2549,6 +2562,7 @@ const apiRoutes: readonly WebRoute[] = [
         ...(attachments.length ? { attachments } : {}),
         ...(approval ? { approval } : {}),
         ...(proactiveOpener ? { proactiveOpener: true } : {}),
+        ...(desktopClientId && !proactiveOpener ? { desktopClientId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
       };
       return postTurnAndMint(req, res, turn, user, threadRef);
@@ -2648,7 +2662,10 @@ const apiRoutes: readonly WebRoute[] = [
         scopeId?: unknown;
         channelName?: unknown;
         queuedRunId?: unknown;
-      }>(req, res, false);
+        callId?: unknown;
+        result?: unknown;
+        desktopClientId?: unknown;
+      }>(req, res, false, 6_000_000);
       if (!p) return;
       const kind = typeof p.kind === "string" ? p.kind : "";
       const text = typeof p.text === "string" ? p.text : undefined;
@@ -2672,6 +2689,9 @@ const apiRoutes: readonly WebRoute[] = [
         `/v1/runs/${encodeURIComponent(id)}/signal`,
         JSON.stringify({
           kind,
+          ...(kind === "client_result"
+            ? { callId: p.callId, result: p.result, desktopClientId: p.desktopClientId }
+            : {}),
           ...(text !== undefined ? { text } : {}),
           ...steerFields,
           ...(typeof p.queuedRunId === "string" ? { queuedRunId: p.queuedRunId } : {}),

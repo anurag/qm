@@ -20,6 +20,7 @@ import {
   delegatedAuthorizationOrigin,
   stopSessionTree,
 } from "../src/sessions/session-syscalls.ts";
+import type { Run } from "../src/runs/run-store.ts";
 import { scopeId, type Conversation, type Principal, type ScopeId, type Session } from "../src/types.ts";
 import type { SessionStore } from "../src/sessions/session-store.ts";
 import type { RunStore } from "../src/runs/run-store.ts";
@@ -1177,9 +1178,9 @@ async function delegatedHumanRig(context: Partial<OrchestratorInput> = {}) {
   return { ...r, parent: parent.run, child, run, api };
 }
 
-test("delegated live authority follows immutable provenance without changing automation origin", async () => {
+test("delegated human origin retains live authority boundaries", async () => {
   const r = await delegatedHumanRig();
-  assert.equal(r.run.request.origin.kind, "automation");
+  assert.equal(r.run.request.origin.kind, "human");
   assert.equal((await delegatedAuthorizationOrigin(r.run.request, r))?.kind, "human");
   for (const patch of [
     { actor: { ...actor, id: "other" } },
@@ -1278,39 +1279,41 @@ test("a later participant cannot change a completion's actor, rollout, destinati
   assert.equal(wake.request.actor.id, actor.id);
   assert.equal(wake.request.deliveryTarget, "slack:C1:task");
   assert.equal(wake.request.unattendedGrants, undefined);
-  assert.deepEqual(wake.request.origin, { kind: "automation", screenData: wake.request.text });
+  assert.deepEqual(wake.request.origin, { kind: "human" });
 });
 
-test("completion wakes preserve live authorization for subsequent delegated steps", async () => {
-  const r = await delegatedHumanRig();
-  const claimed = await r.runs.claimById(r.run.id, "w1", 60000);
-  await r.runs.complete(r.run.id, claimed!.leaseToken!, { status: "ok", reply: "step one" });
-  for (const pending of await r.runs.inFlightForThread(r.room.threadRef)) {
-    const parentTurn = await r.runs.claimById(pending.id, "parent", 60_000);
-    assert.ok(parentTurn);
-    await r.runs.complete(pending.id, parentTurn.leaseToken!, { status: "silent" });
-  }
-  await deliverSubagentMail(
-    { ...r, maxAttempts: 3, delegationEnabled: async () => true },
-    (await r.runs.get(r.run.id))!,
-  );
-  const wake = (await r.runs.getByDedupKey(`subagent-return:${r.run.id}`))!;
-  assert.ok(wake);
-  assert.equal(wake.request.origin.kind, "automation");
-  assert.equal(wake.request.addressed, true);
-  assert.equal((await delegatedAuthorizationOrigin(wake.request, r))?.kind, "human");
-  const api = createSessionSyscalls({ ...r, maxAttempts: 3 }).forTurn({
-    session: r.room,
-    scopeId: scope,
-    request: { ...wake.request, runId: wake.id },
+for (const surface of ["slack", "web"] as const) {
+  test(`${surface} completion wakes preserve live authorization for subsequent delegated steps`, async () => {
+    const r = await delegatedHumanRig({ surface });
+    const claimed = await r.runs.claimById(r.run.id, "w1", 60000);
+    await r.runs.complete(r.run.id, claimed!.leaseToken!, { status: "ok", reply: "step one" });
+    for (const pending of await r.runs.inFlightForThread(r.room.threadRef)) {
+      const parentTurn = await r.runs.claimById(pending.id, "parent", 60_000);
+      assert.ok(parentTurn);
+      await r.runs.complete(pending.id, parentTurn.leaseToken!, { status: "silent" });
+    }
+    await deliverSubagentMail(
+      { ...r, maxAttempts: 3, delegationEnabled: async () => true },
+      (await r.runs.get(r.run.id))!,
+    );
+    const wake = (await r.runs.getByDedupKey(`subagent-return:${r.run.id}`))!;
+    assert.ok(wake);
+    assert.equal(wake.request.origin.kind, "human");
+    assert.equal(wake.request.addressed, true);
+    assert.equal((await delegatedAuthorizationOrigin(wake.request, r))?.kind, "human");
+    const api = createSessionSyscalls({ ...r, maxAttempts: 3 }).forTurn({
+      session: r.room,
+      scopeId: scope,
+      request: { ...wake.request, runId: wake.id },
+    });
+    assert.ok((await api.write({ target: r.child.id, text: "step two", followup: true })).ok);
+    const next = (await r.runs.inFlightForThread(r.child.threadRef))[0]!;
+    assert.equal((await delegatedAuthorizationOrigin(next.request, r))?.kind, "human");
+    await r.sessions.setParentSession(r.child.id, null);
+    assert.equal(await delegatedAuthorizationOrigin(wake.request, r), undefined);
+    assert.equal(await delegatedAuthorizationOrigin(next.request, r), undefined);
   });
-  assert.ok((await api.write({ target: r.child.id, text: "step two", followup: true })).ok);
-  const next = (await r.runs.inFlightForThread(r.child.threadRef))[0]!;
-  assert.equal((await delegatedAuthorizationOrigin(next.request, r))?.kind, "human");
-  await r.sessions.setParentSession(r.child.id, null);
-  assert.equal(await delegatedAuthorizationOrigin(wake.request, r), undefined);
-  assert.equal(await delegatedAuthorizationOrigin(next.request, r), undefined);
-});
+}
 
 test("completed children do not fill a working parent's run slots and consumed returns settle", async () => {
   const r = await rig();
@@ -1492,7 +1495,7 @@ for (const addressed of [true, false]) {
     assert.equal(wake.request.surfaceTools, true);
     assert.equal(wake.request.delegatingRunId, r.parent.id);
     assert.equal(wake.request.sessionSenderId, r.child.id);
-    assert.equal(wake.request.origin.kind, "automation");
+    assert.equal(wake.request.origin.kind, "human");
     assert.match(wake.request.text, /delegated task finished/i);
     assert.equal(wake.request.displayText, "Delegated task completed");
     assert.equal(wake.request.envelopeWrapped, true);
@@ -1829,8 +1832,8 @@ test("sessions list shows only sidebar sessions the whole audience can see and c
   assert.equal((await live.start!({ fork: false, text: "hello", title: "fresh" })).ok, true);
   assert.equal((await live.start!({ fork: true })).ok, true);
   assert.deepEqual(started, [
-    { scopeId: scope, text: "hello", title: "fresh" },
-    { scopeId: scope, forkOf: room.id },
+    { scopeId: scope, origin: { kind: "human" }, sessionSenderId: room.id, text: "hello", title: "fresh" },
+    { scopeId: scope, origin: { kind: "human" }, sessionSenderId: room.id, forkOf: room.id },
   ]);
   const child = await sessions.getOrCreateByThread("agent:main:subagent:w", "dm", scope, undefined, "web");
   await sessions.updateTitle(child.id, "worker");
@@ -1901,4 +1904,81 @@ test("sessions list shows only sidebar sessions the whole audience can see and c
     assert.equal(out.ok, false);
   }
   assert.equal(started.length, 4);
+});
+
+test("stopping a session tree tells every stopped run who stopped it", async () => {
+  const sent: Array<{ runId: string; signal: unknown }> = [];
+  const root = { id: "root", scopeId: "personal:a", threadRef: "web:root" } as unknown as Session;
+  const child = { id: "child", scopeId: "personal:a", threadRef: "agent:main:subagent:child" } as unknown as Session;
+  const stopped = await stopSessionTree(
+    {
+      sessions: { childrenOf: async (id: string) => (id === "root" ? [child] : []) },
+      runs: {
+        inFlightForThread: async (threadRef: string) =>
+          [{ id: `run-${threadRef}`, status: "running" }] as unknown as Run[],
+        withdraw: async () => true,
+        get: async () => null,
+      },
+      signals: {
+        send: async (runId: string, signal: unknown) => {
+          sent.push({ runId, signal });
+          return true;
+        },
+      },
+    },
+    root,
+    "by the parent agent",
+  );
+  assert.equal(stopped, true);
+  assert.deepEqual(
+    sent.map((s) => s.signal),
+    [
+      { kind: "abort", reason: "by the parent agent" },
+      { kind: "abort", reason: "by the parent agent" },
+    ],
+  );
+});
+
+for (const origin of [
+  { kind: "human", messageTs: "1", entryTs: "2" },
+  { kind: "ambient", live: true, entryTs: "2" },
+  { kind: "automation" },
+] as const) {
+  test(`nested tasks and followups inherit ${origin.kind} origin`, async () => {
+    const r = await delegatedHumanRig({ origin });
+    const childApi = createSessionSyscalls({ ...r, maxAttempts: 3 }).forTurn({
+      session: r.child,
+      scopeId: scope,
+      request: { ...r.run.request, runId: r.run.id },
+    });
+    const opened = await childApi.open({ task: "inspect nested" });
+    assert.ok(opened.ok);
+    const child = (await r.sessions.get(opened.sessionId))!;
+    const nested = (await r.runs.latestForThread(child.threadRef))!;
+    assert.equal(nested.request.origin.kind, origin.kind);
+    assert.equal("messageTs" in nested.request.origin, false);
+    assert.equal("entryTs" in nested.request.origin, false);
+    assert.equal(nested.request.delegatingRunId, r.run.id);
+    assert.equal(nested.request.sessionSenderId, r.child.id);
+    assert.ok((await childApi.write({ target: child.id, followup: true, text: "inspect again" })).ok);
+    const followup = (await r.runs.latestForThread(child.threadRef))!;
+    assert.equal(followup.request.origin.kind, origin.kind);
+    assert.equal(followup.request.delegatingRunId, r.run.id);
+  });
+}
+
+test("detaching an ancestor revokes a descendant's delegated live authority", async () => {
+  const r = await delegatedHumanRig();
+  const api = createSessionSyscalls({ ...r, maxAttempts: 3 }).forTurn({
+    session: r.child,
+    scopeId: scope,
+    request: { ...r.run.request, runId: r.run.id },
+  });
+  const opened = await api.open({ task: "inspect nested" });
+  assert.ok(opened.ok);
+  const nested = (await r.sessions.get(opened.sessionId))!;
+  const run = (await r.runs.latestForThread(nested.threadRef))!;
+  assert.equal((await delegatedAuthorizationOrigin(run.request, r))?.kind, "human");
+  await r.sessions.setParentSession(r.child.id, null);
+  assert.equal(await delegatedAuthorizationOrigin(run.request, r), undefined);
 });

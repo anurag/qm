@@ -9,7 +9,7 @@ import { scopeId } from "../types.ts";
 import { rosterAdmits } from "../resolution/scope-membership.ts";
 import { isHalt, routeWake, type Wake } from "../wake/wake.ts";
 import type { OrchestratorInput } from "../core/orchestrator.ts";
-import { isPersonAuthored, resolveTurnOrigin } from "../core/turn-origin.ts";
+import { desktopClientForTurn, isPersonAuthored, isSessionTurn, resolveTurnOrigin } from "../core/turn-origin.ts";
 import { conversationScope } from "../resolution/resolution-service.ts";
 import { isTerminal, leaseLapsed } from "../runs/run-store.ts";
 import type { SessionStateEvent } from "../runs/session-state-bus.ts";
@@ -40,6 +40,8 @@ const PARTICIPANT_REHYDRATE_TIMEOUT_MS = 5_000;
 import { unscreenedNotice } from "../security/security-posture.ts";
 import type { AppHelpers } from "./app-helpers.ts";
 import type { AmbientHelpers } from "./app-ambient.ts";
+
+const USER_STOP = "by user";
 
 export function attributedSteerText(
   steerer: { id: string; displayName?: string | undefined },
@@ -92,8 +94,8 @@ export function createTurnMethods(
     const signals = deps.signals;
     const stop = async () => {
       const session = await deps.sessions.getByThread(run.sessionId);
-      if (session) return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals }, session);
-      await signals.send(run.id, { kind: "abort" });
+      if (session) return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals }, session, USER_STOP);
+      await signals.send(run.id, { kind: "abort", reason: USER_STOP });
       if (run.status === "pending") await deps.runs.withdraw(run.id);
       return true;
     };
@@ -199,9 +201,12 @@ export function createTurnMethods(
       let privateRequest = req.privateSessionMessage ? req : undefined;
       if (approvedRequest?.privateSessionMessage) privateRequest = approvedRequest;
       const origin = resolveTurnOrigin(privateRequest ?? req);
+      const sessionTurn =
+        (req.spawned && isSessionTurn(req)) ||
+        (sameApprovedMessage && approvedRequest && isSessionTurn(approvedRequest));
 
       const modelAccount =
-        !req.externalSlack && deps.userModelCredentials && origin.kind === "human"
+        !req.externalSlack && deps.userModelCredentials && origin.kind === "human" && !sessionTurn
           ? await deps.config.getModelAccountDurable(actor.id)
           : "company";
       const individualAuth = modelAccount !== "company";
@@ -372,8 +377,13 @@ export function createTurnMethods(
         surface: req.surface,
         ...(req.slackSource ? { slackSource: req.slackSource } : {}),
         ...(req.externalSlack ? { externalSlack: req.externalSlack } : {}),
+        ...(req.spawned && req.sessionSenderId ? { sessionSenderId: req.sessionSenderId } : {}),
+        ...(req.spawned && req.delegatingRunId ? { delegatingRunId: req.delegatingRunId } : {}),
         ...(sameApprovedMessage && approvedRequest?.sessionSenderId
           ? { sessionSenderId: approvedRequest.sessionSenderId }
+          : {}),
+        ...(sameApprovedMessage && approvedRequest?.delegatingRunId
+          ? { delegatingRunId: approvedRequest.delegatingRunId }
           : {}),
         ...(req.deliveryTarget ? { deliveryTarget: req.deliveryTarget } : {}),
         ...(req.deliveryCandidates?.length ? { deliveryCandidates: req.deliveryCandidates } : {}),
@@ -410,6 +420,7 @@ export function createTurnMethods(
         ...(req.botActor ? { botActor: true } : {}),
         ...(req.surfaceTools ? { surfaceTools: true } : {}),
         ...(req.clientTools?.length ? { clientTools: req.clientTools } : {}),
+        desktopClientId: desktopClientForTurn({ ...req, origin }),
         ...(req.envelopeWrapped ? { envelopeWrapped: true } : {}),
         ...(typeof req.displayText === "string" && req.displayText ? { displayText: req.displayText } : {}),
         ...(req.addressed || origin.kind === "human" ? { addressed: true } : {}),
@@ -477,7 +488,7 @@ export function createTurnMethods(
 
       if (replay) dedupKey = replay.signalDedupKey;
 
-      if (origin.kind === "human" && !req.approval) deps.reaperPoke?.();
+      if (origin.kind === "human" && !isSessionTurn(input) && !req.approval) deps.reaperPoke?.();
 
       if (
         req.surface !== "web" &&
@@ -731,6 +742,7 @@ export function createTurnMethods(
       const stale =
         run.status === "pending" ? run.attempts > 0 : !alive && leaseLapsed(run, Date.now() - STALE_LEASE_GRACE_MS);
       return {
+        desktopClientId: desktopClientForTurn({ ...run.request, attempt: run.attempts }),
         status: run.status,
         result: run.result ? await withAdminLink(run.result) : run.result,
         ...(run.request.surface === "web" &&
@@ -795,7 +807,7 @@ export function createTurnMethods(
       const stop = async () => {
         const session = await deps.sessions.getByThread(threadRef);
         if (!session || !deps.signals || (viewer && !(await sessionForViewer(session.id, viewer)))) return false;
-        return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals: deps.signals }, session);
+        return stopSessionTree({ sessions: deps.sessions, runs: deps.runs, signals: deps.signals }, session, USER_STOP);
       };
       return deps.advisoryLock ? deps.advisoryLock.withLock("session-tree-admission", stop) : stop();
     },
@@ -863,7 +875,8 @@ export function createTurnMethods(
       }
       if (signal.kind === "client_result") {
         if (viewer && !samePerson(run.request.actor.id, viewer)) return { accepted: false, reason: "not_found" };
-        if (!run.request.clientTools?.length) return { accepted: false, reason: "no_client_tools" };
+        if (!run.request.clientTools?.length && !run.request.desktopClientId)
+          return { accepted: false, reason: "no_client_tools" };
         const sent = await deps.signals.send(runId, {
           kind: "client_result",
           callId: signal.callId,

@@ -36,6 +36,8 @@ function run(over: Partial<Run>): Run {
     attempts: 1,
     errorAttempts: 0,
     maxAttempts: 3,
+    priority: 2,
+    preemptions: 0,
     leaseToken: null,
     leaseExpiresAt: null,
     workerId: null,
@@ -197,6 +199,7 @@ test("runResultDelivery keeps unprompted failures quiet, like the live path", ()
   const failed = run({ status: "failed", result: { status: "failed", reason: "boom" } });
   failed.request = { ...failed.request, origin: { kind: "ambient" } };
   assert.equal(runResultDelivery(failed), null, "no failure note where nobody addressed the agent");
+  assert.ok(runResultDelivery({ ...failed, request: { ...failed.request, sessionSenderId: "child" } }));
   const ok = run({});
   ok.request = { ...ok.request, origin: { kind: "ambient" } };
   assert.equal(runResultDelivery(ok)?.text, "the reply", "an unprompted reply the agent chose to send still recovers");

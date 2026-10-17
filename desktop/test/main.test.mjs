@@ -5,6 +5,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { mock, test } from "node:test";
 
+mock.module("../permissions.mjs", {
+  namedExports: {
+    registerComputerPermissions() {},
+    async showComputerPermissions() {},
+    focusComputerPermissions: () => false,
+  },
+});
+
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 test(
@@ -104,6 +112,7 @@ test(
           },
         },
         session: { fromPartition: () => session },
+        screen: {},
         dialog: { showErrorBox: (...args) => errors.push(args), showMessageBox: async (...args) => errors.push(args) },
       },
     });
@@ -158,7 +167,7 @@ test(
       input("Tab", true);
       assert.equal(reserved, true);
       assert.deepEqual(sent, [["qm:cycle-tab", 1]]);
-      const frame = { url: "https://old.example/" };
+      const frame = { url: "https://old.example/", origin: "https://old.example" };
       windows[0].webContents.mainFrame = frame;
       const browserEvent = { sender: windows[0].webContents, senderFrame: frame };
       await assert.rejects(handlers.get("qm:open-browser")(browserEvent, "https://evil.example/"));
@@ -166,6 +175,12 @@ test(
         handlers.get("qm:open-browser")({ ...browserEvent, senderFrame: { url: frame.url } }, "/settings"),
       );
       await assert.rejects(handlers.get("qm:open-browser")(browserEvent, "https://user:pass@old.example/"));
+      frame.origin = "null";
+      assert.throws(
+        () => handlers.get("qm:computer-call")(browserEvent, { code: "1+1" }, crypto.randomUUID(), Date.now() + 1000),
+        /Untrusted workspace/,
+      );
+      frame.origin = "https://old.example";
       let prevented = false;
       windows[0].webContents.emit(
         "will-redirect",
