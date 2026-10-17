@@ -198,7 +198,7 @@ test("Render starts a sandbox and reports the failure when the AWS CLI cannot be
     errors.some(
       (error) =>
         error.code === "aws_cli_install_failed" &&
-        /\(exit 6\): curl: \(6\) Could not resolve host downloading$/.test(error.message),
+        error.message.endsWith("(exit 6): curl: (6) Could not resolve host downloading"),
     ),
   );
 });
