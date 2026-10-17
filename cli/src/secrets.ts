@@ -24,7 +24,14 @@ export interface SecretSpec {
   required: boolean | { when: SecretCondition; optional?: true; optionalOtherwise?: true };
   description: string;
   generate?: string;
-  managedBy?: "operator" | "terraform";
+  managedBy?: ManagedBy | Partial<Record<QmConfig["target"] | "default", ManagedBy>>;
+}
+
+type ManagedBy = "operator" | "terraform" | "render";
+
+export function managedByFor(spec: SecretSpec, target: QmConfig["target"]): ManagedBy {
+  if (typeof spec.managedBy === "string") return spec.managedBy;
+  return spec.managedBy?.[target] ?? spec.managedBy?.default ?? "operator";
 }
 
 export interface ComputedSecret {
@@ -33,7 +40,7 @@ export interface ComputedSecret {
   description: string;
   required: boolean;
   generate?: string;
-  managedBy: "operator" | "terraform";
+  managedBy: ManagedBy;
   aliases?: Array<{ service: DeclaredServiceName; name: string }>;
 }
 
@@ -42,6 +49,21 @@ export const MINT_JWK =
   "node -e \"const {generateKeyPairSync}=require('node:crypto');process.stdout.write(JSON.stringify(generateKeyPairSync('ec',{namedCurve:'P-256'}).privateKey.export({format:'jwk'})))\"";
 
 export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
+  {
+    name: "RENDER_API_KEY",
+    service: "core",
+    required: {
+      when: {
+        kind: "any",
+        conditions: [
+          { kind: "target", target: "render" },
+          { kind: "env-equals", service: "core", name: "SANDBOX_BACKEND", value: "render" },
+          { kind: "env-equals", service: "core", name: "DEPLOY_PROVIDER", value: "render" },
+        ],
+      },
+    },
+    description: "Render API key for this deployment, sandboxes, and published apps.",
+  },
   {
     name: "ANTHROPIC_API_KEY",
     service: "core",
@@ -68,6 +90,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: { when: { kind: "env-equals", service: "core", name: "HARNESS", value: "pi" } },
     description: "Public core self-API URL reachable from agent sandboxes.",
+    managedBy: { render: "render" },
   },
   {
     name: "CORE_SIGNING_SECRET",
@@ -216,7 +239,7 @@ export const FIRST_PARTY_SECRET_SPECS: readonly SecretSpec[] = [
     service: "core",
     required: { when: { kind: "target", target: "aws" } },
     description: "Postgres connection string for durable state.",
-    managedBy: "terraform",
+    managedBy: { default: "terraform", render: "render" },
   },
   {
     name: "DATABASE_POOL_URL",
@@ -605,7 +628,7 @@ export function computedSecrets(config: QmConfig): ComputedSecret[] {
       description: spec.description,
       required,
       ...(spec.generate ? { generate: spec.generate } : {}),
-      managedBy: spec.managedBy ?? "operator",
+      managedBy: managedByFor(spec, config.target),
       ...(spec.envName ? { aliases: [{ service: spec.service, name: spec.envName }] } : {}),
     });
   }
@@ -798,7 +821,8 @@ export function renderEnvExample(config: QmConfig): string {
     ].sort();
     lines.push(`# ${secret.description} (${consumers.join(", ")})`);
     if (secret.generate) lines.push(`# Generate with: ${generate(secret.generate)}`);
-    if (secret.managedBy === "terraform") lines.push(`# ${secret.name}=  # populated by Terraform`);
+    if (secret.managedBy === "render") lines.push(`# ${secret.name}=  # supplied by qm up on Render`);
+    else if (secret.managedBy === "terraform") lines.push(`# ${secret.name}=  # populated by Terraform`);
     else if (secret.required) lines.push(`${secret.name}=`);
     else lines.push(`# ${secret.name}=  # optional`);
     lines.push("");
@@ -818,7 +842,11 @@ export function renderEnvExample(config: QmConfig): string {
     lines.push(`# ${spec.description} (${spec.service})`);
     lines.push(`# Needed when ${clauses.join(" and ")}${spec.required === false ? " (optional even then)" : ""}.`);
     if (spec.generate) lines.push(`# Generate with: ${generate(spec.generate)}`);
-    lines.push(spec.managedBy === "terraform" ? `# ${spec.name}=  # populated by Terraform` : `# ${spec.name}=`);
+    lines.push(
+      managedByFor(spec, config.target) === "terraform"
+        ? `# ${spec.name}=  # populated by Terraform`
+        : `# ${spec.name}=`,
+    );
     lines.push("");
   }
   return `${lines.join("\n").trimEnd()}\n`;

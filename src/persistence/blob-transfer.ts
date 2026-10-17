@@ -172,7 +172,7 @@ export function createS3BlobTransferStore(options: S3BlobTransferOptions): BlobT
   const bucket = options.bucket;
   const prefix = (options.prefix ?? "") + "transfer/";
   const keyFor = (blobId: string): string => prefix + blobId;
-  const client = options._client ?? s3Client(options.region);
+  const client = options._client ?? s3Client({ region: options.region });
 
   return {
     s3Ref: (blobId) => (/^[0-9a-f]{32}$/.test(blobId) ? { bucket, key: keyFor(blobId) } : null),

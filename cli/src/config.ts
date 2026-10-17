@@ -20,7 +20,7 @@ import {
   SANDBOX_BACKEND_POLICY,
   targetsAllowingSandboxBackend,
 } from "./providers.ts";
-import { envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
+import { capture, envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
 
 export const CONFIG_FILENAME = "qm.config.jsonc";
 
@@ -46,7 +46,7 @@ export interface PluginEntry {
 }
 
 export interface SandboxConfig {
-  backend?: "local" | "sprites" | "aws" | "agent37" | "superserve" | "e2b";
+  backend?: "local" | "sprites" | "aws" | "agent37" | "superserve" | "e2b" | "render";
   app?: string;
   image?: string;
   baseImage?: string;
@@ -76,6 +76,18 @@ export interface AwsServiceConfig {
   publicPaths?: string[];
   logGroup?: string;
   stopTimeout?: number;
+}
+
+export interface RenderConfig {
+  source: { repo: string; branch: string };
+  storage: { plan: string; diskSizeGB: number };
+  workspaceId: string;
+  region: "oregon" | "ohio" | "virginia" | "frankfurt" | "singapore";
+  appRegion?: RenderConfig["region"];
+  corePlan: string;
+  servicePlan: string;
+  postgresPlan: string;
+  postgresDiskSizeGB: number;
 }
 
 export interface AwsConfig {
@@ -166,6 +178,7 @@ export interface QmConfig {
   imageFrom?: string;
   deployAppPrefix?: string;
   aws?: AwsConfig;
+  render?: RenderConfig;
 }
 
 export function securityScreenEnv(config: Pick<QmConfig, "securityScreen">): Record<string, string> {
@@ -285,7 +298,7 @@ function stripTrailingCommas(text: string): string {
   return out;
 }
 
-const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
+export const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
 
 const skipWs = (s: string, i: number): number => {
   while (i < s.length && /\s/.test(s[i]!)) i++;
@@ -347,10 +360,23 @@ function objectProps(s: string, objStart: number): { props: PropSpan[]; openBrac
   }
 }
 
+interface ConfigEdit {
+  start: number;
+  end: number;
+  text: string;
+}
+
+function applyEdits(raw: string, edits: ConfigEdit[]): string {
+  let out = raw;
+  for (const edit of edits.sort((a, b) => b.start - a.start))
+    out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
+  return out;
+}
+
 function updateConfigStringMap(raw: string, key: string, updates: Record<string, string>): string {
   const stripped = stripJsonComments(raw);
   const root = objectProps(stripped, 0);
-  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const edits: ConfigEdit[] = [];
   const entry = ([k, v]: [string, string]): string => `${JSON.stringify(k)}: ${JSON.stringify(v)}`;
   const property = root.props.find((p) => p.key === key);
   if (property) {
@@ -371,10 +397,7 @@ function updateConfigStringMap(raw: string, key: string, updates: Record<string,
     const text = `${root.props.length ? "," : ""}\n  ${JSON.stringify(key)}: { ${body} }\n`;
     edits.push({ start: root.closeBrace, end: root.closeBrace, text });
   }
-  edits.sort((a, b) => b.start - a.start);
-  let out = raw;
-  for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
-  return out;
+  return applyEdits(raw, edits);
 }
 
 export const updateConfigImageOverrides = (raw: string, updates: Record<string, string>): string =>
@@ -383,7 +406,7 @@ export const updateConfigImageOverrides = (raw: string, updates: Record<string, 
 export function updateConfigCoreEnv(raw: string, updates: Record<string, string>): string {
   const stripped = stripJsonComments(raw);
   const root = objectProps(stripped, 0);
-  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const edits: ConfigEdit[] = [];
   const envProp = root.props.find((p) => p.key === "env");
   if (!envProp) throw new CliError('config has no top-level "env" object');
   const env = objectProps(stripped, envProp.valueStart);
@@ -404,10 +427,7 @@ export function updateConfigCoreEnv(raw: string, updates: Record<string, string>
       text: core.props.length ? ` ${body},` : ` ${body} `,
     });
   }
-  edits.sort((a, b) => b.start - a.start);
-  let out = raw;
-  for (const edit of edits) out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
-  return out;
+  return applyEdits(raw, edits);
 }
 
 export function loadConfigAt(path: string, overrides?: { target?: Target }): { config: QmConfig; path: string } {
@@ -525,6 +545,7 @@ const VALID_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   "imageFrom",
   "deployAppPrefix",
   "aws",
+  "render",
 ]);
 
 function validate(raw: unknown, path: string): QmConfig {
@@ -776,6 +797,8 @@ function validate(raw: unknown, path: string): QmConfig {
     ];
     out.aws = validateAws(o["aws"], path, runnableServices(services), configuredSecretNames);
   }
+  if (o["render"] !== undefined) out.render = validateRender(o["render"], path);
+  if (target === "render" && !out.render) throw new CliError(`${path}: target "render" requires a "render" block`);
   if (target === "aws" && !out.aws) throw new CliError(`${path}: target "aws" requires an "aws" block`);
   validateModelProvider(out, path);
   validatePortalTrust(out, path);
@@ -1494,6 +1517,140 @@ function validateAws(
   return out;
 }
 
+export function githubRepoUrl(value: string): string | undefined {
+  const url = URL.parse(value.trim());
+  if (!url || url.protocol !== "https:" || url.host !== "github.com") return undefined;
+  if (url.username || url.password || url.search || url.hash) return undefined;
+  const segments = url.pathname
+    .replace(/\/$/, "")
+    .replace(/\.git$/, "")
+    .split("/")
+    .slice(1);
+  if (segments.length !== 2 || !segments.every((segment) => /^[A-Za-z0-9_.-]+$/.test(segment))) return undefined;
+  return `https://github.com/${segments.join("/")}`;
+}
+
+function isGitBranchName(branch: string): boolean {
+  try {
+    capture("git", ["check-ref-format", "--branch", branch]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function renderSource(raw: unknown, path: string): NonNullable<RenderConfig["source"]> {
+  if (!isPlainObject(raw) || Object.keys(raw).some((key) => !["repo", "branch"].includes(key)))
+    throw new CliError(`${path}: render.source must contain repo and branch`);
+  const repo = typeof raw.repo === "string" ? githubRepoUrl(raw.repo) : undefined;
+  if (!repo)
+    throw new CliError(`${path}: render.source.repo must be an HTTPS GitHub repository URL without credentials`);
+  const branch = typeof raw.branch === "string" ? raw.branch.trim() : "";
+  if (!isGitBranchName(branch)) throw new CliError(`${path}: render.source.branch must be a Git branch name`);
+  return { repo, branch };
+}
+
+const retiredRenderPlans: Record<string, string> = {
+  starter: "0.5c-512mb",
+  standard: "1c-2g",
+  pro: "2c-4g",
+  pro_plus: "4c-8g",
+  pro_max: "4c-16g",
+  pro_ultra: "8c-32g",
+};
+
+export function renderPlanId(plan: string): string {
+  return retiredRenderPlans[plan] ?? plan;
+}
+
+function validateRender(raw: unknown, path: string): RenderConfig {
+  if (!isPlainObject(raw)) throw new CliError(`${path}: "render" must be an object`);
+  const allowed = new Set([
+    "workspaceId",
+    "region",
+    "appRegion",
+    "corePlan",
+    "servicePlan",
+    "postgresPlan",
+    "postgresDiskSizeGB",
+    "storage",
+    "source",
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) throw new CliError(`${path}: unknown render.${key}`);
+  }
+  const storageRaw = raw.storage ?? {};
+  if (!isPlainObject(storageRaw)) throw new CliError(`${path}: render.storage must be an object`);
+  for (const key of Object.keys(storageRaw)) {
+    if (!["plan", "diskSizeGB"].includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
+  }
+  const plan = (key: string, value: unknown, compute = true): string => {
+    if (compute && typeof value === "string" && retiredRenderPlans[value])
+      throw new CliError(
+        `${path}: render.${key} ${value} is a retired Render plan name; use ${retiredRenderPlans[value]}`,
+      );
+    if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free")
+      throw new CliError(`${path}: render.${key} must name a paid Render plan`);
+    return value;
+  };
+  const storagePlan = plan("storage.plan", storageRaw.plan ?? "0.5c-512mb");
+  const diskSizeGB = storageRaw.diskSizeGB ?? 10;
+  if (typeof diskSizeGB !== "number" || !Number.isInteger(diskSizeGB) || diskSizeGB < 1 || diskSizeGB > 1000)
+    throw new CliError(`${path}: render.storage.diskSizeGB must be an integer from 1 to 1000`);
+  const storage: RenderConfig["storage"] = { plan: storagePlan, diskSizeGB };
+  const workspaceId = raw.workspaceId;
+  if (typeof workspaceId !== "string" || !/^(tea|usr)-[a-z0-9]+$/.test(workspaceId)) {
+    throw new CliError(`${path}: render.workspaceId must be a Render workspace ID (tea-... or usr-...)`);
+  }
+  const region = raw.region ?? "oregon";
+  const regions = ["oregon", "ohio", "virginia", "frankfurt", "singapore"];
+  if (typeof region !== "string" || !regions.includes(region)) {
+    throw new CliError(`${path}: render.region must be a Render region`);
+  }
+  const appRegion = raw.appRegion;
+  if (appRegion !== undefined && (typeof appRegion !== "string" || !regions.includes(appRegion)))
+    throw new CliError(`${path}: render.appRegion must be a Render region`);
+  const postgresDiskSizeGB = raw.postgresDiskSizeGB ?? 10;
+  if (
+    typeof postgresDiskSizeGB !== "number" ||
+    !Number.isInteger(postgresDiskSizeGB) ||
+    postgresDiskSizeGB < 1 ||
+    postgresDiskSizeGB > 1000
+  ) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be an integer from 1 to 1000`);
+  }
+  if (postgresDiskSizeGB !== 1 && postgresDiskSizeGB % 5 !== 0) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be 1 or a multiple of 5`);
+  }
+  return {
+    source: renderSource(raw.source, path),
+    storage,
+    workspaceId,
+    region: region as RenderConfig["region"],
+    ...(appRegion === undefined ? {} : { appRegion: appRegion as RenderConfig["region"] }),
+    corePlan: plan("corePlan", raw.corePlan ?? "2c-4g"),
+    servicePlan: plan("servicePlan", raw.servicePlan ?? "0.5c-512mb"),
+    postgresPlan: plan("postgresPlan", raw.postgresPlan ?? "0.5c-1g", false),
+    postgresDiskSizeGB,
+  };
+}
+
+export function updateConfigUrls(raw: string, updates: { publicUrl: string; apiUrl: string }): string {
+  const root = objectProps(stripJsonComments(raw), 0);
+  const edits: ConfigEdit[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    const property = root.props.find((entry) => entry.key === key);
+    if (property) edits.push({ start: property.valueStart, end: property.valueEnd, text: JSON.stringify(value) });
+    else
+      edits.push({
+        start: root.openBrace + 1,
+        end: root.openBrace + 1,
+        text: `\n  ${JSON.stringify(key)}: ${JSON.stringify(value)},`,
+      });
+  }
+  return applyEdits(raw, edits);
+}
+
 function validateSandbox(raw: unknown, path: string, target: Target): SandboxConfig | undefined {
   if (raw === undefined) return undefined;
   if (!isPlainObject(raw)) {
@@ -1505,7 +1662,7 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       throw new CliError(`${path}: ${field} ${JSON.stringify(name)} is not a valid env var name`);
     }
   };
-  const out: SandboxConfig = {};
+  const out: SandboxConfig = target === "render" ? { backend: "render" } : {};
   if (o["backend"] !== undefined) {
     if (
       o["backend"] !== "local" &&
@@ -1513,10 +1670,11 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       o["backend"] !== "aws" &&
       o["backend"] !== "agent37" &&
       o["backend"] !== "superserve" &&
-      o["backend"] !== "e2b"
+      o["backend"] !== "e2b" &&
+      o["backend"] !== "render"
     ) {
       throw new CliError(
-        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), "agent37", "superserve" (Superserve sandboxes), or "e2b" (E2B sandboxes)`,
+        `${path}: "sandbox.backend" must be "local" (Docker containers on the deployment host), "sprites" (Fly Sprites), "aws" (Lambda MicroVM sandboxes), "agent37", "superserve" (Superserve sandboxes), "e2b" (E2B sandboxes), or "render" (Render Sandboxes)`,
       );
     }
     out.backend = o["backend"];
@@ -1580,7 +1738,7 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
-  if (out.backend === "agent37" || out.backend === "superserve" || out.backend === "e2b") {
+  if (out.backend === "agent37" || out.backend === "superserve" || out.backend === "e2b" || out.backend === "render") {
     const stray = (["app", "image", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
     if (stray.length) {
       throw new CliError(

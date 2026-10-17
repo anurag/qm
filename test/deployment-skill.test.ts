@@ -7,11 +7,14 @@ function read(path: string): string {
   return readFileSync(path, "utf8");
 }
 
-test("package-consumer deployment skill covers both self-owned providers and the completion contract", () => {
+test("package deployment instructions cover supported providers and the completion contract", () => {
   const root = read("cli/templates/deployment/deployment.md");
   for (const phrase of [
     "Before cloud mutation",
-    "Fly.io, AWS, or Porter",
+    "Fly.io",
+    "AWS",
+    "Render",
+    "Porter",
     "deployment repository",
     "npm ci",
     "slack render",
@@ -36,6 +39,7 @@ test("package-consumer deployment skill covers both self-owned providers and the
     ".codex/skills/deploy-qm/agents/openai.yaml",
     ".codex/skills/deploy-qm/references/fly.md",
     ".codex/skills/deploy-qm/references/aws.md",
+    ".codex/skills/deploy-qm/references/render.md",
     ".codex/skills/deploy-qm/references/porter.md",
     ".codex/skills/deploy-qm/references/slack.md",
     ".codex/skills/deploy-qm/references/email.md",
@@ -48,6 +52,7 @@ test("package-consumer deployment skill covers both self-owned providers and the
     "cli/templates/deployment/SKILL.md",
     "cli/templates/deployment/references/fly.md",
     "cli/templates/deployment/references/aws.md",
+    "cli/templates/deployment/references/render.md",
     "cli/templates/deployment/references/porter.md",
     "cli/templates/deployment/references/slack.md",
     "cli/templates/deployment/references/email.md",
@@ -143,8 +148,13 @@ test("each provider has an independent agent-computer proof", () => {
   const root = read("cli/templates/deployment/deployment.md");
   const fly = read("cli/templates/deployment/references/fly.md");
   const aws = read("cli/templates/deployment/references/aws.md");
+  const render = read("cli/templates/deployment/references/render.md");
 
   assert.match(root, /\/root\/workspace\/qm-computer-proof\.txt/);
+  assert.match(render, /## Agent-computer proof/);
+  assert.match(render, /render-home\/<url-encoded scope id>\.tar/);
+  assert.match(render, /workspace\/qm-computer-proof\.txt/);
+  assert.ok(render.split("\n").length < 140, "the Render reference stays close to the other provider references");
   assert.match(fly, /## Agent-computer proof/);
   assert.match(fly, /agent_scope/);
   assert.match(fly, /fly machine exec/);
