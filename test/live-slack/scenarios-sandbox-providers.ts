@@ -16,6 +16,7 @@ const providerCoverage: Record<SandboxBackendName, true> = {
   porter: true,
   agent37: true,
   superserve: true,
+  render: true,
   "do-managed-agents": true,
 };
 

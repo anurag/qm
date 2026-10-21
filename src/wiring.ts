@@ -9,6 +9,19 @@ import { createPostgresDecisionStore, type DecisionStore } from "./decisions/sto
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
 import { availableRuntimeError } from "./api/runtime-config.ts";
 import { createApprovalStore } from "./core/approval-store.ts";
+import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/render-deploy-provider.ts";
+import { createRenderDeployArtifacts, type StoredRenderDeployCredential } from "./deploy/render-deploy-artifacts.ts";
+import { createRenderAppDatabase, type StoredRenderAppDatabase } from "./deploy/render-app-database.ts";
+import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/render-app-storage.ts";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
+import {
+  createRenderSandbox,
+  type StoredRenderCleanup,
+  type StoredRenderSandbox,
+  type StoredRenderScratch,
+} from "./sandbox/render-sandbox.ts";
+import { createSdkRenderClient } from "./sandbox/render-client.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { flushErrorReporting } from "../plugins/chassis/src/error-reporting.ts";
 import { createProductAnalytics } from "./util/product-analytics.ts";
@@ -151,6 +164,7 @@ import { createDeliveryStore, type DeliveryStore } from "./delivery/delivery-sto
 import { createPostgresDeliveryStore } from "./delivery/postgres-delivery-store.ts";
 import { wireRunResultDeliveries } from "./delivery/run-result-delivery.ts";
 import { adminSessionUrl } from "./util/admin-links.ts";
+import { uuidSchema } from "./util/ids.ts";
 import { withWebTranscriptDeliveries } from "./delivery/web-transcript-delivery.ts";
 import { createDirectoryStore, type DirectoryStore } from "./directory/directory-store.ts";
 import { createPostgresDirectoryStore } from "./directory/postgres-directory-store.ts";
@@ -229,6 +243,7 @@ import {
   type StoredManagedAgentsSandbox,
 } from "./sandbox/managed-agents-sandbox.ts";
 import { createSdkManagedAgentsClient } from "./sandbox/managed-agents-client.ts";
+import { s3Client } from "./persistence/s3.ts";
 import { createS3SnapshotStore } from "./sandbox/home-snapshot.ts";
 import { createModalSandbox, type StoredModalSandbox } from "./sandbox/modal-sandbox.ts";
 import { createSdkModalClient } from "./sandbox/modal-client.ts";
@@ -766,10 +781,20 @@ export function buildApp(
     config.securityScreen === "off" && overrides.securityScreener ? "enforce" : config.securityScreen,
   );
 
-  const workspace = createLocalWorkspaceStore(config.dataDir);
+  const requireDbUrl = (kind: string): string => {
+    if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
+    return config.databaseUrl;
+  };
+  const s3 = config.s3Endpoint ? s3Client({ region: config.s3Region, endpoint: config.s3Endpoint }) : undefined;
+  const s3Override = s3 ? { _client: s3 } : {};
+  const workspace =
+    config.workspaceStore === "postgres"
+      ? createRenderWorkspaceStore(config.dataDir, requireDbUrl("WORKSPACE_STORE"))
+      : createLocalWorkspaceStore(config.dataDir);
   const blobTransfer: BlobTransferStore =
     config.transferStore === "s3" && config.s3Bucket
       ? createS3BlobTransferStore({
+          ...s3Override,
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -778,6 +803,7 @@ export function buildApp(
   const fileBytes: DurableByteStore =
     config.snapshotStore === "s3" && config.s3Bucket
       ? createS3DurableByteStore({
+          ...s3Override,
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -789,6 +815,7 @@ export function buildApp(
   const fileUploads =
     config.databaseUrl && config.snapshotStore === "s3" && config.s3Bucket
       ? createDirectFileUploads({
+          ...(s3 ? { client: s3, presign: (command, expiresIn) => getSignedUrl(s3, command, { expiresIn }) } : {}),
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -884,6 +911,9 @@ export function buildApp(
   const e2bBodies = artifactMap<StoredE2bSandbox>("e2b_sandbox_bodies");
   const modalBodies = artifactMap<StoredModalSandbox>("modal_sandbox_bodies");
   const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
+  const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
+  const renderScratch = artifactMap<StoredRenderScratch>("render_scratch_bodies");
+  const renderCleanup = artifactMap<StoredRenderCleanup>("render_sandbox_cleanup");
   const e2bClient = (use: "computers" | "apps"): E2bClient => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey)
@@ -1097,6 +1127,40 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       onError: sandboxOnError,
     });
+  const buildRender = (): Sandbox => {
+    const render = config.renderSandbox;
+    if (!render.apiKey || !render.workspaceId) {
+      throw new Error("SANDBOX_BACKEND=render requires RENDER_API_KEY and RENDER_WORKSPACE_ID");
+    }
+    if (!config.s3Bucket || config.snapshotStore !== "s3")
+      throw new Error("Render Sandboxes require S3_BUCKET and SNAPSHOT_STORE=s3");
+    return createRenderSandbox(workspace, {
+      client: createSdkRenderClient({
+        apiKey: render.apiKey,
+        workspaceId: render.workspaceId,
+        region: render.region,
+      }),
+      ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
+      store: renderBodies,
+      scratchStore: renderScratch,
+      cleanupStore: renderCleanup,
+      snapshots: createS3SnapshotStore({
+        bucket: config.s3Bucket,
+        prefix: `${config.s3Prefix ?? ""}render-home`,
+        ...(s3 ? { s3 } : {}),
+        ...(config.s3Region ? { region: config.s3Region } : {}),
+      }),
+      advisoryLock,
+      extraTools: deploymentLayer.advertisedTools,
+      credentialPaths: deploymentLayer.credentialPaths,
+      layerToolFiles: () => deploymentLayer.installFiles,
+      blobTransfer,
+      ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+      ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
+      ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+      onError: sandboxOnError,
+    });
+  };
   const buildBackend: Record<Config["sandboxBackend"], () => Sandbox> = {
     local: buildLocal,
     sprites: buildSprites,
@@ -1106,6 +1170,7 @@ export function buildApp(
     aws: buildAws,
     porter: buildPorter,
     agent37: buildAgent37,
+    render: buildRender,
     superserve: buildSuperserve,
     "do-managed-agents": buildManagedAgents,
   };
@@ -1296,10 +1361,6 @@ export function buildApp(
   const secretDrops: SecretDropStore = createSecretDropStore(artifactMap<SecretDropRecord>("secret_drops"));
   const modelGateway = createModelGateway();
 
-  const requireDbUrl = (kind: string): string => {
-    if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
-    return config.databaseUrl;
-  };
   const sessions: SessionStore =
     config.sessionStore === "postgres"
       ? createPostgresSessionStore(requireDbUrl("SESSION_STORE"))
@@ -1312,6 +1373,7 @@ export function buildApp(
           bytesFor: (prefix) =>
             config.snapshotStore === "s3" && config.s3Bucket
               ? createS3DurableByteStore({
+                  ...s3Override,
                   bucket: config.s3Bucket,
                   ...(config.s3Region ? { region: config.s3Region } : {}),
                   prefix: `${config.s3Prefix ?? ""}${prefix}`,
@@ -1683,6 +1745,7 @@ export function buildApp(
       ...(config.snapshotStore === "s3" && config.s3Bucket
         ? {
             archiveBytes: createS3DurableByteStore({
+              ...s3Override,
               bucket: config.s3Bucket,
               ...(config.s3Region ? { region: config.s3Region } : {}),
               prefix: `${config.s3Prefix ?? ""}deploy-git/`,
@@ -1691,6 +1754,66 @@ export function buildApp(
         : {}),
     },
   });
+  const renderDeployBodies = artifactMap<StoredRenderDeploy>("render_deploy_bodies");
+  const renderArtifacts =
+    config.deployProvider === "render"
+      ? createRenderDeployArtifacts({
+          baseUrl: config.apiBaseUrl ?? "",
+          signingSecret: config.signingSecret ?? "",
+          store: artifactMap<StoredRenderDeployCredential>("render_deploy_credentials"),
+          deployStore,
+        })
+      : undefined;
+  const buildRenderDeploy = (): DeployProvider => {
+    const render = config.renderDeploy;
+    if (
+      !config.databaseUrl ||
+      !pgArtifactMap ||
+      !config.s3Bucket ||
+      !config.s3Endpoint ||
+      !render.source ||
+      !render.environmentId ||
+      !renderArtifacts ||
+      !config.connectorSecretKey
+    )
+      throw new Error(
+        "Render app deployment requires durable database, storage, Git source, environment, and credential keys",
+      );
+    const database = createRenderAppDatabase({
+      adminUrl: config.databaseUrl,
+      appEndpoint: render.appDatabaseEndpoint,
+      store: artifactMap<StoredRenderAppDatabase>("render_app_databases"),
+      keyMaterial: config.connectorSecretKey,
+      advisoryLock,
+    });
+    const storage = createRenderAppStorage({
+      apiKey: render.apiKey,
+      workspaceId: render.workspaceId,
+      environmentId: render.environmentId,
+      minioServiceId: render.minioServiceId,
+      endpoint: config.s3Endpoint,
+      bucket: config.s3Bucket,
+      prefix: config.s3Prefix,
+      region: config.s3Region,
+      store: artifactMap<StoredRenderAppStorage>("render_app_storage"),
+      keyMaterial: config.connectorSecretKey,
+    });
+    return createRenderDeployProvider({
+      ...render,
+      source: render.source,
+      environmentId: render.environmentId,
+      store: renderDeployBodies,
+      artifacts: renderArtifacts,
+      advisoryLock,
+      resources: {
+        ensure: async (id) => ({ ...(await database.ensure(id)), ...(await storage.ensure(id)) }),
+        suspend: async (id) => {
+          await database.suspend(id);
+          await storage.suspend(id);
+        },
+      },
+    });
+  };
   const buildAwsDeploy = (): DeployProvider =>
     createAwsDeployProvider({
       ...config.awsDeploy,
@@ -1713,6 +1836,7 @@ export function buildApp(
       : undefined;
   const buildDeployProvider: Record<Config["deployProvider"], () => DeployProvider> = {
     aws: buildAwsDeploy,
+    render: buildRenderDeploy,
     docker: () => createDockerDeployProvider({ onError: sandboxOnError }),
     fly: () =>
       createFlyDeployProvider({
@@ -2126,11 +2250,10 @@ export function buildApp(
   };
   const orchestrator = createOrchestrator(orchestratorDeps);
 
-  const uuidId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const recoveryAdminBase = config.publicWebUrl?.replace(/\/$/, "");
   const recoveryAdminUrlFor = recoveryAdminBase
     ? (sessionId: string): string | undefined =>
-        uuidId.test(sessionId) ? adminSessionUrl(recoveryAdminBase, sessionId) : undefined
+        uuidSchema.safeParse(sessionId).success ? adminSessionUrl(recoveryAdminBase, sessionId) : undefined
     : undefined;
   const runResultRecovery = wireRunResultDeliveries(runs, deliveries, recoveryAdminUrlFor, sessions);
   const idempotency = createIdempotencyStore(artifactMap<IdempotencyRecord>("idempotency"));
@@ -2284,6 +2407,7 @@ export function buildApp(
     environments,
     deploy: deployService,
     deployAppsDomain: config.awsDeploy.appsDomain,
+    ...(renderArtifacts ? { deploymentGitPrincipals: renderArtifacts } : {}),
     deploymentLayer,
     ...(processes ? { processes } : {}),
     monitors,
@@ -2792,8 +2916,7 @@ export function buildApp(
   const deepIdleMachineMs = config.deepIdleMachineMs;
   const devIdleMachineMs = config.devIdleMachineMs;
   const SANDBOX_MAINTENANCE_INTERVAL_MS = 5 * 60_000;
-  const deepIdleReapEnabled = Boolean(sandbox.reapDeepIdle && (deepIdleMachineMs > 0 || devIdleMachineMs > 0));
-  const deepIdleSweeper = deepIdleReapEnabled
+  const deepIdleSweeper = sandbox.reapDeepIdle
     ? createSweeper(
         () =>
           leaderLease.hold("sandbox:deep-idle-reaper", () =>
@@ -3049,6 +3172,7 @@ export function buildApp(
     sessionShareBytes:
       config.snapshotStore === "s3" && config.s3Bucket
         ? createS3DurableByteStore({
+            ...s3Override,
             bucket: config.s3Bucket,
             ...(config.s3Region ? { region: config.s3Region } : {}),
             prefix: `${config.s3Prefix ?? ""}session-shares/`,
