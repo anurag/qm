@@ -20,7 +20,7 @@ import {
   type PublicConnectorClient,
   type DecryptedConnectorClient,
 } from "../connectors/connector-client-store.ts";
-import { errMessage, reportFailureAs } from "../util/errors.ts";
+import { errMessage } from "../util/errors.ts";
 
 export interface PersistedSoul {
   scopeId: ScopeId;
@@ -39,36 +39,18 @@ export interface PersistedSoulRevision {
   updatedBy?: string;
 }
 type SoulSnapshot = PersistedSoul | null;
-export interface PersistedCommandPolicy {
-  scopeId: ScopeId;
-  policy: CommandPolicy;
-}
-export interface PersistedSecurityPosture {
-  scopeId: ScopeId;
-  posture: SecurityPosture;
-}
-export interface PersistedSharingPosture {
-  scopeId: ScopeId;
-  posture: SharingPosture;
-}
-export interface PersistedApprovalGrantModes {
-  scopeId: ScopeId;
-  modes: ApprovalGrantModes;
-}
-export interface PersistedEgressPolicy {
-  scopeId: ScopeId;
-  policy: EgressPolicy;
-}
+type ScopedRow<K extends string, V> = { scopeId: ScopeId } & Record<K, V>;
+export type PersistedSecurityPosture = ScopedRow<"posture", SecurityPosture>;
+export type PersistedSharingPosture = ScopedRow<"posture", SharingPosture>;
+export type PersistedApprovalGrantModes = ScopedRow<"modes", ApprovalGrantModes>;
+export type PersistedEgressPolicy = ScopedRow<"policy", EgressPolicy>;
 export type ModelAccount = "company" | "personal" | "anthropic" | "openai";
 
-export interface PersistedModelAccount extends PersistedScopedFlag {
+interface PersistedModelAccount extends PersistedScopedFlag {
   provider?: "anthropic" | "openai";
 }
 
-export interface PersistedScopedFlag {
-  scopeId: ScopeId;
-  on: boolean;
-}
+export type PersistedScopedFlag = ScopedRow<"on", boolean>;
 export interface PersistedBaseModel {
   scopeId: ScopeId;
   embeddingModelId?: string;
@@ -94,54 +76,20 @@ interface ScopedRuntimeSelection extends RuntimeSelection {
   orgRevision: number;
   revision?: number;
 }
-export interface PersistedApprovedHarnesses {
-  scopeId: ScopeId;
-  ids: string[];
-}
-export interface PersistedWebuiModels {
-  scopeId: ScopeId;
-  ids: string[];
-}
-export interface PersistedInternalMemberOverrides {
-  scopeId: ScopeId;
-  members: string[];
-}
-export interface PersistedAckEmoji {
-  scopeId: ScopeId;
-  names: string[];
-}
-export interface PersistedPinnedSkills {
-  scopeId: ScopeId;
-  names: string[];
-}
-export interface PersistedSlackEmojiCatalog {
+export type PersistedApprovedHarnesses = ScopedRow<"ids", string[]>;
+export type PersistedInternalMemberOverrides = ScopedRow<"members", string[]>;
+interface PersistedSlackEmojiCatalog {
   scopeId: ScopeId;
   emoji: Record<string, string>;
   updatedAt: number;
 }
 
-export interface PersistedPeopleDirectoryUrl {
-  scopeId: ScopeId;
-  url: string;
-}
 export interface OrgBranding {
   accent?: string;
   mark?: string;
   markUrl?: string;
   selfLabel?: string;
   orgName?: string;
-}
-export interface PersistedBranding {
-  scopeId: ScopeId;
-  branding: OrgBranding;
-}
-export interface PersistedBrowseMaxSteps {
-  scopeId: ScopeId;
-  steps: number;
-}
-export interface PersistedBrowseModel {
-  scopeId: ScopeId;
-  modelId: string;
 }
 interface AutoFlaggerConfig {
   harnessId: string;
@@ -171,9 +119,7 @@ export interface PersistedDeploymentIdentity {
 export interface ScopedConfigStore {
   refreshSecurity(ids: ScopeId[]): Promise<void>;
   getSoul(id: ScopeId): string | null;
-  setSoul(id: ScopeId, content: string, updatedBy?: string): number;
-  setSoulLatest(id: ScopeId, content: string, updatedBy?: string): Promise<number>;
-  clearSoul(id: ScopeId): void;
+  setSoul(id: ScopeId, content: string, updatedBy?: string): Promise<number>;
   setSoulIfVersion(id: ScopeId, expectedVersion: number, content: string, updatedBy?: string): Promise<number | null>;
   soulVersion(id: ScopeId): number;
   soulHistory(id: ScopeId): PersistedSoulRevision[];
@@ -181,12 +127,10 @@ export interface ScopedConfigStore {
   restoreSoulSnapshot(id: ScopeId, snapshot: SoulSnapshot): Promise<boolean>;
   restoreSoulCacheSnapshot(id: ScopeId, snapshot: SoulSnapshot): void;
   getCommandPolicy(id: ScopeId): CommandPolicy | null;
-  setCommandPolicy(id: ScopeId, policy: CommandPolicy): void;
-  clearCommandPolicy(id: ScopeId): void;
+  setCommandPolicy(id: ScopeId, policy: CommandPolicy): Promise<void>;
   getSecurityPosture(id: ScopeId): SecurityPosture;
   getSecurityPostureDurable(id: ScopeId): Promise<SecurityPosture>;
   setSecurityPosture(id: ScopeId, posture: SecurityPosture): Promise<void>;
-  clearSecurityPosture(id: ScopeId): void;
   getSharingPosture(id: ScopeId): SharingPosture;
   getSharingPostureDurable(id: ScopeId): Promise<SharingPosture>;
   getSharingPostureOwnDurable(id: ScopeId): Promise<SharingPosture | null>;
@@ -196,19 +140,15 @@ export interface ScopedConfigStore {
   getApprovalGrantModes(id: ScopeId): ApprovalGrantModes;
   getApprovalGrantModesDurable(id: ScopeId): Promise<ApprovalGrantModes>;
   setApprovalGrantModes(id: ScopeId, modes: ApprovalGrantModes): Promise<void>;
-  clearApprovalGrantModes(id: ScopeId): void;
   getEgress(id: ScopeId): EgressPolicy | null;
-  setEgress(id: ScopeId, policy: EgressPolicy): void;
-  clearEgress(id: ScopeId): void;
+  setEgress(id: ScopeId, policy: EgressPolicy): Promise<void>;
   getUnfulfilledInsights(id: ScopeId): boolean;
-  setUnfulfilledInsights(id: ScopeId, on: boolean): void;
-  clearUnfulfilledInsights(id: ScopeId): void;
+  setUnfulfilledInsights(id: ScopeId, on: boolean): Promise<void>;
   getExternalSlackParticipants(id: ScopeId): boolean;
-  setExternalSlackParticipants(id: ScopeId, on: boolean): void;
-  clearExternalSlackParticipants(id: ScopeId): void;
+  setExternalSlackParticipants(id: ScopeId, on: boolean): Promise<void>;
   getExternalSlackParticipantsDurable(id: ScopeId): Promise<boolean>;
   getChannelHeaderPin(id: ScopeId): boolean;
-  setChannelHeaderPinLatest(id: ScopeId, on: boolean | null): Promise<void>;
+  setChannelHeaderPin(id: ScopeId, on: boolean | null): Promise<void>;
   getChannelHeaderPinDurable(id: ScopeId): Promise<boolean>;
   getChannelHeaderPinOverrideDurable(id: ScopeId): Promise<boolean | null>;
   getChannelHeaderPinDefaultDurable(): Promise<boolean>;
@@ -218,96 +158,123 @@ export interface ScopedConfigStore {
   setPurposeRuntime(purpose: RuntimePurpose, selection: RuntimeSelection): Promise<void>;
   clearPurposeRuntime(purpose: RuntimePurpose): Promise<void>;
   getBaseModel(id: ScopeId): string | null;
-  setBaseModel(id: ScopeId, modelId: string | null): void;
+  setBaseModel(id: ScopeId, modelId: string | null): Promise<void>;
   getRuntimeSelection(id: ScopeId): ScopedRuntimeSelection | null;
-  setRuntimeSelection(id: ScopeId, selection: RuntimeSelection | null): void;
-  setRuntimeSelectionLatest(id: ScopeId, selection: RuntimeSelection | null): Promise<void>;
-  acknowledgeRuntimeSelection(id: ScopeId): void;
-  acknowledgeRuntimeSelectionLatest(id: ScopeId): Promise<void>;
+  setRuntimeSelection(id: ScopeId, selection: RuntimeSelection | null): Promise<void>;
+  acknowledgeRuntimeSelection(id: ScopeId): Promise<void>;
   getRuntimeSelectionDurable(id: ScopeId): Promise<ScopedRuntimeSelection | null>;
   onRuntimeSelectionChanged(listener: (id: ScopeId) => void): void;
   getApprovedHarnesses(): string[] | null;
-  setApprovedHarnesses(ids: string[] | null): void;
+  setApprovedHarnesses(ids: string[] | null): Promise<void>;
   getApprovedHarnessesDurable(): Promise<string[] | null>;
   getInternalMemberOverrides(): string[];
-  setInternalMemberOverrides(members: string[]): void;
+  setInternalMemberOverrides(members: string[]): Promise<void>;
   getInternalMemberOverridesDurable(): Promise<string[]>;
   getOrgAmbient(): boolean;
-  setOrgAmbient(on: boolean): void;
+  setOrgAmbient(on: boolean): Promise<void>;
   getOrgAmbientDurable(): Promise<boolean>;
   getInteractiveFastMode(): boolean;
-  setInteractiveFastMode(on: boolean): void;
+  setInteractiveFastMode(on: boolean): Promise<void>;
   getInteractiveFastModeDurable(): Promise<boolean>;
   getIndividualModelAuth(): boolean;
-  setIndividualModelAuth(on: boolean): void;
+  setIndividualModelAuth(on: boolean): Promise<void>;
   getIndividualModelAuthDurable(principalId?: string): Promise<boolean>;
   setPersonalModelAuth(principalId: string, on: boolean, provider?: "anthropic" | "openai"): Promise<void>;
   getModelAccountDurable(principalId: string): Promise<ModelAccount>;
   getBaseModelOwnDurable(id: ScopeId): Promise<string | null>;
   getWebuiModels(id: ScopeId): string[] | null;
-  setWebuiModels(id: ScopeId, ids: string[] | null): void;
+  setWebuiModels(id: ScopeId, ids: string[] | null): Promise<void>;
   getBaseModelDurable(id: ScopeId): Promise<string | null>;
   getWebuiModelsDurable(id: ScopeId): Promise<string[] | null>;
   getAckEmoji(id: ScopeId): string[] | null;
-  setAckEmoji(id: ScopeId, names: string[] | null): void;
+  setAckEmoji(id: ScopeId, names: string[] | null): Promise<void>;
   getAckEmojiDurable(id: ScopeId): Promise<string[] | null>;
-  getPinnedSkillsDurable(id: ScopeId): Promise<string[]>;
-  setPinnedSkills(id: ScopeId, names: string[]): Promise<void>;
-  setSlackEmojiCatalog(id: ScopeId, emoji: Record<string, string>): void;
+  setSlackEmojiCatalog(id: ScopeId, emoji: Record<string, string>): Promise<void>;
   getSlackEmojiCatalogDurable(id: ScopeId): Promise<PersistedSlackEmojiCatalog | null>;
-  getPeopleDirectoryUrl(id: ScopeId): string | null;
-  setPeopleDirectoryUrl(id: ScopeId, url: string | null): void;
   getBranding(id: ScopeId): OrgBranding | null;
-  setBranding(id: ScopeId, branding: OrgBranding | null): void;
+  setBranding(id: ScopeId, branding: OrgBranding | null): Promise<void>;
   getBrandingDurable(id: ScopeId): Promise<OrgBranding | null>;
   getBrowseMaxSteps(id: ScopeId): number | null;
-  setBrowseMaxSteps(id: ScopeId, steps: number | null): void;
+  setBrowseMaxSteps(id: ScopeId, steps: number | null): Promise<void>;
   getBrowseModel(id: ScopeId): string | null;
-  setBrowseModel(id: ScopeId, modelId: string | null): void;
+  setBrowseModel(id: ScopeId, modelId: string | null): Promise<void>;
   getEmbeddingModelDurable(): Promise<string | null>;
   setEmbeddingModel(modelId: string | null): Promise<void>;
   getAutoFlaggerConfig(): AutoFlaggerConfig | null;
-  setAutoFlaggerConfig(config: AutoFlaggerConfig | null): void;
+  setAutoFlaggerConfig(config: AutoFlaggerConfig | null): Promise<void>;
   setConnectorClient(id: ScopeId, provider: string, input: ConnectorClientInput): Promise<void>;
   listConnectorClients(id: ScopeId): Promise<PublicConnectorClient[]>;
   deleteConnectorClient(id: ScopeId, provider: string): Promise<void>;
   getConnectorClientSecret(id: ScopeId, provider: string): Promise<DecryptedConnectorClient | null>;
   scopeConfigPresence(id: ScopeId): Promise<ScopeConfigPresence>;
   refreshScope(id: ScopeId): Promise<void>;
-  flushScope(id: ScopeId): Promise<void>;
   hydrate?(): Promise<void>;
 }
 
+export interface ConfigStoreMaps {
+  connectorClients?: DurableMap<StoredConnectorClient>;
+  souls?: DurableMap<PersistedSoul>;
+  soulHistory?: DurableMap<PersistedSoulRevision>;
+  commandPolicies?: DurableMap<ScopedRow<"policy", CommandPolicy>>;
+  securityPostures?: DurableMap<PersistedSecurityPosture>;
+  sharingPostures?: DurableMap<PersistedSharingPosture>;
+  approvalGrantModes?: DurableMap<PersistedApprovalGrantModes>;
+  egressPolicies?: DurableMap<PersistedEgressPolicy>;
+  unfulfilledInsights?: DurableMap<PersistedScopedFlag>;
+  externalSlackParticipants?: DurableMap<PersistedScopedFlag>;
+  channelHeaderPin?: DurableMap<PersistedScopedFlag>;
+  baseModels?: DurableMap<PersistedBaseModel>;
+  approvedHarnesses?: DurableMap<PersistedApprovedHarnesses>;
+  internalMemberOverrides?: DurableMap<PersistedInternalMemberOverrides>;
+  orgAmbient?: DurableMap<PersistedScopedFlag>;
+  interactiveFastMode?: DurableMap<PersistedScopedFlag>;
+  individualModelAuth?: DurableMap<PersistedModelAccount>;
+  webuiModels?: DurableMap<ScopedRow<"ids", string[]>>;
+  ackEmoji?: DurableMap<ScopedRow<"names", string[]>>;
+  slackEmojiCatalog?: DurableMap<PersistedSlackEmojiCatalog>;
+  branding?: DurableMap<ScopedRow<"branding", OrgBranding>>;
+  browseMaxSteps?: DurableMap<ScopedRow<"steps", number>>;
+  browseModels?: DurableMap<ScopedRow<"modelId", string>>;
+  autoFlaggerConfigs?: DurableMap<PersistedAutoFlaggerConfig>;
+  deploymentIdentity?: DurableMap<PersistedDeploymentIdentity>;
+}
+
+const CONFIG_STORE_TABLES: Record<keyof ConfigStoreMaps, string> = {
+  connectorClients: "connector_clients",
+  souls: "soul_configs",
+  soulHistory: "soul_history",
+  commandPolicies: "command_policies",
+  securityPostures: "security_postures",
+  sharingPostures: "sharing_postures",
+  approvalGrantModes: "approval_grant_modes",
+  egressPolicies: "egress_policies",
+  unfulfilledInsights: "unfulfilled_insights_flag",
+  externalSlackParticipants: "external_slack_participants_flag",
+  channelHeaderPin: "channel_header_pin_flag",
+  baseModels: "base_model_configs",
+  approvedHarnesses: "approved_harness_configs",
+  internalMemberOverrides: "internal_member_overrides",
+  orgAmbient: "org_ambient_flag",
+  interactiveFastMode: "interactive_fast_mode_flag",
+  individualModelAuth: "individual_model_auth_flag",
+  webuiModels: "webui_model_configs",
+  ackEmoji: "ack_emoji",
+  slackEmojiCatalog: "slack_emoji_catalog",
+  branding: "branding_configs",
+  browseMaxSteps: "browse_max_steps_configs",
+  browseModels: "browse_model_configs",
+  autoFlaggerConfigs: "auto_flagger_configs",
+  deploymentIdentity: "deployment_identity",
+};
+
+export const configStoreMaps = (map: (table: string) => DurableMap<never>): Required<ConfigStoreMaps> =>
+  Object.fromEntries(
+    Object.entries(CONFIG_STORE_TABLES).map(([key, table]) => [key, map(table)]),
+  ) as unknown as Required<ConfigStoreMaps>;
+
 export function createMemoryConfigStore(
   orgId: string,
-  opts: {
-    connectorClients?: DurableMap<StoredConnectorClient>;
-    souls?: DurableMap<PersistedSoul>;
-    soulHistory?: DurableMap<PersistedSoulRevision>;
-    commandPolicies?: DurableMap<PersistedCommandPolicy>;
-    securityPostures?: DurableMap<PersistedSecurityPosture>;
-    sharingPostures?: DurableMap<PersistedSharingPosture>;
-    approvalGrantModes?: DurableMap<PersistedApprovalGrantModes>;
-    egressPolicies?: DurableMap<PersistedEgressPolicy>;
-    unfulfilledInsights?: DurableMap<PersistedScopedFlag>;
-    externalSlackParticipants?: DurableMap<PersistedScopedFlag>;
-    channelHeaderPin?: DurableMap<PersistedScopedFlag>;
-    baseModels?: DurableMap<PersistedBaseModel>;
-    approvedHarnesses?: DurableMap<PersistedApprovedHarnesses>;
-    internalMemberOverrides?: DurableMap<PersistedInternalMemberOverrides>;
-    orgAmbient?: DurableMap<PersistedScopedFlag>;
-    interactiveFastMode?: DurableMap<PersistedScopedFlag>;
-    individualModelAuth?: DurableMap<PersistedModelAccount>;
-    webuiModels?: DurableMap<PersistedWebuiModels>;
-    peopleDirectoryUrls?: DurableMap<PersistedPeopleDirectoryUrl>;
-    ackEmoji?: DurableMap<PersistedAckEmoji>;
-    pinnedSkills?: DurableMap<PersistedPinnedSkills>;
-    slackEmojiCatalog?: DurableMap<PersistedSlackEmojiCatalog>;
-    branding?: DurableMap<PersistedBranding>;
-    browseMaxSteps?: DurableMap<PersistedBrowseMaxSteps>;
-    browseModels?: DurableMap<PersistedBrowseModel>;
-    autoFlaggerConfigs?: DurableMap<PersistedAutoFlaggerConfig>;
-    deploymentIdentity?: DurableMap<PersistedDeploymentIdentity>;
+  opts: ConfigStoreMaps & {
     connectorSecretKey?: Buffer | string;
     defaultSecurityPosture?: SecurityPosture;
     defaultSharingPosture?: SharingPosture;
@@ -316,66 +283,89 @@ export function createMemoryConfigStore(
   const souls = new Map<ScopeId, { content: string; version: number }>();
   const soulHistory = new Map<ScopeId, PersistedSoulRevision[]>();
   const legacySoulHistory = new Map<ScopeId, PersistedSoulRevision[]>();
-  const policies = new Map<ScopeId, CommandPolicy>();
-  const securityPostures = new Map<ScopeId, SecurityPosture>();
-  const sharingPostures = new Map<ScopeId, SharingPosture>();
-  const approvalGrantModesCache = new Map<ScopeId, ApprovalGrantModes>();
-  const egress = new Map<ScopeId, EgressPolicy>();
-  const unfulfilledInsights = new Map<ScopeId, boolean>();
-  const externalSlackParticipants = new Map<ScopeId, boolean>();
-  const channelHeaderPin = new Map<ScopeId, boolean>();
   const baseModels = new Map<ScopeId, PersistedBaseModel>();
-  let approvedHarnesses: string[] | null = null;
-  let internalMemberOverrides: string[] = [];
-  let orgAmbient = true;
-  let interactiveFastMode = false;
-  let individualModelAuth = false;
-  const webuiModels = new Map<ScopeId, string[]>();
-  const peopleDirectoryUrls = new Map<ScopeId, string>();
-  const ackEmoji = new Map<ScopeId, string[]>();
-  const branding = new Map<ScopeId, OrgBranding>();
-  const browseMaxSteps = new Map<ScopeId, number>();
-  const browseModels = new Map<ScopeId, string>();
-  let autoFlaggerConfig: AutoFlaggerConfig | null = null;
   const soulStore = opts.souls ?? createMemoryMap<PersistedSoul>();
   const soulHistoryStore = opts.soulHistory ?? createMemoryMap<PersistedSoulRevision>();
-  const commandPolicyStore = opts.commandPolicies ?? createMemoryMap<PersistedCommandPolicy>();
-  const securityPostureStore = opts.securityPostures ?? createMemoryMap<PersistedSecurityPosture>();
-  const sharingPostureStore = opts.sharingPostures ?? createMemoryMap<PersistedSharingPosture>();
-  const approvalGrantModesStore = opts.approvalGrantModes ?? createMemoryMap<PersistedApprovalGrantModes>();
-  const egressStore = opts.egressPolicies ?? createMemoryMap<PersistedEgressPolicy>();
-  const unfulfilledInsightsStore = opts.unfulfilledInsights ?? createMemoryMap<PersistedScopedFlag>();
-  const externalSlackParticipantsStore = opts.externalSlackParticipants ?? createMemoryMap<PersistedScopedFlag>();
-  const channelHeaderPinStore = opts.channelHeaderPin ?? createMemoryMap<PersistedScopedFlag>();
   const baseModelStore = opts.baseModels ?? createMemoryMap<PersistedBaseModel>();
-  const approvedHarnessStore = opts.approvedHarnesses ?? createMemoryMap<PersistedApprovedHarnesses>();
-  const internalMemberOverridesStore =
-    opts.internalMemberOverrides ?? createMemoryMap<PersistedInternalMemberOverrides>();
-  const orgAmbientStore = opts.orgAmbient ?? createMemoryMap<PersistedScopedFlag>();
-  const interactiveFastModeStore = opts.interactiveFastMode ?? createMemoryMap<PersistedScopedFlag>();
-  const individualModelAuthStore = opts.individualModelAuth ?? createMemoryMap<PersistedModelAccount>();
-  const webuiModelStore = opts.webuiModels ?? createMemoryMap<PersistedWebuiModels>();
-  const peopleDirectoryUrlStore = opts.peopleDirectoryUrls ?? createMemoryMap<PersistedPeopleDirectoryUrl>();
-  const ackEmojiStore = opts.ackEmoji ?? createMemoryMap<PersistedAckEmoji>();
-  const pinnedSkillsStore = opts.pinnedSkills ?? createMemoryMap<PersistedPinnedSkills>();
   const slackEmojiCatalogStore = opts.slackEmojiCatalog ?? createMemoryMap<PersistedSlackEmojiCatalog>();
-  const brandingStore = opts.branding ?? createMemoryMap<PersistedBranding>();
-  const browseMaxStepsStore = opts.browseMaxSteps ?? createMemoryMap<PersistedBrowseMaxSteps>();
-  const browseModelStore = opts.browseModels ?? createMemoryMap<PersistedBrowseModel>();
-  const autoFlaggerStore = opts.autoFlaggerConfigs ?? createMemoryMap<PersistedAutoFlaggerConfig>();
   const deploymentIdentity = opts.deploymentIdentity ?? createMemoryMap<PersistedDeploymentIdentity>();
-  const persistWarn = (what: string) => reportFailureAs(`config: persist ${what}`, undefined);
   const writeQueue = createKeyedQueue();
-  const pendingWrites = new Map<string, Promise<void>>();
-  const persist = (key: string, what: string, op: () => Promise<unknown>): void => {
-    const pending = writeQueue(key, async () => {
-      await op();
-    }).then(() => {
-      if (pendingWrites.get(key) === pending) pendingWrites.delete(key);
+  const save = (key: string, write: () => Promise<unknown>, apply: () => void): Promise<void> =>
+    writeQueue(key, async () => {
+      await write();
+      apply();
     });
-    pendingWrites.set(key, pending);
-    void pending.catch(persistWarn(what));
+  type SettingKey = Exclude<keyof ConfigStoreMaps, "connectorClients">;
+  type Row<M extends SettingKey> = NonNullable<ConfigStoreMaps[M]> extends DurableMap<infer R> ? R : never;
+  const setting = <M extends SettingKey, T>(
+    name: M,
+    read: (row: Row<M>) => T,
+    toRow: (id: ScopeId, value: T) => Row<M>,
+    orgOnly = false,
+  ) => {
+    const store = (opts[name] ?? createMemoryMap()) as DurableMap<Row<M>>;
+    const cache = new Map<ScopeId, T>();
+    const load = (id: ScopeId, row: Row<M> | null) => (row ? cache.set(id, read(row)) : cache.delete(id));
+    const refresh = async (id: ScopeId) => {
+      if (!orgOnly || id === org) load(id, await store.get(id));
+    };
+    return {
+      store,
+      refresh,
+      reload: (id: ScopeId) => writeQueue(`${name}:${id}`, () => refresh(id)),
+      get: (id: ScopeId) => cache.get(id),
+      durable: async (id: ScopeId) => {
+        const row = await store.get(id);
+        return row ? read(row) : undefined;
+      },
+      set(id: ScopeId, value: T | null) {
+        const row = value === null ? null : toRow(id, value);
+        return save(
+          `${name}:${id}`,
+          () => (row ? store.put(id, row) : store.delete(id)),
+          () => load(id, row),
+        );
+      },
+      async hydrate() {
+        if (orgOnly) await refresh(org);
+        else for (const row of await store.all()) load((row as { scopeId: ScopeId }).scopeId, row);
+      },
+    };
   };
+  const field = <M extends SettingKey, K extends Exclude<keyof Row<M>, "scopeId">>(name: M, key: K, orgOnly = false) =>
+    setting(
+      name,
+      (row) => row[key],
+      (id, value: Row<M>[K]) => ({ scopeId: id, [key]: value }) as Row<M>,
+      orgOnly,
+    );
+  const settings = {
+    commandPolicies: field("commandPolicies", "policy"),
+    securityPostures: field("securityPostures", "posture"),
+    sharingPostures: field("sharingPostures", "posture"),
+    approvalGrantModes: field("approvalGrantModes", "modes"),
+    egressPolicies: field("egressPolicies", "policy"),
+    unfulfilledInsights: field("unfulfilledInsights", "on"),
+    externalSlackParticipants: field("externalSlackParticipants", "on"),
+    channelHeaderPin: field("channelHeaderPin", "on"),
+    approvedHarnesses: field("approvedHarnesses", "ids", true),
+    internalMemberOverrides: field("internalMemberOverrides", "members", true),
+    orgAmbient: field("orgAmbient", "on", true),
+    interactiveFastMode: field("interactiveFastMode", "on", true),
+    individualModelAuth: field("individualModelAuth", "on", true),
+    webuiModels: field("webuiModels", "ids"),
+    ackEmoji: field("ackEmoji", "names"),
+    branding: field("branding", "branding"),
+    browseMaxSteps: field("browseMaxSteps", "steps"),
+    browseModels: field("browseModels", "modelId"),
+    autoFlaggerConfigs: setting(
+      "autoFlaggerConfigs",
+      ({ harnessId, modelId, rubric }): AutoFlaggerConfig => ({ harnessId, modelId, rubric }),
+      (id, config) => ({ scopeId: id, ...config }),
+      true,
+    ),
+  } satisfies Partial<Record<SettingKey, unknown>>;
+  const allSettings = Object.values(settings);
   const channelHeaderPinListeners = new Set<(id: ScopeId) => void>();
   const noteChannelHeaderPinChanged = (id: ScopeId): void => {
     for (const listener of channelHeaderPinListeners) {
@@ -433,6 +423,17 @@ export function createMemoryConfigStore(
       return null;
     }
   };
+  const runtimeSelection = (row: PersistedBaseModel | null | undefined): ScopedRuntimeSelection | null => {
+    if (!row?.harnessId || !row.modelId) return null;
+    return {
+      harnessId: row.harnessId,
+      modelId: row.modelId,
+      orgRevision: row.orgRevision ?? 0,
+      ...(row.revision !== undefined ? { revision: row.revision } : {}),
+      ...(row.effortLevel !== undefined ? { effortLevel: row.effortLevel } : {}),
+      ...(row.fastMode !== undefined ? { fastMode: row.fastMode } : {}),
+    };
+  };
   const cacheBaseModel = (id: ScopeId, row: PersistedBaseModel | null): void => {
     if (row) baseModels.set(id, row);
     else baseModels.delete(id);
@@ -451,6 +452,8 @@ export function createMemoryConfigStore(
   };
   const defaultSecurityPosture = opts.defaultSecurityPosture ?? "auto";
   const defaultSharingPosture = opts.defaultSharingPosture ?? "isolated";
+  const orgDefaultPolicy = defaultOrgPolicy();
+  const orgDefaultEgress: EgressPolicy = { allowedHosts: [], deniedHosts: [] };
   const DEFAULT_APPROVAL_GRANT_MODES: ApprovalGrantModes = { session: true, always: true };
   const composeApprovalGrantModes = (orgModes: ApprovalGrantModes, scope?: ApprovalGrantModes): ApprovalGrantModes => ({
     session: orgModes.session && (scope?.session ?? true),
@@ -462,8 +465,6 @@ export function createMemoryConfigStore(
     version: 1,
   };
   souls.set(org, defaultOrgSoul);
-  policies.set(org, defaultOrgPolicy());
-  egress.set(org, { allowedHosts: [], deniedHosts: [] });
 
   let hydrated: Promise<void> | null = null;
   const loadSoulCache = (id: ScopeId, soul: PersistedSoul | null): void => {
@@ -505,30 +506,16 @@ export function createMemoryConfigStore(
   return {
     async refreshSecurity(ids) {
       await Promise.all(
-        ids.map(async (id) => {
-          const [soul, policy, egressPolicy, sharingPosture] = await Promise.all([
-            soulStore.get(id),
-            commandPolicyStore.get(id),
-            egressStore.get(id),
-            sharingPostureStore.get(id),
-          ]);
-          if (!pendingWrites.has(`soul:${id}`)) {
+        ids.flatMap((id) => [
+          writeQueue(`soul:${id}`, async () => {
+            const soul = await soulStore.get(id);
             if (soul) souls.set(id, { content: soul.content, version: soul.version });
             else if (id !== org) souls.delete(id);
-          }
-          if (!pendingWrites.has(`policy:${id}`)) {
-            if (policy) policies.set(id, policy.policy);
-            else if (id !== org) policies.delete(id);
-          }
-          if (!pendingWrites.has(`egress:${id}`)) {
-            if (egressPolicy) egress.set(id, egressPolicy.policy);
-            else if (id !== org) egress.delete(id);
-          }
-          if (!pendingWrites.has(`sharingPosture:${id}`)) {
-            if (sharingPosture) sharingPostures.set(id, sharingPosture.posture);
-            else sharingPostures.delete(id);
-          }
-        }),
+          }),
+          settings.commandPolicies.reload(id),
+          settings.egressPolicies.reload(id),
+          settings.sharingPostures.reload(id),
+        ]),
       );
     },
     hydrate() {
@@ -550,55 +537,14 @@ export function createMemoryConfigStore(
           }
           for (const revisions of legacySoulHistory.values()) revisions.sort((a, b) => b.version - a.version);
           for (const revisions of soulHistory.values()) revisions.sort((a, b) => b.version - a.version);
-          for (const r of await commandPolicyStore.all()) policies.set(r.scopeId, r.policy);
-          for (const r of await securityPostureStore.all()) securityPostures.set(r.scopeId, r.posture);
-          for (const r of await sharingPostureStore.all()) sharingPostures.set(r.scopeId, r.posture);
-          for (const r of await approvalGrantModesStore.all()) approvalGrantModesCache.set(r.scopeId, r.modes);
-          for (const r of await egressStore.all()) egress.set(r.scopeId, r.policy);
-          for (const r of await unfulfilledInsightsStore.all()) unfulfilledInsights.set(r.scopeId, r.on);
-          for (const r of await externalSlackParticipantsStore.all()) externalSlackParticipants.set(r.scopeId, r.on);
-          for (const r of await channelHeaderPinStore.all()) channelHeaderPin.set(r.scopeId, r.on);
           for (const r of await baseModelStore.all()) baseModels.set(r.scopeId, r);
-          approvedHarnesses = (await approvedHarnessStore.get(org))?.ids ?? null;
-          internalMemberOverrides = (await internalMemberOverridesStore.get(org))?.members ?? [];
-          orgAmbient = (await orgAmbientStore.get(org))?.on ?? true;
-          interactiveFastMode = (await interactiveFastModeStore.get(org))?.on ?? false;
-          individualModelAuth = (await individualModelAuthStore.get(org))?.on ?? false;
-          for (const r of await webuiModelStore.all()) webuiModels.set(r.scopeId, r.ids);
-          for (const r of await peopleDirectoryUrlStore.all()) peopleDirectoryUrls.set(r.scopeId, r.url);
-          for (const r of await ackEmojiStore.all()) ackEmoji.set(r.scopeId, r.names);
-          for (const r of await brandingStore.all()) branding.set(r.scopeId, r.branding);
-          for (const r of await browseMaxStepsStore.all()) browseMaxSteps.set(r.scopeId, r.steps);
-          for (const r of await browseModelStore.all()) browseModels.set(r.scopeId, r.modelId);
-          const storedAutoFlagger = await autoFlaggerStore.get(org);
-          autoFlaggerConfig = storedAutoFlagger
-            ? {
-                harnessId: storedAutoFlagger.harnessId,
-                modelId: storedAutoFlagger.modelId,
-                rubric: storedAutoFlagger.rubric,
-              }
-            : null;
+          await Promise.all(allSettings.map((setting) => setting.hydrate()));
         })();
       }
       return hydrated;
     },
     getSoul: (id) => souls.get(id)?.content ?? null,
     setSoul(id, content, updatedBy) {
-      const version = (souls.get(id)?.version ?? 0) + 1;
-      const revision: PersistedSoulRevision = {
-        scopeId: id,
-        content,
-        version,
-        updatedAt: Date.now(),
-        ...(updatedBy ? { updatedBy } : {}),
-      };
-      const history = [revision, ...(soulHistory.get(id) ?? [])];
-      souls.set(id, { content, version });
-      soulHistory.set(id, history);
-      persist(`soul:${id}`, "soul", () => soulStore.put(id, { ...revision, history }));
-      return version;
-    },
-    setSoulLatest(id, content, updatedBy) {
       return writeQueue(`soul:${id}`, async () => {
         if (!soulStore.update) throw new Error("SOUL store does not support atomic updates");
         const legacy = legacySoulHistory.get(id) ?? [];
@@ -635,18 +581,6 @@ export function createMemoryConfigStore(
         legacySoulHistory.delete(id);
         loadSoulCache(id, saved);
         return saved.version;
-      });
-    },
-    clearSoul(id) {
-      if (id === org) souls.set(org, defaultOrgSoul);
-      else souls.delete(id);
-      soulHistory.delete(id);
-      legacySoulHistory.delete(id);
-      persist(`soul:${id}`, "soul", async () => {
-        await soulStore.delete(id);
-        for (const [key, revision] of await soulHistoryStore.entries()) {
-          if (revision.scopeId === id) await soulHistoryStore.delete(key);
-        }
       });
     },
     async setSoulIfVersion(id, expectedVersion, content, updatedBy) {
@@ -714,145 +648,77 @@ export function createMemoryConfigStore(
     restoreSoulCacheSnapshot(id, snapshot) {
       loadSoulCache(id, cloneSoul(snapshot));
     },
-    getCommandPolicy: (id) => policies.get(id) ?? null,
-    setCommandPolicy(id, policy) {
-      policies.set(id, policy);
-      persist(`policy:${id}`, "command policy", () => commandPolicyStore.put(id, { scopeId: id, policy }));
-    },
-    clearCommandPolicy(id) {
-      if (id === org) policies.set(org, defaultOrgPolicy());
-      else policies.delete(id);
-      persist(`policy:${id}`, "command policy", () => commandPolicyStore.delete(id));
-    },
+    getCommandPolicy: (id) => settings.commandPolicies.get(id) ?? (id === org ? orgDefaultPolicy : null),
+    setCommandPolicy: (id, policy) => settings.commandPolicies.set(id, policy),
     getSecurityPosture(id) {
-      const orgPosture = securityPostures.get(org) ?? defaultSecurityPosture;
-      return id === org ? orgPosture : composeSecurityPosture(orgPosture, securityPostures.get(id));
+      const orgPosture = settings.securityPostures.get(org) ?? defaultSecurityPosture;
+      return id === org ? orgPosture : composeSecurityPosture(orgPosture, settings.securityPostures.get(id));
     },
     async getSecurityPostureDurable(id) {
-      const orgPosture = (await securityPostureStore.get(org))?.posture ?? defaultSecurityPosture;
+      const orgPosture = (await settings.securityPostures.durable(org)) ?? defaultSecurityPosture;
       if (id === org) return orgPosture;
-      return composeSecurityPosture(orgPosture, (await securityPostureStore.get(id))?.posture);
+      return composeSecurityPosture(orgPosture, await settings.securityPostures.durable(id));
     },
     async setSecurityPosture(id, posture) {
       const effective =
         id === org
           ? posture
-          : composeSecurityPosture((await securityPostureStore.get(org))?.posture ?? defaultSecurityPosture, posture);
-      await writeQueue(`securityPosture:${id}`, () =>
-        securityPostureStore.put(id, { scopeId: id, posture: effective }),
-      );
-      securityPostures.set(id, effective);
-    },
-    clearSecurityPosture(id) {
-      securityPostures.delete(id);
-      persist(`securityPosture:${id}`, "security posture", () => securityPostureStore.delete(id));
+          : composeSecurityPosture((await settings.securityPostures.durable(org)) ?? defaultSecurityPosture, posture);
+      await settings.securityPostures.set(id, effective);
     },
     getSharingPosture(id) {
-      const orgPosture = sharingPostures.get(org) ?? defaultSharingPosture;
-      return id === org ? orgPosture : composeSharingPostures(orgPosture, [sharingPostures.get(id)]);
+      const orgPosture = settings.sharingPostures.get(org) ?? defaultSharingPosture;
+      return id === org ? orgPosture : composeSharingPostures(orgPosture, [settings.sharingPostures.get(id)]);
     },
     async getSharingPostureDurable(id) {
-      const orgPosture = (await sharingPostureStore.get(org))?.posture ?? defaultSharingPosture;
-      return id === org
-        ? orgPosture
-        : composeSharingPostures(orgPosture, [(await sharingPostureStore.get(id))?.posture]);
+      const orgPosture = (await settings.sharingPostures.durable(org)) ?? defaultSharingPosture;
+      return id === org ? orgPosture : composeSharingPostures(orgPosture, [await settings.sharingPostures.durable(id)]);
     },
-    async getSharingPostureOwnDurable(id) {
-      return (await sharingPostureStore.get(id))?.posture ?? null;
-    },
+    getSharingPostureOwnDurable: async (id) => (await settings.sharingPostures.durable(id)) ?? null,
     async resolveSharingPostureDurable(personalId, targetId) {
-      const [orgRow, personalRow, targetRow] = await Promise.all([
-        sharingPostureStore.get(org),
-        sharingPostureStore.get(personalId),
-        sharingPostureStore.get(targetId),
-      ]);
-      return composeSharingPostures(orgRow?.posture ?? defaultSharingPosture, [
-        personalId === org ? undefined : personalRow?.posture,
-        targetId === org || targetId === personalId ? undefined : targetRow?.posture,
+      const [orgPosture, personalPosture, targetPosture] = await Promise.all(
+        [org, personalId, targetId].map((id) => settings.sharingPostures.durable(id)),
+      );
+      return composeSharingPostures(orgPosture ?? defaultSharingPosture, [
+        personalId === org ? undefined : personalPosture,
+        targetId === org || targetId === personalId ? undefined : targetPosture,
       ]);
     },
-    async setSharingPosture(id, posture) {
-      await writeQueue(`sharingPosture:${id}`, () => sharingPostureStore.put(id, { scopeId: id, posture }));
-      sharingPostures.set(id, posture);
-    },
-    async clearSharingPosture(id) {
-      await writeQueue(`sharingPosture:${id}`, () => sharingPostureStore.delete(id));
-      sharingPostures.delete(id);
-    },
+    setSharingPosture: (id, posture) => settings.sharingPostures.set(id, posture),
+    clearSharingPosture: (id) => settings.sharingPostures.set(id, null),
     getApprovalGrantModes(id) {
-      const orgModes = approvalGrantModesCache.get(org) ?? DEFAULT_APPROVAL_GRANT_MODES;
+      const orgModes = settings.approvalGrantModes.get(org) ?? DEFAULT_APPROVAL_GRANT_MODES;
       if (id === org) return { ...orgModes };
-      return composeApprovalGrantModes(orgModes, approvalGrantModesCache.get(id));
+      return composeApprovalGrantModes(orgModes, settings.approvalGrantModes.get(id));
     },
     async getApprovalGrantModesDurable(id) {
-      const orgModes = (await approvalGrantModesStore.get(org))?.modes ?? DEFAULT_APPROVAL_GRANT_MODES;
+      const orgModes = (await settings.approvalGrantModes.durable(org)) ?? DEFAULT_APPROVAL_GRANT_MODES;
       if (id === org) return { ...orgModes };
-      return composeApprovalGrantModes(orgModes, (await approvalGrantModesStore.get(id))?.modes);
+      return composeApprovalGrantModes(orgModes, await settings.approvalGrantModes.durable(id));
     },
-    async setApprovalGrantModes(id, modes) {
-      const value = { session: !!modes.session, always: !!modes.always };
-      await writeQueue(`approvalGrantModes:${id}`, () =>
-        approvalGrantModesStore.put(id, { scopeId: id, modes: value }),
-      );
-      approvalGrantModesCache.set(id, value);
-    },
-    clearApprovalGrantModes(id) {
-      approvalGrantModesCache.delete(id);
-      persist(`approvalGrantModes:${id}`, "approval grant modes", () => approvalGrantModesStore.delete(id));
-    },
-    getEgress: (id) => egress.get(id) ?? null,
-    setEgress(id, policy) {
-      egress.set(id, policy);
-      persist(`egress:${id}`, "egress policy", () => egressStore.put(id, { scopeId: id, policy }));
-    },
-    clearEgress(id) {
-      if (id === org) egress.set(org, { allowedHosts: [], deniedHosts: [] });
-      else egress.delete(id);
-      persist(`egress:${id}`, "egress policy", () => egressStore.delete(id));
-    },
-    getUnfulfilledInsights: (id) => (unfulfilledInsights.get(org) ?? false) || (unfulfilledInsights.get(id) ?? false),
-    setUnfulfilledInsights(id, on) {
-      unfulfilledInsights.set(id, on);
-      persist(`unfulfilled:${id}`, "unfulfilled-insights flag", () =>
-        unfulfilledInsightsStore.put(id, { scopeId: id, on }),
-      );
-    },
-    clearUnfulfilledInsights(id) {
-      unfulfilledInsights.delete(id);
-      persist(`unfulfilled:${id}`, "unfulfilled-insights flag", () => unfulfilledInsightsStore.delete(id));
-    },
+    setApprovalGrantModes: (id, modes) =>
+      settings.approvalGrantModes.set(id, { session: !!modes.session, always: !!modes.always }),
+    getEgress: (id) => settings.egressPolicies.get(id) ?? (id === org ? orgDefaultEgress : null),
+    setEgress: (id, policy) => settings.egressPolicies.set(id, policy),
+    getUnfulfilledInsights: (id) =>
+      (settings.unfulfilledInsights.get(org) ?? false) || (settings.unfulfilledInsights.get(id) ?? false),
+    setUnfulfilledInsights: (id, on) => settings.unfulfilledInsights.set(id, on),
     getExternalSlackParticipants: (id) =>
-      (externalSlackParticipants.get(org) ?? false) || (externalSlackParticipants.get(id) ?? false),
-    setExternalSlackParticipants(id, on) {
-      externalSlackParticipants.set(id, on);
-      persist(`externalSlack:${id}`, "external-slack-participants flag", () =>
-        externalSlackParticipantsStore.put(id, { scopeId: id, on }),
-      );
-    },
-    clearExternalSlackParticipants(id) {
-      externalSlackParticipants.delete(id);
-      persist(`externalSlack:${id}`, "external-slack-participants flag", () =>
-        externalSlackParticipantsStore.delete(id),
-      );
-    },
+      (settings.externalSlackParticipants.get(org) ?? false) || (settings.externalSlackParticipants.get(id) ?? false),
+    setExternalSlackParticipants: (id, on) => settings.externalSlackParticipants.set(id, on),
     getExternalSlackParticipantsDurable: async (id) =>
-      ((await externalSlackParticipantsStore.get(org))?.on ?? false) ||
-      ((await externalSlackParticipantsStore.get(id))?.on ?? false),
-    getChannelHeaderPin: (id) => channelHeaderPin.get(id) ?? channelHeaderPin.get(org) ?? false,
-    async setChannelHeaderPinLatest(id, on) {
-      await writeQueue(`channelHeaderPin:${id}`, async () => {
-        if (on === null) await channelHeaderPinStore.delete(id);
-        else await channelHeaderPinStore.put(id, { scopeId: id, on });
-        if (on === null) channelHeaderPin.delete(id);
-        else channelHeaderPin.set(id, on);
-      });
+      ((await settings.externalSlackParticipants.durable(org)) ?? false) ||
+      ((await settings.externalSlackParticipants.durable(id)) ?? false),
+    getChannelHeaderPin: (id) => settings.channelHeaderPin.get(id) ?? settings.channelHeaderPin.get(org) ?? false,
+    async setChannelHeaderPin(id, on) {
+      await settings.channelHeaderPin.set(id, on);
       noteChannelHeaderPinChanged(id);
     },
     getChannelHeaderPinDurable: async (id) =>
-      (await channelHeaderPinStore.get(id))?.on ??
-      (id === org ? false : ((await channelHeaderPinStore.get(org))?.on ?? false)),
-    getChannelHeaderPinOverrideDurable: async (id) => (await channelHeaderPinStore.get(id))?.on ?? null,
-    getChannelHeaderPinDefaultDurable: async () => (await channelHeaderPinStore.get(org))?.on ?? false,
+      (await settings.channelHeaderPin.durable(id)) ??
+      (id === org ? false : ((await settings.channelHeaderPin.durable(org)) ?? false)),
+    getChannelHeaderPinOverrideDurable: async (id) => (await settings.channelHeaderPin.durable(id)) ?? null,
+    getChannelHeaderPinDefaultDurable: async () => (await settings.channelHeaderPin.durable(org)) ?? false,
     onChannelHeaderPinChanged(listener) {
       channelHeaderPinListeners.add(listener);
     },
@@ -867,62 +733,20 @@ export function createMemoryConfigStore(
     setPurposeRuntime,
     clearPurposeRuntime: (purpose) => setPurposeRuntime(purpose),
     getBaseModel: (id) => baseModels.get(id)?.modelId ?? null,
-    setBaseModel(id, modelId) {
-      if (modelId === null) {
-        const purposes = purposeFields(id, baseModels.get(id));
-        if (Object.keys(purposes).length) baseModels.set(id, { scopeId: id, ...purposes });
-        else baseModels.delete(id);
-        persist(`model:${id}`, "base model", () => updateBaseModelRow(id, (row) => withoutRuntime(id, row)));
-      } else {
-        const prior = baseModels.get(id);
-        if (prior?.harnessId && isHarnessId(prior.harnessId) && !modelSupportedByHarness(modelId, prior.harnessId))
-          return;
-        const row: PersistedBaseModel = { ...prior, scopeId: id, modelId };
-        baseModels.set(id, row);
-        persist(`model:${id}`, "base model", () =>
-          updateBaseModelRow(id, (current) => ({ ...current, scopeId: id, modelId })),
-        );
-      }
+    async setBaseModel(id, modelId) {
+      await writeQueue(`model:${id}`, async () => {
+        const saved = await updateBaseModelRow(id, (current) => {
+          if (modelId === null) return withoutRuntime(id, current);
+          const harnessId = current?.harnessId;
+          if (harnessId && isHarnessId(harnessId) && !modelSupportedByHarness(modelId, harnessId)) return current!;
+          return { ...current, scopeId: id, modelId };
+        });
+        cacheBaseModel(id, saved);
+      });
       noteRuntimeSelectionChanged(id);
     },
-    getRuntimeSelection(id) {
-      const row = baseModels.get(id);
-      if (!row?.harnessId || !row.modelId) return null;
-      return {
-        harnessId: row.harnessId,
-        modelId: row.modelId,
-        orgRevision: row.orgRevision ?? 0,
-        ...(row.revision !== undefined ? { revision: row.revision } : {}),
-        ...(row.effortLevel !== undefined ? { effortLevel: row.effortLevel } : {}),
-        ...(row.fastMode !== undefined ? { fastMode: row.fastMode } : {}),
-      };
-    },
-    setRuntimeSelection(id, selection) {
-      if (selection === null) {
-        const purposes = purposeFields(id, baseModels.get(id));
-        if (Object.keys(purposes).length) baseModels.set(id, { scopeId: id, ...purposes });
-        else baseModels.delete(id);
-        persist(`model:${id}`, "runtime selection", () => updateBaseModelRow(id, (row) => withoutRuntime(id, row)));
-        noteRuntimeSelectionChanged(id);
-        return;
-      }
-      const orgRow = baseModels.get(org);
-      const revision = (orgRow?.revision ?? 0) + 1;
-      const row: PersistedBaseModel =
-        id === org
-          ? { scopeId: id, ...purposeFields(id, orgRow), ...selection, revision, orgRevision: revision }
-          : { scopeId: id, ...selection, orgRevision: orgRow?.revision ?? 0 };
-      baseModels.set(id, row);
-      persist(`model:${id}`, "runtime selection", () =>
-        updateBaseModelRow(id, (current) => {
-          if (id !== org) return row;
-          const next = Math.max(revision, (current?.revision ?? 0) + 1);
-          return { scopeId: id, ...purposeFields(id, current), ...selection, revision: next, orgRevision: next };
-        }),
-      );
-      noteRuntimeSelectionChanged(id);
-    },
-    async setRuntimeSelectionLatest(id, selection) {
+    getRuntimeSelection: (id) => runtimeSelection(baseModels.get(id)),
+    async setRuntimeSelection(id, selection) {
       await writeQueue(`model:${id}`, async () => {
         if (selection === null) {
           cacheBaseModel(id, await updateBaseModelRow(id, (row) => withoutRuntime(id, row)));
@@ -938,16 +762,7 @@ export function createMemoryConfigStore(
       });
       noteRuntimeSelectionChanged(id);
     },
-    acknowledgeRuntimeSelection(id) {
-      const row = baseModels.get(id);
-      if (!row || id === org) return;
-      const next = { ...row, orgRevision: baseModels.get(org)?.revision ?? 0 };
-      baseModels.set(id, next);
-      persist(`model:${id}`, "runtime selection acknowledgment", () =>
-        baseModelStore.merge(id, { orgRevision: next.orgRevision }),
-      );
-    },
-    async acknowledgeRuntimeSelectionLatest(id) {
+    async acknowledgeRuntimeSelection(id) {
       if (id === org) return;
       await writeQueue(`model:${id}`, async () => {
         const orgRevision = (await baseModelStore.get(org))?.revision ?? 0;
@@ -958,161 +773,66 @@ export function createMemoryConfigStore(
     onRuntimeSelectionChanged(listener) {
       runtimeSelectionListeners.add(listener);
     },
-    getRuntimeSelectionDurable: async (id) => {
-      const row = await baseModelStore.get(id);
-      if (!row?.harnessId || !row.modelId) return null;
-      return {
-        harnessId: row.harnessId,
-        modelId: row.modelId,
-        orgRevision: row.orgRevision ?? 0,
-        ...(row.revision !== undefined ? { revision: row.revision } : {}),
-        ...(row.effortLevel !== undefined ? { effortLevel: row.effortLevel } : {}),
-        ...(row.fastMode !== undefined ? { fastMode: row.fastMode } : {}),
-      };
+    getRuntimeSelectionDurable: async (id) => runtimeSelection(await baseModelStore.get(id)),
+    getApprovedHarnesses: () => {
+      const ids = settings.approvedHarnesses.get(org);
+      return ids ? [...ids] : null;
     },
-    getApprovedHarnesses: () => (approvedHarnesses ? [...approvedHarnesses] : null),
-    setApprovedHarnesses(ids) {
-      const next = ids ? [...ids] : null;
-      approvedHarnesses = next;
-      if (next)
-        persist(`approvedHarnesses:${org}`, "approved harnesses", () =>
-          approvedHarnessStore.put(org, { scopeId: org, ids: next }),
-        );
-      else persist(`approvedHarnesses:${org}`, "approved harnesses", () => approvedHarnessStore.delete(org));
-    },
-    getApprovedHarnessesDurable: async () => (await approvedHarnessStore.get(org))?.ids ?? null,
-    getInternalMemberOverrides: () => [...internalMemberOverrides],
-    setInternalMemberOverrides(members) {
-      const next = [...new Set(members.map((m) => m.trim().toLowerCase()).filter(Boolean))];
-      internalMemberOverrides = next;
-      persist(`internalMemberOverrides:${org}`, "internal member overrides", () =>
-        internalMemberOverridesStore.put(org, { scopeId: org, members: next }),
-      );
-    },
-    getInternalMemberOverridesDurable: async () => (await internalMemberOverridesStore.get(org))?.members ?? [],
-    getOrgAmbient: () => orgAmbient,
-    setOrgAmbient(on) {
-      orgAmbient = on;
-      persist(`orgAmbient:${org}`, "org ambient switch", () => orgAmbientStore.put(org, { scopeId: org, on }));
-    },
-    getOrgAmbientDurable: async () => (await orgAmbientStore.get(org))?.on ?? true,
-    getInteractiveFastMode: () => interactiveFastMode,
-    setInteractiveFastMode(on) {
-      interactiveFastMode = on;
-      persist(`interactiveFastMode:${org}`, "interactive fast mode switch", () =>
-        interactiveFastModeStore.put(org, { scopeId: org, on }),
-      );
-    },
-    getInteractiveFastModeDurable: async () => (await interactiveFastModeStore.get(org))?.on ?? false,
-    getIndividualModelAuth: () => individualModelAuth,
-    setIndividualModelAuth(on) {
-      individualModelAuth = on;
-      persist(`individualModelAuth:${org}`, "individual model auth switch", () =>
-        individualModelAuthStore.put(org, { scopeId: org, on }),
-      );
-    },
+    setApprovedHarnesses: (ids) => settings.approvedHarnesses.set(org, ids ? [...ids] : null),
+    getApprovedHarnessesDurable: async () => (await settings.approvedHarnesses.durable(org)) ?? null,
+    getInternalMemberOverrides: () => [...(settings.internalMemberOverrides.get(org) ?? [])],
+    setInternalMemberOverrides: (members) =>
+      settings.internalMemberOverrides.set(org, [
+        ...new Set(members.map((m) => m.trim().toLowerCase()).filter(Boolean)),
+      ]),
+    getInternalMemberOverridesDurable: async () => (await settings.internalMemberOverrides.durable(org)) ?? [],
+    getOrgAmbient: () => settings.orgAmbient.get(org) ?? true,
+    setOrgAmbient: (on) => settings.orgAmbient.set(org, on),
+    getOrgAmbientDurable: async () => (await settings.orgAmbient.durable(org)) ?? true,
+    getInteractiveFastMode: () => settings.interactiveFastMode.get(org) ?? false,
+    setInteractiveFastMode: (on) => settings.interactiveFastMode.set(org, on),
+    getInteractiveFastModeDurable: async () => (await settings.interactiveFastMode.durable(org)) ?? false,
+    getIndividualModelAuth: () => settings.individualModelAuth.get(org) ?? false,
+    setIndividualModelAuth: (on) => settings.individualModelAuth.set(org, on),
     async getIndividualModelAuthDurable(principalId) {
-      if ((await individualModelAuthStore.get(org))?.on) return true;
+      if (await settings.individualModelAuth.durable(org)) return true;
       return principalId
-        ? ((await individualModelAuthStore.get(scopeId("personal", principalId)))?.on ?? false)
+        ? ((await settings.individualModelAuth.durable(scopeId("personal", principalId))) ?? false)
         : false;
     },
     async getModelAccountDurable(principalId) {
-      const row = await individualModelAuthStore.get(scopeId("personal", principalId));
+      const row = await settings.individualModelAuth.store.get(scopeId("personal", principalId));
       if (row?.on) return row.provider ?? "personal";
-      return (await individualModelAuthStore.get(org))?.on ? "personal" : "company";
+      return (await settings.individualModelAuth.durable(org)) ? "personal" : "company";
     },
     async setPersonalModelAuth(principalId, on, provider) {
       const id = scopeId("personal", principalId);
-      await individualModelAuthStore.put(id, { scopeId: id, on, ...(on && provider ? { provider } : {}) });
+      await settings.individualModelAuth.store.put(id, { scopeId: id, on, ...(on && provider ? { provider } : {}) });
     },
     getBaseModelOwnDurable: async (id) => (await baseModelStore.get(id))?.modelId ?? null,
     getBaseModelDurable: async (id) =>
       (await baseModelStore.get(id))?.modelId ??
       (id === org ? null : ((await baseModelStore.get(org))?.modelId ?? null)),
-    getWebuiModels: (id) => webuiModels.get(id) ?? null,
-    setWebuiModels(id, ids) {
-      if (ids === null || ids.length === 0) {
-        webuiModels.delete(id);
-        persist(`webuiModels:${id}`, "web-ui models", () => webuiModelStore.delete(id));
-      } else {
-        webuiModels.set(id, ids);
-        persist(`webuiModels:${id}`, "web-ui models", () => webuiModelStore.put(id, { scopeId: id, ids }));
-      }
-    },
+    getWebuiModels: (id) => settings.webuiModels.get(id) ?? null,
+    setWebuiModels: (id, ids) => settings.webuiModels.set(id, ids?.length ? ids : null),
     getWebuiModelsDurable: async (id) =>
-      (await webuiModelStore.get(id))?.ids ?? (await webuiModelStore.get(org))?.ids ?? null,
-    getAckEmoji: (id) => ackEmoji.get(id) ?? null,
-    setAckEmoji(id, names) {
-      if (!names || !names.length) {
-        ackEmoji.delete(id);
-        persist(`ackEmoji:${id}`, "ack emoji", () => ackEmojiStore.delete(id));
-      } else {
-        ackEmoji.set(id, names);
-        persist(`ackEmoji:${id}`, "ack emoji", () => ackEmojiStore.put(id, { scopeId: id, names }));
-      }
-    },
-    getAckEmojiDurable: async (id) => {
-      const pending = pendingWrites.get(`ackEmoji:${id}`);
-      if (pending) await pending;
-      return (await ackEmojiStore.get(id))?.names ?? null;
-    },
-    getPinnedSkillsDurable: async (id) => (await pinnedSkillsStore.get(id))?.names ?? [],
-    setPinnedSkills: (id, names) =>
-      writeQueue(`pinnedSkills:${id}`, () =>
-        names.length ? pinnedSkillsStore.put(id, { scopeId: id, names }) : pinnedSkillsStore.delete(id),
-      ),
-    setSlackEmojiCatalog(id, emoji) {
-      persist(`slackEmojiCatalog:${id}`, "slack emoji catalog", () =>
+      (await settings.webuiModels.durable(id)) ?? (await settings.webuiModels.durable(org)) ?? null,
+    getAckEmoji: (id) => settings.ackEmoji.get(id) ?? null,
+    setAckEmoji: (id, names) => settings.ackEmoji.set(id, names?.length ? names : null),
+    getAckEmojiDurable: async (id) => (await settings.ackEmoji.durable(id)) ?? null,
+    async setSlackEmojiCatalog(id, emoji) {
+      await writeQueue(`slackEmojiCatalog:${id}`, () =>
         slackEmojiCatalogStore.put(id, { scopeId: id, emoji, updatedAt: Date.now() }),
       );
     },
-    getSlackEmojiCatalogDurable: async (id) => {
-      const pending = pendingWrites.get(`slackEmojiCatalog:${id}`);
-      if (pending) await pending;
-      return (await slackEmojiCatalogStore.get(id)) ?? null;
-    },
-    getPeopleDirectoryUrl: (id) => peopleDirectoryUrls.get(id) ?? null,
-    setPeopleDirectoryUrl(id, url) {
-      if (url === null) {
-        peopleDirectoryUrls.delete(id);
-        persist(`peopleDir:${id}`, "people directory url", () => peopleDirectoryUrlStore.delete(id));
-      } else {
-        peopleDirectoryUrls.set(id, url);
-        persist(`peopleDir:${id}`, "people directory url", () => peopleDirectoryUrlStore.put(id, { scopeId: id, url }));
-      }
-    },
-    getBranding: (id) => branding.get(id) ?? null,
-    setBranding(id, value) {
-      if (value === null) {
-        branding.delete(id);
-        persist(`branding:${id}`, "branding", () => brandingStore.delete(id));
-      } else {
-        branding.set(id, value);
-        persist(`branding:${id}`, "branding", () => brandingStore.put(id, { scopeId: id, branding: value }));
-      }
-    },
-    getBrandingDurable: async (id) => (await brandingStore.get(id))?.branding ?? null,
-    getBrowseMaxSteps: (id) => browseMaxSteps.get(id) ?? null,
-    setBrowseMaxSteps(id, steps) {
-      if (steps === null) {
-        browseMaxSteps.delete(id);
-        persist(`browseSteps:${id}`, "browse max steps", () => browseMaxStepsStore.delete(id));
-      } else {
-        browseMaxSteps.set(id, steps);
-        persist(`browseSteps:${id}`, "browse max steps", () => browseMaxStepsStore.put(id, { scopeId: id, steps }));
-      }
-    },
-    getBrowseModel: (id) => browseModels.get(id) ?? null,
-    setBrowseModel(id, modelId) {
-      if (modelId === null) {
-        browseModels.delete(id);
-        persist(`browseModel:${id}`, "browse model", () => browseModelStore.delete(id));
-      } else {
-        browseModels.set(id, modelId);
-        persist(`browseModel:${id}`, "browse model", () => browseModelStore.put(id, { scopeId: id, modelId }));
-      }
-    },
+    getSlackEmojiCatalogDurable: async (id) => (await slackEmojiCatalogStore.get(id)) ?? null,
+    getBranding: (id) => settings.branding.get(id) ?? null,
+    setBranding: (id, value) => settings.branding.set(id, value),
+    getBrandingDurable: async (id) => (await settings.branding.durable(id)) ?? null,
+    getBrowseMaxSteps: (id) => settings.browseMaxSteps.get(id) ?? null,
+    setBrowseMaxSteps: (id, steps) => settings.browseMaxSteps.set(id, steps),
+    getBrowseModel: (id) => settings.browseModels.get(id) ?? null,
+    setBrowseModel: (id, modelId) => settings.browseModels.set(id, modelId),
     getEmbeddingModelDurable: async () => (await baseModelStore.get(org))?.embeddingModelId ?? null,
     setEmbeddingModel: async (modelId) => {
       await writeQueue(`model:${org}`, async () => {
@@ -1125,17 +845,8 @@ export function createMemoryConfigStore(
         cacheBaseModel(org, saved);
       });
     },
-    getAutoFlaggerConfig: () => autoFlaggerConfig,
-    setAutoFlaggerConfig(config) {
-      autoFlaggerConfig = config;
-      if (config === null) {
-        persist(`autoFlagger:${org}`, "Auto flagger config", () => autoFlaggerStore.delete(org));
-      } else {
-        persist(`autoFlagger:${org}`, "Auto flagger config", () =>
-          autoFlaggerStore.put(org, { scopeId: org, ...config }),
-        );
-      }
-    },
+    getAutoFlaggerConfig: () => settings.autoFlaggerConfigs.get(org) ?? null,
+    setAutoFlaggerConfig: (config) => settings.autoFlaggerConfigs.set(org, config),
     async setConnectorClient(id, provider, input) {
       const rec: StoredConnectorClient = {
         scopeId: id,
@@ -1169,82 +880,29 @@ export function createMemoryConfigStore(
       };
     },
     async scopeConfigPresence(id) {
-      const [
-        soul,
-        commandPolicy,
-        securityPosture,
-        sharingPosture,
-        grantModes,
-        egressPolicy,
-        unfulfilled,
-        externalSlack,
-        runtime,
-        approved,
-        brandingRow,
-      ] = await Promise.all([
-        soulStore.get(id),
-        commandPolicyStore.get(id),
-        securityPostureStore.get(id),
-        sharingPostureStore.get(id),
-        approvalGrantModesStore.get(id),
-        egressStore.get(id),
-        unfulfilledInsightsStore.get(id),
-        externalSlackParticipantsStore.get(id),
-        baseModelStore.get(id),
-        id === org ? approvedHarnessStore.get(org) : null,
-        brandingStore.get(id),
-      ]);
-      return {
-        soul: !!soul,
-        commandPolicy: !!commandPolicy,
-        securityPosture: !!securityPosture,
-        sharingPosture: !!sharingPosture,
-        approvalGrantModes: !!grantModes,
-        egress: !!egressPolicy,
-        unfulfilledInsights: !!unfulfilled,
-        externalSlackParticipants: !!externalSlack,
-        runtime: !!runtime,
-        approvedHarnesses: !!approved,
-        branding: !!brandingRow,
+      const stores = {
+        soul: soulStore,
+        commandPolicy: settings.commandPolicies.store,
+        securityPosture: settings.securityPostures.store,
+        sharingPosture: settings.sharingPostures.store,
+        approvalGrantModes: settings.approvalGrantModes.store,
+        egress: settings.egressPolicies.store,
+        unfulfilledInsights: settings.unfulfilledInsights.store,
+        externalSlackParticipants: settings.externalSlackParticipants.store,
+        runtime: baseModelStore,
+        approvedHarnesses: settings.approvedHarnesses.store,
+        branding: settings.branding.store,
       };
+      const present = await Promise.all(
+        Object.entries(stores).map(async ([key, store]) => [key, !!(await store.get(id))] as const),
+      );
+      return Object.fromEntries(present) as Record<keyof typeof stores, boolean>;
     },
     async refreshScope(id) {
-      const [
-        soul,
-        commandPolicy,
-        securityPosture,
-        sharingPosture,
-        grantModes,
-        egressPolicy,
-        unfulfilled,
-        externalSlack,
-        baseModel,
-        approved,
-        brandingRow,
-        orgAmbientRow,
-        interactiveFastModeRow,
-        individualModelAuthRow,
-        channelHeaderPinRow,
-        autoFlaggerRow,
-        internalOverridesRow,
-      ] = await Promise.all([
+      const [soul, baseModel] = await Promise.all([
         soulStore.get(id),
-        commandPolicyStore.get(id),
-        securityPostureStore.get(id),
-        sharingPostureStore.get(id),
-        approvalGrantModesStore.get(id),
-        egressStore.get(id),
-        unfulfilledInsightsStore.get(id),
-        externalSlackParticipantsStore.get(id),
         baseModelStore.get(id),
-        id === org ? approvedHarnessStore.get(org) : null,
-        brandingStore.get(id),
-        id === org ? orgAmbientStore.get(org) : null,
-        id === org ? interactiveFastModeStore.get(org) : null,
-        id === org ? individualModelAuthStore.get(org) : null,
-        channelHeaderPinStore.get(id),
-        id === org ? autoFlaggerStore.get(org) : null,
-        id === org ? internalMemberOverridesStore.get(org) : null,
+        ...allSettings.map((setting) => setting.refresh(id)),
       ]);
       let refreshedSoul = soul;
       const legacyHistory = legacySoulHistory.get(id) ?? [];
@@ -1264,68 +922,8 @@ export function createMemoryConfigStore(
         legacySoulHistory.delete(id);
       }
       loadSoulCache(id, refreshedSoul);
-      if (commandPolicy) policies.set(id, commandPolicy.policy);
-      else if (id === org) policies.set(org, defaultOrgPolicy());
-      else policies.delete(id);
-      if (securityPosture) securityPostures.set(id, securityPosture.posture);
-      else securityPostures.delete(id);
-      if (sharingPosture) sharingPostures.set(id, sharingPosture.posture);
-      else sharingPostures.delete(id);
-      if (grantModes) approvalGrantModesCache.set(id, grantModes.modes);
-      else approvalGrantModesCache.delete(id);
-      if (egressPolicy) egress.set(id, egressPolicy.policy);
-      else if (id === org) egress.set(org, { allowedHosts: [], deniedHosts: [] });
-      else egress.delete(id);
-      if (unfulfilled) unfulfilledInsights.set(id, unfulfilled.on);
-      else unfulfilledInsights.delete(id);
-      if (externalSlack) externalSlackParticipants.set(id, externalSlack.on);
-      else externalSlackParticipants.delete(id);
       if (baseModel) baseModels.set(id, baseModel);
       else baseModels.delete(id);
-      if (id === org) approvedHarnesses = approved?.ids ?? null;
-      if (id === org) internalMemberOverrides = internalOverridesRow?.members ?? [];
-      if (id === org) orgAmbient = orgAmbientRow?.on ?? true;
-      if (id === org) interactiveFastMode = interactiveFastModeRow?.on ?? false;
-      if (id === org) individualModelAuth = individualModelAuthRow?.on ?? false;
-      if (id === org)
-        autoFlaggerConfig = autoFlaggerRow
-          ? { harnessId: autoFlaggerRow.harnessId, modelId: autoFlaggerRow.modelId, rubric: autoFlaggerRow.rubric }
-          : null;
-      if (brandingRow) branding.set(id, brandingRow.branding);
-      else branding.delete(id);
-      if (channelHeaderPinRow) channelHeaderPin.set(id, channelHeaderPinRow.on);
-      else channelHeaderPin.delete(id);
-    },
-    async flushScope(id) {
-      const keys = [
-        `soul:${id}`,
-        `policy:${id}`,
-        `securityPosture:${id}`,
-        `sharingPosture:${id}`,
-        `approvalGrantModes:${id}`,
-        `egress:${id}`,
-        `externalSlack:${id}`,
-        `model:${id}`,
-        `branding:${id}`,
-        ...(id === org
-          ? [
-              `approvedHarnesses:${org}`,
-              `orgAmbient:${org}`,
-              `interactiveFastMode:${org}`,
-              `individualModelAuth:${org}`,
-              `autoFlagger:${org}`,
-            ]
-          : []),
-        `channelHeaderPin:${id}`,
-        `ackEmoji:${id}`,
-      ];
-      await Promise.all(
-        keys.map(async (key) => {
-          const pending = pendingWrites.get(key);
-          if (pending) await pending;
-          await writeQueue(key, async () => undefined);
-        }),
-      );
     },
   };
 }
