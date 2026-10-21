@@ -89,6 +89,33 @@ test("automatic context renders overheard messages and preserves literal entitie
   assert.match(rendered.header, /stored Slack events/);
 });
 
+test("a top-level tag after a multi-day gap still sees earlier channel messages", async () => {
+  const { cache, readHistory, client } = fixture();
+  const trigger = 1_700_200_000;
+  await cache.ingest([
+    {
+      container: "C1",
+      ts: `${trigger - 3 * 86_400}.000001`,
+      text: "the Claude key errors when I chat",
+      authorId: "U1",
+    },
+  ]);
+  const serializer = createConversationSerializer({
+    ids,
+    directory,
+    externalParticipantsEnabled: async () => false,
+    readHistory,
+  });
+  const result = await serializer.serializeSlackConversation(
+    client,
+    { kind: "channel", channel: "C1", ts: `${trigger}.000002`, rawText: "help me debug this", userId: "U2", files: [] },
+    { audience: [] },
+  );
+  const overheard = renderConversationView(result.view).overheard;
+  const earlier = overheard.find((m) => m.ts === `${trigger - 3 * 86_400}.000001`);
+  assert.equal(earlier?.text, "the Claude key errors when I chat");
+});
+
 test("missing parent falls back once then the returned parent is stored for later turns", async () => {
   const { cache, readHistory, client } = fixture();
   await cache.ingest([{ container: "C1", ts: "2.000000", sub: "1.000000", text: "reply" }]);
@@ -401,7 +428,7 @@ test("automatic context keeps the thread parent and recent exchange but excludes
   );
 });
 
-for (const source of ["live", "mirror"] as const) {
+for (const source of ["live", "mirror", "explicit-live"] as const) {
   test(`own status cards are excluded from ${source} history and backfill`, async () => {
     const f = fixture();
     const messages = [
@@ -410,15 +437,123 @@ for (const source of ["live", "mirror"] as const) {
       { user: "UBOT", ts: "3", text: "ordinary answer" },
       { user: "UOTHER", ts: "4", text: "other bot task", blocks: [{ type: "task_card", task_id: "qm_status:other" }] },
     ];
-    const read = createSlackHistoryReader({ core: f.core, ids, source });
+    const read = createSlackHistoryReader({
+      core: f.core,
+      ids,
+      source: source === "explicit-live" ? "mirror" : source,
+    });
     const client = { conversations: { history: async () => ({ messages }), replies: async () => ({ messages }) } };
-    const result = await read(client, "C1", "1");
+    const result = await read(client, "C1", "1", undefined, false, source === "explicit-live");
     assert.deepEqual(
       result.raw.map((m) => m.ts),
       ["1", "3", "4"],
     );
     assert.ok(!(await f.cache.readMessages("C1", { limit: 100 })).some((m) => m.ts === "2"));
-    const expanded = await read(client, "C1", undefined, undefined, true);
+    const expanded = await read(client, "C1", undefined, undefined, true, source === "explicit-live");
     assert.ok(!expanded.raw.some((m) => m.ts === "2"));
   });
 }
+
+test("explicit live context verifies reactions and never substitutes mirrored data on failure", async () => {
+  const { createSurfaceContextFulfiller } = await import("../src/slack/surface-context.ts");
+  const { core, client } = fixture();
+  const calls: unknown[] = [];
+  const historyClient = {
+    conversations: {
+      history: async (args: unknown) => {
+        calls.push(args);
+        return {
+          messages: [
+            { ts: "2.5", user: "UBOT", text: "Working", blocks: [{ type: "task_card", task_id: "qm_status:test" }] },
+            {
+              ts: "2.0",
+              text: "complete",
+              user: "U1",
+              reactions: [{ name: "white_check_mark", count: 2, users: ["U2"] }],
+            },
+            { ts: "1.0", text: "waiting", user: "U1" },
+          ],
+          has_more: true,
+        };
+      },
+      replies: async () => ({ messages: [{ ts: "1.0", text: "waiting", user: "U1" }] }),
+    },
+  };
+  const readHistory = createSlackHistoryReader({ core, ids, source: "mirror", historyClient });
+  let outcome: any;
+  const fulfiller = createSurfaceContextFulfiller({
+    core: {
+      fulfillContextRequest: async (_id, result) => {
+        outcome = result;
+      },
+    } as SlackCoreClient,
+    directory,
+    serializer: createConversationSerializer({
+      ids,
+      directory,
+      readHistory,
+      externalParticipantsEnabled: async () => false,
+    }),
+    botToken: "test",
+    clientOptions: {},
+    historyClient,
+    readHistory,
+  });
+  const request = {
+    id: "live",
+    query: { conversationTarget: "C1", count: 2, before: "3.0", live: true },
+  } as import("../src/api/slack-core-client.ts").SurfaceContextRequest;
+  await fulfiller.fulfillSurfaceContext(client, request);
+  assert.equal(outcome.error, undefined);
+  assert.deepEqual(
+    outcome.result.messages.map((m: any) => m.reactions),
+    [[], [{ name: "white_check_mark", count: 2 }]],
+  );
+  assert.deepEqual(calls, [{ channel: "C1", limit: 200, latest: "3.0", inclusive: false }]);
+  assert.equal(outcome.result.hasMore, true);
+  assert.equal(outcome.result.nextBefore, "1.0");
+  request.query.conversationTarget = "C1:1.0";
+  await fulfiller.fulfillSurfaceContext(client, request);
+  assert.match(outcome.error, /truncated channel history/);
+  assert.equal(outcome.result, undefined);
+  historyClient.conversations.replies = async () => {
+    throw new Error("missing_scope");
+  };
+  await fulfiller.fulfillSurfaceContext(client, request);
+  assert.match(outcome.error, /missing_scope/);
+  assert.equal(outcome.result, undefined);
+  historyClient.conversations.replies = async () => ({ messages: [{ ts: "1.0", text: "waiting", user: "U1" }] });
+  request.query.conversationTarget = "C1";
+  historyClient.conversations.history = async () => {
+    throw new Error("live source unavailable");
+  };
+  await fulfiller.fulfillSurfaceContext(client, request);
+  assert.match(outcome.error, /live source unavailable/);
+  assert.equal(outcome.result, undefined);
+  request.query.conversationTarget = "C1:1.0";
+  await fulfiller.fulfillSurfaceContext(client, request);
+  assert.match(outcome.error, /live source unavailable/);
+  assert.equal(outcome.result, undefined);
+  request.query.conversationTarget = "C1";
+  historyClient.conversations.history = async () => ({
+    messages: [{ ts: "2.0", subtype: "channel_join", text: "joined", user: "U1" }],
+    has_more: true,
+  });
+  await fulfiller.fulfillSurfaceContext(client, request);
+  assert.match(outcome.error, /only filtered messages/);
+  assert.equal(outcome.result, undefined);
+});
+
+test("explicit live reads reject truncated threads instead of returning an unusable backward cursor", async () => {
+  const f = fixture();
+  const read = createSlackHistoryReader({ core: f.core, ids, source: "mirror", managed: true });
+  const client = {
+    conversations: {
+      replies: async ({ limit }: { limit: number }) => ({
+        messages: Array.from({ length: limit }, (_, i) => ({ ts: `${i + 1}.0`, text: `reply ${i}` })),
+        has_more: true,
+      }),
+    },
+  };
+  await assert.rejects(read(client, "C1", "1.0", undefined, false, true), /thread exceeds the history limit/);
+});
