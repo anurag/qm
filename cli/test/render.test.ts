@@ -778,6 +778,23 @@ test("Render retains the creation request when its recovery lookup fails", async
   assert.deepEqual(d.saved().pendingCreate, { collection: "projects", name: "acme-qm" });
 });
 
+test("Render retains the creation request when its recovery lookup returns an empty body", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.intercept = ({ path, method }) => {
+    if (path === "/projects" && method === "POST") throw new TypeError("connection closed");
+    return undefined;
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /connection closed/);
+  c.intercept = ({ path, method }) =>
+    path === "/projects" && method === "GET" ? new Response(null, { status: 200 }) : undefined;
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /invalid list response/);
+  await assert.rejects(async () => d.backend.down({ purge: true }), /invalid list response/);
+  assert.deepEqual(d.saved().pendingCreate, { collection: "projects", name: "acme-qm" });
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
+});
+
 test("Render records a resource after its accepted creation response is lost", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
@@ -812,6 +829,162 @@ test("Render retries a resource creation rejected by rate limiting", async (t) =
   c.intercept = undefined;
   await d.backend.up({ dryRun: false });
   assert.equal(d.saved().pendingCreate, undefined);
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.services.size, 3);
+});
+
+test("Render retries transient API failures for idempotent requests and only rate limits for creations", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  const injected = new Set<string>();
+  const once = (key: string, fail: () => Response) => {
+    if (injected.has(key)) return undefined;
+    injected.add(key);
+    return fail();
+  };
+  const transient = (status: number) => () => new Response(null, { status, headers: { "retry-after": "0" } });
+  c.intercept = ({ path, method }) => {
+    if (method === "GET" && path === "/owners/tea-acme") return once("owner", transient(503));
+    if (method === "POST" && path === "/projects") return once("project", transient(429));
+    if (method === "PUT" && path === "/services/srv-acme-core/env-vars")
+      return once("env", () => {
+        throw new TypeError("connection reset");
+      });
+    return undefined;
+  };
+  await d.backend.up({ dryRun: false });
+  assert.deepEqual([...injected], ["owner", "project", "env"]);
+  assert.equal(c.projects.size, 1);
+  assert.equal(c.calls.filter((call) => call.method === "POST" && call.path === "/projects").length, 2);
+  c.intercept = ({ path, method }) =>
+    method === "POST" && path === "/services/srv-acme-core/deploys"
+      ? new Response(null, { status: 503, headers: { "retry-after": "0" } })
+      : undefined;
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 503/);
+  assert.equal(
+    c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/services/srv-acme-core/deploys")
+      .length,
+    1,
+  );
+  c.intercept = ({ path, method }) => {
+    if (method !== "DELETE" || path !== "/services/srv-acme-core") return undefined;
+    return once("delete", () => {
+      c.services.delete("srv-acme-core");
+      return new Response(null, { status: 502, headers: { "retry-after": "0" } });
+    });
+  };
+  await d.backend.down({ purge: true });
+  assert.ok(injected.has("delete"));
+  assert.equal(c.services.size, 0);
+  assert.deepEqual(d.saved().services, {});
+});
+
+test("Render rejects unrecorded same-name resources and changed ownership before mutations", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  c.projects.set("prj-existing", {
+    id: "prj-existing",
+    name: "acme-qm",
+    owner: { id: "tea-acme" },
+    environmentIds: [],
+  });
+  await assert.rejects(d.backend.up({ dryRun: false }), /Refusing to adopt/);
+  assert.deepEqual(writes(c.calls), []);
+  c.projects.clear();
+  await d.backend.up({ dryRun: false });
+  c.services.get("srv-acme-web-ui")!.environmentId = "evm-other";
+  const mark = c.calls.length;
+  await assert.rejects(d.backend.up({ dryRun: false }), /does not match/);
+  assert.deepEqual(writes(c.calls.slice(mark)), []);
+  await assert.rejects(async () => d.backend.down({ purge: true }), /does not match/);
+  assert.equal(c.services.size, 3);
+});
+
+test("Render stops services and resumes them while retaining database and disk", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  await d.backend.down({});
+  assert.equal(c.services.get("srv-acme-minio")!.suspended, "suspended");
+  assert.ok(c.database);
+  assert.equal(c.services.size, 3);
+  const mark = c.calls.length;
+  await d.backend.up({ dryRun: false });
+  assert.ok([...c.services.values()].every((service) => service.suspended === "not_suspended"));
+  assert.equal(
+    c.calls.slice(mark).some((call) => call.path.endsWith("/deploys") && call.method === "POST"),
+    true,
+  );
+});
+
+test("Render shutdown ignores app services outside the saved project", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const app = {
+    ...c.services.get("srv-acme-web-ui")!,
+    id: "srv-other-project-app",
+    name: "qm-app-other",
+    type: "private_service",
+    environmentId: "evm-other-project",
+  };
+  c.services.set(app.id, app);
+  c.envs.set(app.id, { QM_DEPLOYMENT_ID: "00000000-0000-4000-8000-000000000002" });
+  const mark = c.calls.length;
+  await d.backend.down({});
+  assert.equal(app.suspended, "not_suspended");
+  assert.ok(c.calls.slice(mark).every((call) => !call.path.startsWith(`/services/${app.id}`)));
+});
+
+test("Render protects published apps in owner environments before shutdown or purge", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const app = {
+    ...c.services.get("srv-acme-web-ui")!,
+    id: "srv-published-app",
+    name: "qm-app-a1",
+    environmentId: "evm-owner",
+    type: "web_service",
+  };
+  c.projects.get("prj-acme")!.environmentIds.push("evm-owner");
+  c.services.set(app.id, app);
+  c.envs.set(app.id, { QM_DEPLOYMENT_ID: "00000000-0000-4000-8000-000000000001" });
+  for (const environmentId of ["evm-acme", "evm-owner"]) {
+    app.environmentId = environmentId;
+    for (const purge of [false, true]) {
+      const mark = c.calls.length;
+      await assert.rejects(async () => d.backend.down({ purge }), /Published apps still use this deployment/);
+      assert.deepEqual(writes(c.calls.slice(mark)), []);
+      assert.equal(d.saved().pendingPurge, undefined);
+    }
+  }
+  app.suspended = "suspended";
+  await assert.rejects(async () => d.backend.down({ purge: true }), /Published apps still use this deployment/);
+  await d.backend.down({});
+  assert.ok(c.database);
+});
+
+test("Render purge resumes partial deletion and retains the project", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  c.intercept = (call) =>
+    call.path === "/services/srv-acme-core" && call.method === "DELETE"
+      ? new Response(null, { status: 500 })
+      : undefined;
+  await assert.rejects(async () => d.backend.down({ purge: true }), /HTTP 500/);
+  assert.equal(d.saved().pendingPurge, true);
+  assert.ok(c.database);
+  await assert.rejects(d.backend.up({ dryRun: false }), /cleanup is incomplete/);
+  c.intercept = undefined;
+  await d.backend.down({ purge: true });
+  assert.equal(c.services.size, 0);
+  assert.equal(c.database, undefined);
+  assert.equal(c.projects.size, 1);
+  assert.deepEqual(d.saved().services, {});
+  await d.backend.up({ dryRun: false });
   assert.equal(c.projects.size, 1);
   assert.equal(c.services.size, 3);
 });
@@ -980,6 +1153,42 @@ test("Render creates services with a no-op command and cancels the automatic bui
   assert.equal(canceled.size, 4);
 });
 
+test("Render resumes a suspended service with a no-op command and keeps its credentials across an interrupted resume", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const storage = { ...c.envs.get("srv-acme-minio")! };
+  d.setCommit("c".repeat(40));
+  await d.backend.down({});
+  let interrupted = false;
+  c.intercept = ({ path, method }) => {
+    if (path === "/services/srv-acme-minio/resume" && method === "POST") {
+      assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
+      assert.equal(
+        c.services.get("srv-acme-minio")!.serviceDetails.envSpecificDetails.dockerCommand,
+        "/bin/sh -c exit 0",
+      );
+    }
+    if (path.startsWith("/services/srv-acme-minio/deploys/") && path.endsWith("/cancel") && !interrupted) {
+      interrupted = true;
+      return new Response(null, { status: 500 });
+    }
+    return undefined;
+  };
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
+  const recorded = readFileSync(join(d.ctx.configDir, "render.resources.json"), "utf8");
+  for (const value of [storage.MINIO_ROOT_PASSWORD!, storage.QM_STORAGE_SECRET_KEY!, "e".repeat(64)])
+    assert.ok(!recorded.includes(value));
+  const mark = c.calls.length;
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.calls.slice(mark).filter((call) => call.path === "/services/srv-acme-minio/resume").length, 0);
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, storage.MINIO_ROOT_PASSWORD);
+  assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, storage.QM_STORAGE_SECRET_KEY);
+  assert.equal(c.deploys.get("srv-acme-minio")!.commit!.id, "a".repeat(40));
+  assert.equal(c.deploys.get("srv-acme-core")!.commit!.id, "c".repeat(40));
+});
+
 test("Render keeps the selected MinIO commit when an interrupted bootstrap retries after the branch moves", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
@@ -998,6 +1207,20 @@ test("Render keeps the selected MinIO commit when an interrupted bootstrap retri
   );
   assert.equal(d.saved().releases[0].commit, "c".repeat(40));
   assert.equal(c.envs.get("srv-acme-core")!.GIT_SHA, "c".repeat(40));
+});
+
+test("Render retries a rejected resume without losing retained storage credentials", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const password = c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD;
+  await d.backend.down({});
+  c.intercept = ({ path }) =>
+    path === "/services/srv-acme-minio/resume" ? new Response(null, { status: 429 }) : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 429/);
+  c.intercept = undefined;
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.envs.get("srv-acme-minio")!.MINIO_ROOT_PASSWORD, password);
 });
 
 test("Render records a service after its creation reply is lost and ignores same-named services elsewhere", async (t) => {
