@@ -1,21 +1,12 @@
 import { SandboxSnapshotNotFoundError } from "@renderinc/sdk";
-
 import { AWS_CLI_ENSURE } from "../../src/sandbox/aws-cli.ts";
-
 import { execFile } from "node:child_process";
-
 import { randomUUID } from "node:crypto";
-
 import { promisify } from "node:util";
-
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-
 import { tmpdir } from "node:os";
-
 import { dirname, join } from "node:path";
-
 import type { TestContext } from "node:test";
-
 import {
   RENDER_SCRIPT_DIR,
   RENDER_SANDBOX_TTL_SEC,
@@ -23,9 +14,8 @@ import {
   type RenderSandboxInfo,
   type RenderSnapshot,
 } from "../../src/sandbox/render-client.ts";
-
+import type { RenderApi } from "../../src/deploy/render-api.ts";
 import type { Deployment } from "../../src/deploy/deploy-store.ts";
-
 import { scopeId } from "../../src/types.ts";
 
 export function fakeDeployment(versions: Deployment["versions"] = []): Deployment {
@@ -37,6 +27,28 @@ export function fakeDeployment(versions: Deployment["versions"] = []): Deploymen
     status: "stopped",
     endpoint: null,
     versions,
+  };
+}
+
+export interface FakeRenderApiCall {
+  method: string;
+  path: string;
+  query: URLSearchParams;
+  body?: unknown;
+}
+
+export function createFakeRenderApi(
+  handle: (call: FakeRenderApiCall) => unknown,
+): RenderApi & { calls: FakeRenderApiCall[] } {
+  const calls: FakeRenderApiCall[] = [];
+  return {
+    calls,
+    async request<T>(method: string, path: string, body?: unknown): Promise<T | null> {
+      const url = new URL(path, "https://render.test");
+      const call = { method, path: url.pathname, query: url.searchParams, body };
+      calls.push(call);
+      return (await handle(call)) as T | null;
+    },
   };
 }
 
