@@ -55,7 +55,7 @@ function customDomainPath(service: RenderService, name?: string): string {
   return `/services/${service.id}/custom-domains${name ? `/${encodeURIComponent(name)}` : ""}`;
 }
 
-function customDomains(request: RenderRequest, service: RenderService): Promise<CustomDomain[]> {
+export function customDomains(request: RenderRequest, service: RenderService): Promise<CustomDomain[]> {
   return list<CustomDomain>(request, customDomainPath(service), "customDomain");
 }
 

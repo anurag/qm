@@ -1,9 +1,7 @@
-import { CliError } from "./log.ts";
-
+import { CliError, errMessage } from "./log.ts";
 import { sleep } from "./util.ts";
 
 export type ServiceType = "web_service" | "private_service";
-
 export interface RenderService {
   id: string;
   name: string;
@@ -29,9 +27,11 @@ export interface RenderService {
     disk?: { id: string; mountPath: string; sizeGB: number };
   };
 }
-
 export type RenderRequest = <T>(path: string, method?: string, body?: unknown) => Promise<T>;
-
+export interface RenderLog {
+  timestamp: string;
+  message: string;
+}
 export class RenderApiError extends CliError {
   readonly status: number;
   constructor(status: number, path: string, method: string, detail: string, requestId: string | null) {
@@ -44,11 +44,8 @@ export class RenderApiError extends CliError {
     return this.status >= 400 && this.status < 500 && this.status !== 408 && this.status !== 429;
   }
 }
-
 const RENDER_ATTEMPTS = 4;
-
 const RENDER_TRANSIENT_STATUSES = new Set([429, 500, 502, 503, 504]);
-
 function retryDelayMs(attempt: number, response?: Response): number {
   const raw = response?.headers.get("retry-after")?.trim();
   if (raw) {
@@ -58,7 +55,6 @@ function retryDelayMs(attempt: number, response?: Response): number {
   }
   return Math.round(Math.min(8_000, 500 * 2 ** (attempt - 1)) * (0.5 + Math.random() / 2));
 }
-
 export function renderClient(apiKey: string): RenderRequest {
   return async <T>(path: string, method = "GET", body?: unknown): Promise<T> => {
     const idempotent = method !== "POST";
@@ -104,14 +100,54 @@ export function renderClient(apiKey: string): RenderRequest {
     return (response.headers.get("content-type")?.includes("json") ? JSON.parse(text) : text) as T;
   };
 }
-
+export async function streamRenderLogs(
+  apiKey: string,
+  query: URLSearchParams,
+  onLog: (log: RenderLog) => void,
+): Promise<void> {
+  const socket = new WebSocket(`wss://api.render.com/v1/logs/subscribe?${query}`, {
+    headers: { authorization: `Bearer ${apiKey}` },
+  });
+  socket.binaryType = "arraybuffer";
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((_, reject) => {
+      timer = setTimeout(() => reject(new CliError("Render log subscription did not connect in 60 seconds")), 60_000);
+      socket.addEventListener("open", () => clearTimeout(timer));
+      socket.addEventListener("message", (event) => {
+        try {
+          const log = JSON.parse(typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data));
+          if (!log || typeof log.timestamp !== "string" || typeof log.message !== "string")
+            throw new CliError("Render log subscription returned an invalid log");
+          onLog(log);
+        } catch (error) {
+          reject(error);
+        }
+      });
+      socket.addEventListener("error", (event) => {
+        reject(
+          new CliError(`Render log subscription failed: ${errMessage(event.error ?? event.message)}`, {
+            cause: event.error,
+          }),
+        );
+      });
+      socket.addEventListener("close", (event) => {
+        reject(
+          new CliError(`Render log subscription closed (${event.code})${event.reason ? `: ${event.reason}` : ""}`),
+        );
+      });
+    });
+  } finally {
+    clearTimeout(timer);
+    socket.close();
+  }
+}
 export async function requestArray<T>(request: RenderRequest, path: string): Promise<T[]> {
   const page = await request<unknown>(path);
   if (page === null) return [];
   if (!Array.isArray(page)) throw new CliError(`Render GET ${path.split("?")[0]} returned an invalid list response`);
   return page as T[];
 }
-
 export async function list<T>(request: RenderRequest, path: string, key: string): Promise<T[]> {
   const out: T[] = [];
   const seen = new Set<string>();
