@@ -5,7 +5,7 @@ import { chmod, chown, mkdtemp, readFile, readlink, rm, symlink, writeFile } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect, type AddressInfo } from "node:net";
-import { test, type TestContext } from "node:test";
+import { mock, test, type TestContext } from "node:test";
 import { createApp } from "../src/api/app.ts";
 import { createServer } from "../src/api/server.ts";
 import { createDeployStore, type Deployment } from "../src/deploy/deploy-store.ts";
@@ -29,6 +29,16 @@ import { Duplex } from "node:stream";
 import { singleProcessDeps } from "./support/single-process.ts";
 
 const runner = new URL(process.env.QM_RENDER_RUNNER_MODULE ?? "../deploy/render-runner/start.mjs", import.meta.url);
+const sqliteBackupStop = mock.fn(async () => {});
+mock.module(new URL("./sqlite.mjs", runner).href, {
+  namedExports: {
+    startSqliteBackup: async () => ({
+      exited: new Promise(() => {}),
+      assertRunning() {},
+      stop: sqliteBackupStop,
+    }),
+  },
+});
 const { prepareRenderApp, runRenderApp, createRenderAppGateway } = await import(runner.href);
 const signingSecret = "render-runner-secret".repeat(3);
 
@@ -270,6 +280,7 @@ test(
       version: 1,
       port: String(appPort),
       secret: "app-secret",
+      dataDir: "/data",
       gatewayPortBlocked: true,
     });
     await rm(appDir, { recursive: true });
@@ -350,6 +361,32 @@ test("Render runner rejects missing commits and revoked access without executing
   await f.artifacts.revoke(f.d.id);
   await writeFile(file, JSON.stringify(manifest));
   await assert.rejects(prepareRenderApp(file, dir), /Git command failed \(\d+\): \S/);
+});
+
+test("Render runner reports both app startup and backup shutdown failures", async (t) => {
+  const f = await fixture(t, "", "exit 7");
+  const manifest = await f.artifacts.prepare(f.d, f.d.versions[0]!);
+  const manifestPath = join(f.root, "manifest.json");
+  await writeFile(manifestPath, JSON.stringify({ ...manifest, readinessNonce: "n".repeat(43) }), { mode: 0o600 });
+  sqliteBackupStop.mock.mockImplementationOnce(async () => {
+    throw new Error("backup stop timeout");
+  });
+  t.after(() => sqliteBackupStop.mock.resetCalls());
+  await assert.rejects(
+    runRenderApp({
+      manifestPath,
+      appDir: join(f.root, "app"),
+      gatewayPort: await port(),
+      appPort: await port(),
+      env: { ...process.env, QM_RENDER_APP_TOKEN: "a".repeat(43) },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /app exited before it was ready \(7\).*backup stop timeout/);
+      assert.equal(error.errors.length, 2);
+      return true;
+    },
+  );
 });
 
 test("Render runner preserves relative Git symlinks after source staging cleanup", async (t) => {
