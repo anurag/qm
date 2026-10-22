@@ -65,7 +65,9 @@ test("approvalMessage clamps a huge purpose so the section block stays under Sla
   const section = msg.blocks.find((b) => b.type === "section") as any;
   const text: string = section.text.text;
   assert.ok(text.length <= 3000, `section text is ${text.length} chars`);
-  assert.match(text, /\*Command:\* `x/);
+  assert.match(text, /\*Command:\* too long to show in Slack/);
+  assert.ok(msg.blocks.length <= 10);
+  assert.ok(msg.blocks.every((b) => b.type !== "section" || (b.text as { text: string }).text.length <= 3000));
 });
 
 test("approvalMessage leads with the agent's purpose when present", () => {
@@ -255,4 +257,47 @@ test("a quarantine-release card offers only Allow once and Deny, with the screen
   const rendered = JSON.stringify(msg.blocks);
   assert.match(rendered, /instruction in untrusted data/);
   assert.match(rendered, /Blocked content preview/);
+});
+
+test("a long command is shown in full across code blocks instead of being cut", () => {
+  const command = `example_send {"body":"${"a".repeat(6_000)}","to":"<b@example.com>"}`;
+  const msg = approvalMessage([{ requestId: "req-1", command, reason: "needs approval" }]);
+  const shown = msg.blocks
+    .filter((b) => b.type === "section")
+    .slice(1)
+    .map((b) => (b.text as { text: string }).text.replace(/```/g, "").replace(/\n/g, ""))
+    .join("");
+  assert.equal(shown, command.replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  assert.ok(msg.blocks.every((b) => b.type !== "section" || (b.text as { text: string }).text.length <= 3000));
+  const actions = msg.blocks.at(-1)!;
+  assert.deepEqual(
+    (actions.elements as Array<{ action_id: string }>).map((e) => e.action_id),
+    ["hilo_allow_once", "hilo_allow_session", "hilo_allow_always", "hilo_deny"],
+  );
+});
+
+test("markup-heavy commands that fit are split so every escaped piece stays within Slack's limit", () => {
+  const command = `example_send {"body":"${"Tom & Jerry <b>'hi'</b> ".repeat(110)}","to":"guest@example.com"}`;
+  const msg = approvalMessage([{ requestId: "req-1", command, reason: "needs approval" }]);
+  const sections = msg.blocks.filter((b) => b.type === "section").slice(1);
+  assert.ok(sections.every((b) => (b.text as { text: string }).text.length <= 3000));
+  const shown = sections.map((b) => (b.text as { text: string }).text.slice(3, -3)).join("");
+  assert.equal(shown, command.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
+  assert.ok(JSON.stringify(msg.blocks).includes("hilo_allow_once"));
+});
+
+test("a command too long to show in Slack can only be denied there", () => {
+  const command = `example_send {"a":"${"&".repeat(15_000)}","to":"attacker@example.com"}`;
+  const msg = approvalMessage([{ requestId: "req-1", command, reason: "needs approval" }]);
+  assert.ok(!JSON.stringify(msg.blocks).includes("hilo_allow_once"));
+  assert.ok(JSON.stringify(msg.blocks).includes("hilo_deny"));
+  assert.match(
+    JSON.stringify(msg.blocks),
+    /too long to show in Slack\. Open this conversation in QM on the web to review and approve it/,
+  );
+  assert.ok(!JSON.stringify(msg.blocks).includes("attacker@example.com"));
+  const linked = approvalMessage([
+    { requestId: "req-2", command, reason: "needs approval", originUrl: "https://qm.example.com/s/abc" },
+  ]);
+  assert.match(JSON.stringify(linked.blocks), /<https:\/\/qm\.example\.com\/s\/abc\|this conversation in QM>/);
 });

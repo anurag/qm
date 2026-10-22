@@ -1,4 +1,5 @@
-import { safeChunks } from "./safe-cut.ts";
+import { xmlEscape } from "../util/message-tag.ts";
+import { safeChunks, safeCutIndex } from "./safe-cut.ts";
 export function decodeSlackEntities(text: string): string {
   return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 }
@@ -243,6 +244,16 @@ function reformatTables(text: string, keep: (s: string) => string): string {
   return out.join("\n");
 }
 
-export function slackSectionBlocks(text: string): Array<Record<string, unknown>> {
-  return safeChunks(text, 2_900).map((chunk) => ({ type: "section", text: { type: "mrkdwn", text: chunk } }));
+export function slackSectionBlocks(text: string, opts?: { code?: boolean }): Array<Record<string, unknown>> {
+  if (!opts?.code)
+    return safeChunks(text, 2_900).map((chunk) => ({ type: "section", text: { type: "mrkdwn", text: chunk } }));
+  const blocks: Array<Record<string, unknown>> = [];
+  let rest = text.replace(/`/g, "'");
+  while (rest) {
+    let cut = rest.length > 2_800 ? safeCutIndex(rest, 2_800) : rest.length;
+    while (xmlEscape(rest.slice(0, cut)).length > 2_990) cut = safeCutIndex(rest, Math.floor(cut * 0.8));
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: `\`\`\`${xmlEscape(rest.slice(0, cut))}\`\`\`` } });
+    rest = rest.slice(cut);
+  }
+  return blocks;
 }

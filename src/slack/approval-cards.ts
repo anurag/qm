@@ -1,4 +1,5 @@
 import { clip, inlineCode } from "./util.ts";
+import { slackSectionBlocks } from "./mrkdwn.ts";
 import { parseDeliveryTarget } from "./delivery.ts";
 
 export const APPROVAL_ACTION_IDS = ["hilo_allow_once", "hilo_allow_session", "hilo_allow_always", "hilo_deny"] as const;
@@ -12,6 +13,7 @@ export interface PendingApproval {
   summary?: string;
   kind?: "approval" | "input";
   grantModes?: { session: boolean; always: boolean };
+  originUrl?: string;
 }
 
 export interface SlackApprovalMessage {
@@ -20,6 +22,8 @@ export interface SlackApprovalMessage {
 }
 
 const APPROVAL_BLOCK_PREFIX = "hilo_approval:";
+const INLINE_COMMAND_MAX = 1_800;
+const COMMAND_SECTIONS_MAX = 6;
 
 function button(
   text: string,
@@ -66,19 +70,33 @@ export function approvalMessage(approvals: readonly PendingApproval[]): SlackApp
     ];
     if (p.summary) lines.push(clip(p.summary, 400));
     if (p.purpose) lines.push(`*Why:* ${clip(p.purpose, 400)}`);
-    if (p.kind !== "input") lines.push(`*Command:* ${inlineCode(p.command)}`);
+    const longCommand = p.kind !== "input" && p.command.length > INLINE_COMMAND_MAX;
+    const sections = longCommand ? slackSectionBlocks(p.command, { code: true }) : [];
+    const shown = sections.length <= COMMAND_SECTIONS_MAX;
+    if (longCommand)
+      lines.push(
+        shown
+          ? "*Command:*"
+          : `*Command:* too long to show in Slack. Open ${p.originUrl && /^https?:\/\//.test(p.originUrl) ? `<${p.originUrl.replaceAll("|", "%7C").replaceAll(">", "%3E")}|this conversation in QM>` : "this conversation in QM"} on the web to review and approve it.`,
+      );
+    else if (p.kind !== "input") lines.push(`*Command:* ${inlineCode(p.command)}`);
     lines.push(`*Flagged as:* ${clip(p.reason, 200)}`);
     blocks.push({
       type: "section",
       text: { type: "mrkdwn", text: clip(lines.join("\n"), 2900) },
     });
+    if (longCommand && shown) blocks.push(...sections);
     blocks.push({
       type: "actions",
       block_id: `${APPROVAL_BLOCK_PREFIX}${p.requestId || "unknown"}`.slice(0, 255),
       elements: [
-        button("Allow once", "hilo_allow_once", p.requestId, "primary"),
-        ...(p.grantModes?.session === false ? [] : [button("Allow session", "hilo_allow_session", p.requestId)]),
-        ...(p.grantModes?.always === false ? [] : [button("Allow always", "hilo_allow_always", p.requestId)]),
+        ...(longCommand && !shown
+          ? []
+          : [
+              button("Allow once", "hilo_allow_once", p.requestId, "primary"),
+              ...(p.grantModes?.session === false ? [] : [button("Allow session", "hilo_allow_session", p.requestId)]),
+              ...(p.grantModes?.always === false ? [] : [button("Allow always", "hilo_allow_always", p.requestId)]),
+            ]),
         button("Deny", "hilo_deny", p.requestId, "danger"),
       ],
     });

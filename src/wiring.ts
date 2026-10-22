@@ -662,7 +662,6 @@ export function buildApp(
   const principalLinks = createPrincipalLinkService(artifactMap<PrincipalLink>("principal_links"), advisoryLock);
   installPrincipalLinks(principalLinks);
   const identity = createIdentityService(artifactMap<DeactivationRecord>("deactivated_principals"), {
-    isOverridden: (id) => configStore.getInternalMemberOverrides().includes(id.trim().toLowerCase()),
     directorySyncProtected: config.emailAuthPrincipals,
     externalMembers: artifactMap<ExternalMember>("external_members"),
     principalLinks,
@@ -2016,6 +2015,13 @@ export function buildApp(
     id: "durable-map/pinned_skills/0002-drop",
     statements: ["DROP TABLE IF EXISTS pinned_skills", "DELETE FROM durable_map_versions WHERE tbl = 'pinned_skills'"],
   });
+  pgArtifactMap?.pool.registerMigration({
+    id: "durable-map/internal_member_overrides/0002-drop",
+    statements: [
+      "DROP TABLE IF EXISTS internal_member_overrides",
+      "DELETE FROM durable_map_versions WHERE tbl = 'internal_member_overrides'",
+    ],
+  });
   pgArtifactMap?.pool.registerMigration(LEGACY_HARNESS_MIGRATION);
   pgArtifactMap?.pool.registerMigration({
     id: "durable-map/suggested_activity_profiles/0001-nightly-on-use",
@@ -2416,10 +2422,7 @@ export function buildApp(
   const inboxRealtime = createInboxRealtime({
     loops: loopStore,
     items: loopItems,
-    requestFire: (loopId) =>
-      void loopFire
-        .fire(loopId, `loop:${loopId}:slack-event:${Date.now()}`)
-        .catch(swallowAs("inbox loop: slack event fire", undefined)),
+    enqueue: (loop, entries) => loopIngress.enqueueConversation(loop, entries),
   });
   const keychainApprovals = keychain
     ? createKeychainApprovals({
@@ -3293,6 +3296,7 @@ export function serverDeps(
             featureFlags: built.featureFlags,
             items: built.loops.items,
             errors: built.errors,
+            enqueue: (loop, entries) => built.loopIngress.enqueueConversation(loop, entries),
             tokens: built.keychain,
             directory: built.directory,
             ...(config.slack?.apiUrl ? { slackApiUrl: config.slack.apiUrl } : {}),

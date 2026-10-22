@@ -1,3 +1,5 @@
+import { toolCallApprovalKey } from "../core/approval-id.ts";
+import { canonicalJson } from "../../cli/src/canonical-json.ts";
 import { adminOperations } from "../tools/admin.ts";
 import { parkIfOverCap } from "../sessions/tool-output.ts";
 import { handbackStop } from "../runs/run-store.ts";
@@ -17,7 +19,7 @@ import type { GapWork } from "../sessions/session-store.ts";
 import { NeedsApproval, CommandDenied } from "../tools/primitives.ts";
 import type { McpToolDescriptor } from "../mcp/mcp-tool-service.ts";
 import { splitToScope } from "../api/artifact-share.ts";
-import { errMessage } from "../util/errors.ts";
+import { errMessage, reportFailure, swallowAs } from "../util/errors.ts";
 import { MemoryFactsMissing } from "../memory/facts.ts";
 import { MemoryDisclosureDenied } from "../memory/disclosure.ts";
 import { computerVerdict } from "../sandbox/sandbox.ts";
@@ -38,10 +40,16 @@ import {
   goalIsOpen,
   goalReport,
   GOAL_STEP_BACK_PROMPT,
+  GOAL_WAIT_MAX_MS,
   type GoalGovernor,
+  GOAL_INBOX_POLL_MS,
+  type GoalInbox,
   type GoalRecord,
   type GovernorVerdict,
   GovernorUndecided,
+  resumeGoal,
+  takeGoalMessages,
+  waitForGoalMessages,
 } from "./goal.ts";
 import {
   toolLabelOf,
@@ -124,12 +132,14 @@ export interface ToolContextRef {
   goalRound?: number;
 
   goalMeter?: import("./grind.ts").GrindMeter;
+  goalInbox?: GoalInbox;
   modelHasPrices?: () => boolean;
   governGoal?: GoalGovernor;
   /** The agent's recent work for the governor, newest last. */
   goalRecentWork?: () => string;
   screenToolResult?: (input: ToolResultScreenInput) => Promise<ToolResultScreen>;
-  toolApprovalGate?: (tool: string) => boolean;
+  toolApprovalGate?: (tool: string, callKey?: string) => boolean;
+  approvedToolCalls?: Map<string, string>;
 }
 
 function text(s: string) {
@@ -370,6 +380,9 @@ export function pauseStampAfterToolCall(
   };
 }
 
+const outsideWorkspace = (path: string): string =>
+  `[not in the computer's workspace: ${path}; only workspace files can be read, so copy it there or name it relative to the workspace]`;
+
 export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions): ToolDefinition[] {
   const scratchExec = !!opts?.scratchExec;
   const ownerAuthExec = !!opts?.ownerAuthExec;
@@ -410,6 +423,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
 
   const resultQueue = createKeyedQueue();
   const quarantinedMessages = new Set<string>();
+  let goalInboxCheckedAt = 0;
   const recordResult = async <T extends { content: Array<{ type: string; text?: string }>; details?: unknown }>(
     callId: string,
     summary: Record<string, unknown>,
@@ -533,6 +547,18 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
         ret.content.push({ type: "text", text });
         result += `\n\n${text}`;
         delivered.push(message.id);
+      }
+      const goal = ref.goal;
+      const goalInbox =
+        goal?.status === "active" && Date.now() - goalInboxCheckedAt >= GOAL_INBOX_POLL_MS ? ref.goalInbox : undefined;
+      if (goalInbox) goalInboxCheckedAt = Date.now();
+      const arrived =
+        goal && goalInbox
+          ? await takeGoalMessages(goalInbox, goal, ref.goalMeter).catch(swallowAs("goal: read the inbox", undefined))
+          : undefined;
+      if (arrived) {
+        ret.content.push({ type: "text", text: arrived });
+        result += `\n\n${arrived}`;
       }
       await log("tool_result", {
         ...(capPayloadStrings(persistedSummary) as Record<string, unknown>),
@@ -1134,7 +1160,12 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       });
       const signal = ref.abortSignal;
       signal?.throwIfAborted();
-      const { content, sourceScopeId, shared } = await tc.read(params.path, signal, params.sandbox_id);
+      const {
+        content,
+        sourceScopeId,
+        shared,
+        outsideWorkspace: outside,
+      } = await tc.read(params.path, signal, params.sandbox_id);
       signal?.throwIfAborted();
       return recordResult(
         callId,
@@ -1145,7 +1176,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
           found: content !== null,
           ...(content !== null ? { bytes: content.length, sourceScopeId } : {}),
         },
-        text(content ?? `[no such file: ${params.path}]`),
+        text(content ?? (outside ? outsideWorkspace(params.path) : `[no such file: ${params.path}]`)),
         content === null,
         sourceScopeId,
         false,
@@ -3869,11 +3900,11 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     for (const path of (paths ?? []).slice(0, GOAL_EVIDENCE_FILES)) {
       const content = tc
         ? await tc.read(path, signal, sandboxId).then(
-            (r) => r.content,
-            () => null,
+            (r) => r.content ?? (r.outsideWorkspace ? outsideWorkspace(path) : "[missing: no such file]"),
+            (e: unknown) => `[unreadable: ${errMessage(e)}]`,
           )
-        : null;
-      let body = content ?? "[missing: no such file]";
+        : "[missing: no such file]";
+      let body = content;
       if (body.length > GOAL_EVIDENCE_FILE_CHARS)
         body = `${body.slice(0, GOAL_EVIDENCE_FILE_CHARS)}\n[truncated at ${GOAL_EVIDENCE_FILE_CHARS} of ${body.length} chars]`;
       out.push(`<file path="${path.replace(/"/g, "")}">\n${body}\n</file>`);
@@ -3973,10 +4004,15 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       'Cancel (status "cancel") ends an active or paused goal without completing it, only when the person in this turn ' +
       "explicitly asks to cancel, drop or replace it; never to escape unfinished work.",
     parameters: Type.Object({
-      status: Type.Union([Type.Literal("complete"), Type.Literal("resume"), Type.Literal("cancel")]),
+      status: Type.Union([
+        Type.Literal("complete"),
+        Type.Literal("resume"),
+        Type.Literal("cancel"),
+        Type.Literal("wait"),
+      ]),
       note: Type.String({
         description:
-          "complete: the concrete evidence (commands, output, results, links) that proves the objective is achieved. resume or cancel: quote the user's request.",
+          "complete: the concrete evidence (commands, output, results, links) that proves the objective is achieved. resume or cancel: quote the user's request. wait: what you are waiting on.",
       }),
       files: Type.Optional(
         Type.Array(Type.String(), {
@@ -3988,12 +4024,12 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     }),
     async execute(callId, params) {
       const p = params as {
-        status?: "complete" | "resume" | "cancel";
+        status?: "complete" | "resume" | "cancel" | "wait";
         note: string;
         files?: string[];
         sandbox_id?: string;
       };
-      const status = p.status === "resume" || p.status === "cancel" ? p.status : "complete";
+      const status = p.status ?? "complete";
       await recordCall(callId, {
         tool: "goal",
         action: "update",
@@ -4030,6 +4066,55 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
           ),
         );
       }
+      if (status === "wait") {
+        if (!ref.goalInbox || goal?.status !== "active") {
+          return recordCoreAuthoredResult(
+            callId,
+            { tool: "goal", action: "update", error: "wait_unavailable" },
+            text(
+              goal?.status === "active"
+                ? "Waiting is only for swarm workers on a goal their parent assigned; this goal stays active. Keep working, or poll the swarm for the reply you need."
+                : "No active goal to wait on.",
+            ),
+            true,
+          );
+        }
+        if (!p.note?.trim()) {
+          return recordCoreAuthoredResult(
+            callId,
+            { tool: "goal", action: "update", error: "note_required" },
+            text("Say who or what you are waiting on, and what you asked them for."),
+            true,
+          );
+        }
+        const signal = ref.abortSignal;
+        const interrupted = () => !!signal?.aborted || !!ref.shutdown?.aborted;
+        let arrived: string | undefined;
+        try {
+          arrived = await waitForGoalMessages(
+            ref.goalInbox,
+            goal,
+            ref.goalMeter ?? createGrindMeter(),
+            p.note.trim(),
+            interrupted,
+          );
+        } catch (e) {
+          await ref.saveGoal?.(goal).catch(swallowAs("goal: save after a failed wait", undefined));
+          return recordCoreAuthoredResult(
+            callId,
+            { tool: "goal", action: "update", error: "inbox_unavailable", goal },
+            text(
+              `Your swarm messages could not be read (${errMessage(e)}), so the wait ended and the goal is active again. Check for the reply with GET /v1/swarm?read=1, or wait again.`,
+            ),
+            true,
+          );
+        }
+        await ref.saveGoal?.(goal).catch(swallowAs("goal: save after a wait", undefined));
+        let outcome = `No swarm message reached you in ${GOAL_WAIT_MAX_MS / 60_000} minutes, so the goal is active again. Check on what you were waiting for, work around it if you can, or wait again.`;
+        if (interrupted()) outcome = "The wait was interrupted; the goal is active again.";
+        if (arrived) outcome = `The goal is active again; this reached you while you waited:\n\n${arrived}`;
+        return recordCoreAuthoredResult(callId, { tool: "goal", action: "update", goal }, text(outcome));
+      }
       if (status === "resume") {
         if (goal?.status !== "paused") {
           return recordCoreAuthoredResult(
@@ -4051,11 +4136,8 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
             true,
           );
         }
-        goal.status = "active";
-        goal.updatedAt = goal.activeSince = Date.now();
+        resumeGoal(goal);
         ref.goalOpenedThisTurn = true;
-        delete goal.pauseReason;
-        delete goal.governor;
         await ref.saveGoal?.(goal);
         return recordCoreAuthoredResult(
           callId,
@@ -4087,6 +4169,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
             true,
           );
       }
+      const assignedAt = goal.createdAt;
       const evidence = [
         p.note ?? "",
         ...(await goalEvidenceFiles(ref.current, p.files, ref.abortSignal, p.sandbox_id)),
@@ -4107,6 +4190,16 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
           { tool: "goal", action: "update", error: "governor_undecided", goal },
           text(
             `The governor could not reach a decision (${errMessage(e)}). This is not a rejection and nothing was recorded against the goal; it stays active. Request completion again with the same evidence.`,
+          ),
+          true,
+        );
+      }
+      if (goal.createdAt !== assignedAt) {
+        return recordCoreAuthoredResult(
+          callId,
+          { tool: "goal", action: "update", error: "goal_replaced", droppedVerdict: verdict, goal },
+          text(
+            `A new goal replaced this one while the governor was deciding, so its decision (${verdict.verdict}: ${verdict.reasons}) was dropped. Your goal is now:\n${goalReport(goal, ref.goalMeter ?? createGrindMeter())}`,
           ),
           true,
         );
@@ -4139,10 +4232,10 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
   });
 
   const mcpDefs = opts?.mcpTools ?? [];
-  const mcpTools = mcpDefs
+  const mcpCandidates = mcpDefs
     .filter((d) => !opts?.readOnly || d.readOnly)
-    .map((d) =>
-      defineTool({
+    .map((d) => ({
+      ...defineTool({
         name: d.name,
         label: d.name,
         description:
@@ -4155,7 +4248,11 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
           if (!tc) return text("[error] no active tool context");
           await recordCall(callId, { tool: d.name, mcpServer: d.serverId, args: params });
           try {
-            const out = await tc.callMcpTool(d.name, (params ?? {}) as Record<string, unknown>);
+            const out = await tc.callMcpTool(
+              d.name,
+              (params ?? {}) as Record<string, unknown>,
+              ref.approvedToolCalls?.get(callId),
+            );
             return recordExternalResult(
               callId,
               { tool: d.name, mcpServer: d.serverId },
@@ -4172,7 +4269,14 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
           }
         },
       }),
-    );
+      needsApproval: d.catalog
+        ? async (params: unknown) => {
+            const tc = ref.current;
+            if (!tc) return true;
+            return tc.mcpToolNeedsApproval(d.name, (isObj(params) ? params : {}) as Record<string, unknown>);
+          }
+        : d.needsApproval === true,
+    }));
 
   const clientTools = [...(opts?.clientTools ?? [])]
     .sort((a, b) => (a.name < b.name ? -1 : 1))
@@ -4310,12 +4414,16 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       read: skill,
       ...(controlTools ? { share: sharingTool("skill"), move: sharingTool("skill", true) } : {}),
     }),
-    resourceTool("files", {
-      read,
-      write,
-      ...(controlTools ? { share: sharingTool("file") } : {}),
-      ...(ref.current?.installSharedCanvas ? { install_canvas: installCanvas } : {}),
-    }),
+    {
+      ...resourceTool("files", {
+        read,
+        write,
+        ...(controlTools ? { share: sharingTool("file") } : {}),
+        ...(ref.current?.installSharedCanvas ? { install_canvas: installCanvas } : {}),
+      }),
+      needsApproval: (params: unknown) => isObj(params) && params.action === "install_canvas",
+      approvalReason: "install an always-on canvas someone shared with you; its code runs in your QM web UI",
+    },
     resourceTool("apps", {
       publish,
       ...(controlTools ? { share: sharingTool("deploy"), move: sharingTool("deploy", true) } : {}),
@@ -4345,9 +4453,15 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     resourceTool("goal", { create: createGoal, get: getGoal, update: updateGoal }),
     runtime,
     context,
-    ...mcpTools,
     ...clientTools,
   ];
+  const nativeNames = new Set(tools.map((t) => t.name));
+  const mcpTools = mcpCandidates.filter((t) => {
+    if (!nativeNames.has(t.name)) return true;
+    console.warn(`[mcp] ${t.name} is hidden because a built-in tool has the same name`);
+    return false;
+  });
+  tools.push(...mcpTools);
   const operationFields: Record<string, Record<string, string[]>> = {
     sandbox: {
       status: ["sandbox_id"],
@@ -4483,19 +4597,27 @@ function withRetrySafety(tool: ToolDefinition, marks: Map<string, RetryMark>): T
 }
 
 const TOOL_APPROVAL_EXEMPT = new Set(["finish_silently"]);
-export const GATED_TOOL_APPROVALS: Record<
-  string,
-  { reason: string; summary: (params: Record<string, unknown>) => string }
-> = {
-  "files:install_canvas": {
-    reason: "install an always-on canvas someone shared with you; its code runs in your QM web UI",
-    summary: (params) => `file ${String(params.id)}`,
-  },
-};
 const STRICT_TOOL_APPROVAL_REASON = "strict posture: this tool call requires human approval";
+const DECLARED_TOOL_APPROVAL_REASON = "this tool asks for approval before each call";
+const APPROVAL_ARGS_MAX_CHARS = 16_000;
+
+interface ToolApprovalDeclaration {
+  needsApproval?: boolean | ((params: unknown) => boolean | Promise<boolean>);
+  approvalReason?: string;
+}
+
+async function declaredApprovalReason(tool: ToolApprovalDeclaration, params: unknown): Promise<string | undefined> {
+  const needed =
+    typeof tool.needsApproval === "function" ? await tool.needsApproval(params) : tool.needsApproval === true;
+  return needed ? (tool.approvalReason ?? DECLARED_TOOL_APPROVAL_REASON) : undefined;
+}
+
+function approvalCallText(label: string, params: unknown): string {
+  return `${label} ${redactCommand(redactSecrets(canonicalJson(params ?? {})))}`;
+}
 
 function withToolApprovalGate(
-  tool: ToolDefinition,
+  tool: ToolDefinition & ToolApprovalDeclaration,
   ref: ToolContextRef,
   rec: {
     recordCall: (callId: string, payload: Record<string, unknown>) => Promise<void>;
@@ -4525,21 +4647,60 @@ function withToolApprovalGate(
         ? `${tool.name}:${resourceAction ?? "invalid"}`
         : tool.name;
       const commandLabel = resourceAction ? `${tool.name} ${resourceAction}` : tool.name;
-      if (gate && !gate(approvalIdentity)) {
-        const gated = GATED_TOOL_APPROVALS[approvalIdentity];
-        const reason = gated?.reason ?? STRICT_TOOL_APPROVAL_REASON;
-        let summary: string | undefined;
-        if (gated && isObj(params)) summary = gated.summary(params);
-        else if (params !== undefined) summary = redactCommand(redactSecrets(JSON.stringify(params)));
-        ref.pendingApprovals?.push({
-          command: commandLabel,
-          reason,
-          kind: "approval",
-          approvalKey: `tool:${approvalIdentity}`,
-          ...(gated ? { grantModes: { session: false, always: false } } : {}),
-          ...(summary === undefined ? {} : { summary }),
-          ...(isObj(params) && typeof params.purpose === "string" ? { purpose: params.purpose } : {}),
-        });
+      let declaredReason: string | undefined;
+      try {
+        declaredReason = await declaredApprovalReason(tool, params);
+      } catch (error) {
+        reportFailure("tool approval: needsApproval check", error, tool.name);
+        await rec.recordCall(callId, { tool: tool.name, blocked: "approval_check_failed", error: errMessage(error) });
+        return rec.recordResult(
+          callId,
+          { tool: tool.name, blocked: "approval_check_failed" },
+          {
+            content: [
+              {
+                type: "text" as const,
+                text: `[error] could not check whether this call needs approval: ${errMessage(error)}`,
+              },
+            ],
+            details: {},
+          },
+          true,
+        );
+      }
+      const callKey = declaredReason ? toolCallApprovalKey(approvalIdentity, params) : undefined;
+      if (callKey && canonicalJson(params ?? {}).length > APPROVAL_ARGS_MAX_CHARS) {
+        const reason = `the arguments are too long to show on an approval card (over ${APPROVAL_ARGS_MAX_CHARS} characters); split the work into smaller calls`;
+        await rec.recordCall(callId, { tool: tool.name, blocked: "approval_args_too_long" });
+        return rec.recordResult(
+          callId,
+          { tool: tool.name, blocked: "approval_args_too_long" },
+          { content: [{ type: "text" as const, text: `[blocked] ${reason}` }], details: {} },
+          true,
+        );
+      }
+      if (callKey ? !gate?.(approvalIdentity, callKey) : gate && !gate(approvalIdentity)) {
+        const reason = declaredReason ?? STRICT_TOOL_APPROVAL_REASON;
+        ref.pendingApprovals?.push(
+          callKey
+            ? {
+                command: approvalCallText(commandLabel, params),
+                reason,
+                kind: "approval",
+                approvalKey: callKey,
+                summary: commandLabel,
+                grantModes: { session: false, always: false },
+                ...(isObj(params) && typeof params.purpose === "string" ? { purpose: params.purpose } : {}),
+              }
+            : {
+                command: commandLabel,
+                reason,
+                kind: "approval",
+                approvalKey: `tool:${approvalIdentity}`,
+                ...(params === undefined ? {} : { summary: redactCommand(redactSecrets(JSON.stringify(params))) }),
+                ...(isObj(params) && typeof params.purpose === "string" ? { purpose: params.purpose } : {}),
+              },
+        );
         ref.pausedOnApproval = true;
         await rec.recordCall(callId, {
           tool: tool.name,
@@ -4564,7 +4725,14 @@ function withToolApprovalGate(
           true,
         );
       }
-      return (inner as (callId: string, params: unknown) => unknown)(callId, params);
+      if (!callKey) return (inner as (callId: string, params: unknown) => unknown)(callId, params);
+      const approved = (ref.approvedToolCalls ??= new Map());
+      approved.set(callId, callKey);
+      try {
+        return await (inner as (callId: string, params: unknown) => unknown)(callId, params);
+      } finally {
+        approved.delete(callId);
+      }
     },
   } as ToolDefinition;
 }

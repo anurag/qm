@@ -1162,3 +1162,56 @@ test("Slack work and follow-up prompts preserve message images without repeating
   }
   assert.match(JSON.stringify((await s.items.get(item!.id))!.sourcePayload), /avatar.png/);
 });
+
+test("a reply Loop's work stage can settle an event as replied or no reply needed", async () => {
+  for (const [kind, actionKind, actionResult] of [
+    ["replied", "replied", "Sent it over"],
+    ["no_reply_needed", "no_reply_needed", "Answered in Gmail"],
+  ] as const) {
+    let judged = false;
+    const w = service((req) => {
+      if (stage(req) === "intake") throw new Error("Event work must not enumerate");
+      if (stage(req) === "work")
+        return `Done.\n\`\`\`json\n{"resolution":{"kind":"${kind}","reason":"Answered in Gmail"}}\n\`\`\``;
+      judged = true;
+      return '```json\n{"outcome":"met","reason":"ok"}\n```';
+    });
+    const loop = await makeLoop(w.loops, { sources: ["gmail"], shipActions: [{ action: "send", gate: "hold" }] });
+    await w.items.ingest([
+      {
+        loopId: loop.id,
+        dedupeKey: "thread1",
+        source: "gmail",
+        sourceAt: 2000,
+        sourcePayload: {
+          source: "gmail",
+          snippet: "Can you send the deck?",
+          gmail: { threadId: "thread1" },
+          latestEvent: { author: "owner", at: 2000, text: "Sent it over" },
+        },
+      },
+    ]);
+    const result = await w.fire.fire(loop.id, `push:${kind}`, undefined, { enumerate: false });
+    const [item] = await w.items.byLoop(loop.id);
+    assert.equal(item?.status, "skipped");
+    assert.equal(item?.actionKind, actionKind);
+    assert.equal(item?.actionResult, actionResult);
+    assert.equal(item?.proposal, undefined);
+    assert.equal(judged, false);
+    assert.deepEqual(result.summary?.ready, []);
+    assert.deepEqual(result.summary?.shipped, []);
+  }
+});
+
+test("a resolution from a non-reply Loop is ignored", async () => {
+  const w = service((req) =>
+    stage(req) === "work"
+      ? '```json\n{"resolution":{"kind":"replied","reason":"x"},"outputs":[]}\n```'
+      : '```json\n{"outcome":"met","reason":"ok"}\n```',
+  );
+  const loop = await makeLoop(w.loops);
+  await w.items.ingest([{ loopId: loop.id, dedupeKey: "k", sourceAt: 1, sourcePayload: {} }]);
+  await w.fire.fire(loop.id, "push:generic", undefined, { enumerate: false });
+  const [item] = await w.items.byLoop(loop.id);
+  assert.notEqual(item?.status, "skipped");
+});
