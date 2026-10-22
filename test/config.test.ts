@@ -269,6 +269,40 @@ test("sandbox backend is parsed once before production backend guards", () => {
   );
 });
 
+for (const primary of ["render", "local"] as const) {
+  test(`production requires durable Render recovery when the primary backend is ${primary}`, () => {
+    const env = {
+      ...productionEnv,
+      SANDBOX_BACKEND: primary,
+      WORKSPACE_STORE: "postgres",
+      RENDER_API_KEY: "test-key",
+      RENDER_WORKSPACE_ID: "tea-test",
+    };
+    for (const database of [undefined, "", "  "])
+      assert.throws(() => loadConfig({ ...env, DATABASE_URL: database }), /required core secrets: DATABASE_URL/);
+    const config = loadConfig({ ...env, DATABASE_URL: "postgres://qm@localhost/qm" });
+    assert.ok(enabledSandboxBackends(config).includes("render"));
+    assert.equal(config.databaseUrl, "postgres://qm@localhost/qm");
+    assert.ok(enabledSandboxBackends(loadConfig({ ...env, NODE_ENV: "development" })).includes("render"));
+  });
+
+  test(`Render timeout limits apply when the primary backend is ${primary}`, () => {
+    const env = {
+      SANDBOX_BACKEND: primary,
+      WORKSPACE_STORE: "postgres",
+      RENDER_API_KEY: "test-key",
+      RENDER_WORKSPACE_ID: "tea-test",
+    };
+    for (const timeout of ["86340", "86400"])
+      assert.throws(() => loadConfig({ ...env, SANDBOX_TIMEOUT_SEC: timeout }), /SANDBOX_TIMEOUT_SEC must stay/);
+    assert.equal(loadConfig({ ...env, SANDBOX_TIMEOUT_SEC: "86339" }).renderSandbox.defaultTimeoutSec, 86339);
+  });
+}
+
+test("Render guards do not limit an unconfigured sandbox backend", () => {
+  assert.equal(loadConfig({ ...productionEnv, SANDBOX_TIMEOUT_SEC: "86400" }).sandboxBackend, "local");
+});
+
 test("production refuses to boot on in-memory sessions, runs, approvals, audit, locks and leases", () => {
   const { DATABASE_URL: _databaseUrl, ...noDatabase } = productionEnv;
   assert.throws(
@@ -979,4 +1013,10 @@ test("a subscription-only company ChatGPT deployment defaults pi to the plain Co
     "claude-opus-5",
   );
   assert.equal(configuredModelForHarness(base, "pi"), undefined);
+});
+
+test("The Render sandbox backend needs the Postgres workspace store", () => {
+  const env = { SANDBOX_BACKEND: "render", RENDER_API_KEY: "rnd_key", RENDER_WORKSPACE_ID: "tea-test" };
+  assert.throws(() => loadConfig(env), /SANDBOX_BACKEND=render requires WORKSPACE_STORE=postgres/);
+  assert.equal(loadConfig({ ...env, WORKSPACE_STORE: "postgres" }).sandboxBackend, "render");
 });

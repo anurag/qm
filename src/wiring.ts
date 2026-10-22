@@ -11,6 +11,13 @@ import { availableRuntimeError } from "./api/runtime-config.ts";
 import { createApprovalStore } from "./core/approval-store.ts";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
+import {
+  createRenderSandbox,
+  type StoredRenderCleanup,
+  type StoredRenderSandbox,
+  type StoredRenderScratch,
+} from "./sandbox/render-sandbox.ts";
+import { createSdkRenderClient } from "./sandbox/render-client.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { flushErrorReporting } from "../plugins/chassis/src/error-reporting.ts";
 import { createProductAnalytics } from "./util/product-analytics.ts";
@@ -903,6 +910,9 @@ export function buildApp(
   const e2bBodies = artifactMap<StoredE2bSandbox>("e2b_sandbox_bodies");
   const modalBodies = artifactMap<StoredModalSandbox>("modal_sandbox_bodies");
   const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
+  const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
+  const renderScratch = artifactMap<StoredRenderScratch>("render_scratch_bodies");
+  const renderCleanup = artifactMap<StoredRenderCleanup>("render_sandbox_cleanup");
   const e2bClient = (use: "computers" | "apps"): E2bClient => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey)
@@ -1114,6 +1124,31 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       onError: sandboxOnError,
     });
+  const buildRender = (): Sandbox => {
+    const render = config.renderSandbox;
+    if (!render.apiKey || !render.workspaceId) {
+      throw new Error("SANDBOX_BACKEND=render requires RENDER_API_KEY and RENDER_WORKSPACE_ID");
+    }
+    return createRenderSandbox(workspace, {
+      client: createSdkRenderClient({
+        apiKey: render.apiKey,
+        workspaceId: render.workspaceId,
+      }),
+      ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
+      store: renderBodies,
+      scratchStore: renderScratch,
+      cleanupStore: renderCleanup,
+      advisoryLock,
+      extraTools: deploymentLayer.advertisedTools,
+      credentialPaths: deploymentLayer.credentialPaths,
+      layerToolFiles: () => deploymentLayer.installFiles,
+      blobTransfer,
+      ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+      ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
+      ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+      onError: sandboxOnError,
+    });
+  };
   const buildBackend: Record<Config["sandboxBackend"], () => Sandbox> = {
     local: buildLocal,
     sprites: buildSprites,
@@ -1123,6 +1158,7 @@ export function buildApp(
     aws: buildAws,
     porter: buildPorter,
     agent37: buildAgent37,
+    render: buildRender,
     superserve: buildSuperserve,
     "do-managed-agents": buildManagedAgents,
   };
