@@ -46,6 +46,7 @@ import {
   readState,
   recordRelease,
   recoverPendingCreate,
+  resolveRollbackTarget,
   saveState,
   type State,
 } from "../render-state.ts";
@@ -636,7 +637,7 @@ export function renderConfigErrors(
   return errors;
 }
 
-export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "down"> {
+export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "down" | "rollback"> {
   return {
     up: async (opts) => {
       const desired = workloads(ctx);
@@ -902,6 +903,58 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "d
             "QM services, Postgres, and the MinIO disk are deleted. The project and production environment are retained for future deployment",
           );
         } else note("Postgres, persistent disks, and stored objects are retained. Storage charges continue");
+      }),
+    rollback: async (to) =>
+      locked(ctx, async () => {
+        const request = api(ctx);
+        const state = readState(ctx);
+        if (!state.rollbackProgress || to !== undefined) {
+          const target = resolveRollbackTarget(state, to);
+          state.rollbackProgress =
+            target.mode === "restore"
+              ? {
+                  mode: "restore",
+                  label: target.release.label,
+                  commit: target.release.commit,
+                  services: target.release.services,
+                  restored: {},
+                }
+              : { mode: "rebuild", commit: target.commit, services: {}, restored: {} };
+        }
+        const progress = state.rollbackProgress;
+        const bound = await inventory(ctx, request, state);
+        if (!bound.services.has("core")) throw new CliError("The core service is missing");
+        const targets =
+          progress.mode === "restore"
+            ? Object.keys(progress.services)
+            : workloads(ctx)
+                .filter((workload) => !workload.diskSizeGB)
+                .map((workload) => workload.name);
+        for (const name of targets) {
+          const service = bound.services.get(name);
+          if (!service || service.serviceDetails.disk)
+            throw new CliError(`The rollback service ${name} is missing or has a disk`);
+        }
+        saveState(ctx, state);
+        const core = bound.services.get("core")!;
+        for (const key of ["RENDER_DEPLOY_COMMIT", "GIT_SHA"])
+          await request(`/services/${core.id}/env-vars/${key}`, "PUT", { value: progress.commit });
+        for (const name of targets) {
+          if (progress.restored[name]) continue;
+          const service = bound.services.get(name)!;
+          await deploy(request, service, progress.commit);
+          const current = await latestDeploy(request, service);
+          if (!current || current.status !== "live") throw new CliError(`${name} has no live deployment`);
+          progress.restored[name] = current.id;
+          saveState(ctx, state);
+        }
+        const release = recordRelease(state, progress.commit, progress.restored);
+        delete state.updateInProgress;
+        delete state.rollbackProgress;
+        saveState(ctx, state);
+        note(
+          `${progress.mode === "restore" ? `Release ${progress.label} restored` : `Commit ${progress.commit.slice(0, 7)} built and deployed`} as ${release.label}. Postgres and object data are retained; migrations are not reversed`,
+        );
       }),
   };
 }

@@ -1084,6 +1084,39 @@ test("Render restores remote drift and grows storage without replacing resources
   );
 });
 
+test("Render rollback deploys the previous commit with current credentials and stored data", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const release = d.saved().releases[0];
+  const secretFile = join(d.ctx.configDir, ".env");
+  writeFileSync(
+    secretFile,
+    readFileSync(secretFile, "utf8").replace(/^CORE_SIGNING_SECRET=.*$/m, `CORE_SIGNING_SECRET=${"f".repeat(64)}`),
+  );
+  d.setCommit("c".repeat(40));
+  await d.backend.up({ dryRun: false });
+  const mark = c.calls.length;
+  const secret = c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY;
+  await d.backend.rollback();
+  assert.deepEqual(
+    writes(c.calls.slice(mark))
+      .filter((call) => call.path.endsWith("/deploys"))
+      .map((call) => [call.path, call.body]),
+    [
+      ["/services/srv-acme-core/deploys", { clearCache: "do_not_clear", commitId: release.commit }],
+      ["/services/srv-acme-web-ui/deploys", { clearCache: "do_not_clear", commitId: release.commit }],
+    ],
+  );
+  assert.equal(c.envs.get("srv-acme-minio")!.QM_STORAGE_SECRET_KEY, secret);
+  assert.equal(c.database?.id, "dpg-acme");
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, d.saved().releases[0].commit);
+  assert.equal(c.envs.get("srv-acme-core")!.GIT_SHA, d.saved().releases[0].commit);
+  assert.equal(c.runtimeEnvs.get("srv-acme-core")!.CORE_SIGNING_SECRET, "f".repeat(64));
+  assert.equal(c.runtimeEnvs.get("srv-acme-core")!.GIT_SHA, release.commit);
+  assert.equal(c.runtimeEnvs.get("srv-acme-web-ui")!.CORE_SIGNING_SECRET, "f".repeat(64));
+});
+
 test("Render rejects a live service built from a different source commit", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
@@ -1097,6 +1130,33 @@ test("Render rejects a live service built from a different source commit", async
   await assert.rejects(d.backend.up({ dryRun: false }), /deployed commit b+.*expected a+/);
   assert.equal(d.saved().releases, undefined);
   assert.equal(d.saved().updateInProgress, true);
+});
+
+test("Render resumes rollback to the last good release after a partial update", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const successful = d.saved();
+  c.intercept = ({ path, method }) =>
+    path === "/services/srv-acme-web-ui/deploys" && method === "POST" ? new Response(null, { status: 500 }) : undefined;
+  await assert.rejects(d.backend.up({ dryRun: false }), /HTTP 500/);
+  assert.equal(d.saved().updateInProgress, true);
+  assert.equal(d.saved().releases.length, 1);
+  c.intercept = ({ path, method }) =>
+    path === "/services/srv-acme-web-ui/deploys" && method === "POST" ? new Response(null, { status: 500 }) : undefined;
+  await assert.rejects(async () => d.backend.rollback(), /HTTP 500/);
+  assert.ok(d.saved().rollbackProgress.restored.core);
+  const mark = c.calls.length;
+  c.intercept = undefined;
+  await d.backend.rollback();
+  assert.deepEqual(
+    writes(c.calls.slice(mark))
+      .filter((call) => call.path.endsWith("/deploys"))
+      .map((call) => [call.path, call.body]),
+    [["/services/srv-acme-web-ui/deploys", { clearCache: "do_not_clear", commitId: successful.releases[0].commit }]],
+  );
+  assert.equal(d.saved().rollbackProgress, undefined);
+  assert.equal(d.saved().updateInProgress, undefined);
 });
 
 test("Render creates services with a no-op command and cancels the automatic build before pinning", async (t) => {
@@ -1218,6 +1278,116 @@ test("Render records a service after its creation reply is lost and ignores same
   assert.equal(d.saved().pendingCreate, undefined);
   assert.deepEqual(d.saved().services.core, { id: "srv-acme-core", name: "acme-core", type: "web_service" });
   assert.equal(c.calls.slice(mark).filter((call) => call.method === "POST" && call.path === "/services").length, 0);
+});
+
+test("Render rollback --to deploys a retained release by label, commit prefix, or deploy ID", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.setCommit("c".repeat(40));
+  await d.backend.up({ dryRun: false });
+  d.setCommit("d".repeat(40));
+  await d.backend.up({ dryRun: false });
+  const [third, second, first] = d.saved().releases as Array<{
+    label: string;
+    commit: string;
+    services: Record<string, string>;
+  }>;
+  assert.deepEqual(
+    [first!, second!, third!].map((release) => [release.label, release.commit[0]]),
+    [
+      ["r1", "a"],
+      ["r2", "c"],
+      ["r3", "d"],
+    ],
+  );
+  const restores = (mark: number) =>
+    writes(c.calls.slice(mark))
+      .filter((call) => call.path.endsWith("/deploys"))
+      .map((call) => [call.path, (call.body as { commitId: string }).commitId]);
+  let mark = c.calls.length;
+  await d.backend.rollback("r1");
+  assert.deepEqual(restores(mark), [
+    ["/services/srv-acme-core/deploys", first!.commit],
+    ["/services/srv-acme-web-ui/deploys", first!.commit],
+  ]);
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "a".repeat(40));
+  assert.equal(d.saved().releases[0].label, "r4");
+  assert.equal(d.saved().releases[0].commit, "a".repeat(40));
+  mark = c.calls.length;
+  await d.backend.rollback("c".repeat(7));
+  assert.deepEqual(restores(mark)[0], ["/services/srv-acme-core/deploys", second!.commit]);
+  assert.equal(d.saved().releases[0].label, "r5");
+  mark = c.calls.length;
+  await d.backend.rollback(third!.services["web-ui"]!);
+  assert.deepEqual(restores(mark)[0], ["/services/srv-acme-core/deploys", third!.commit]);
+  assert.equal(c.envs.get("srv-acme-core")!.GIT_SHA, "d".repeat(40));
+  assert.equal(d.saved().releases.length, 6);
+});
+
+test("Render rollback --to rejects unknown, ambiguous, and short targets and lists the releases", async (t) => {
+  const d = deployment(t);
+  cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  await d.backend.up({ dryRun: false });
+  await assert.rejects(
+    async () => d.backend.rollback("r9"),
+    /not a release label, commit, or deploy ID\. Retained releases: r2 \(aaaaaaa, .*\), r1/,
+  );
+  await assert.rejects(
+    async () => d.backend.rollback("dep-nope"),
+    /No retained Render release contains deploy dep-nope/,
+  );
+  await assert.rejects(
+    async () => d.backend.rollback("a".repeat(7)),
+    /matches several retained releases; use a release label/,
+  );
+  await assert.rejects(async () => d.backend.rollback("f".repeat(7)), /give the full 40-character commit to build it/);
+  assert.equal(d.saved().rollbackProgress, undefined);
+});
+
+test("Render rollback --to builds a full commit that no retained release recorded", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const mark = c.calls.length;
+  await d.backend.rollback("f".repeat(40));
+  const written = writes(c.calls.slice(mark));
+  assert.equal(
+    written.some((call) => call.path.endsWith("/rollback")),
+    false,
+  );
+  assert.deepEqual(
+    written.filter((call) => call.path.endsWith("/deploys")).map((call) => [call.path, call.body]),
+    ["core", "web-ui"].map((name) => [
+      `/services/srv-acme-${name}/deploys`,
+      { clearCache: "do_not_clear", commitId: "f".repeat(40) },
+    ]),
+  );
+  assert.equal(c.envs.get("srv-acme-core")!.RENDER_DEPLOY_COMMIT, "f".repeat(40));
+  const [latest, previous] = d.saved().releases;
+  assert.equal(latest.label, "r2");
+  assert.equal(latest.commit, "f".repeat(40));
+  assert.deepEqual(Object.keys(latest.services).sort(), ["core", "web-ui"]);
+  assert.equal(previous.label, "r1");
+});
+
+test("Render rollback can rebuild a release after its provider deploy record is gone", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.setCommit("c".repeat(40));
+  await d.backend.up({ dryRun: false });
+  const first = d.saved().releases[1];
+  c.deploysById.delete(first.services["web-ui"]);
+  const mark = c.calls.length;
+  await d.backend.rollback("r1");
+  assert.equal(
+    c.calls.slice(mark).some((call) => call.path.endsWith(`/${first.services["web-ui"]}`)),
+    false,
+  );
+  assert.equal(d.saved().rollbackProgress, undefined);
+  assert.equal(c.deploys.get("srv-acme-web-ui")!.commit!.id, first.commit);
 });
 
 test("Render branch resolution keeps Git diagnostics before cloud changes", async (t) => {
