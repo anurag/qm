@@ -9,6 +9,7 @@ import { createPostgresDecisionStore, type DecisionStore } from "./decisions/sto
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
 import { availableRuntimeError } from "./api/runtime-config.ts";
 import { createApprovalStore } from "./core/approval-store.ts";
+import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { flushErrorReporting } from "../plugins/chassis/src/error-reporting.ts";
 import { createProductAnalytics } from "./util/product-analytics.ts";
@@ -770,7 +771,14 @@ export function buildApp(
     config.securityScreen === "off" && overrides.securityScreener ? "enforce" : config.securityScreen,
   );
 
-  const workspace = createLocalWorkspaceStore(config.dataDir);
+  const requireDbUrl = (kind: string): string => {
+    if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
+    return config.databaseUrl;
+  };
+  const workspace =
+    config.workspaceStore === "postgres"
+      ? createRenderWorkspaceStore(config.dataDir, requireDbUrl("WORKSPACE_STORE"))
+      : createLocalWorkspaceStore(config.dataDir);
   const blobTransfer: BlobTransferStore =
     config.transferStore === "s3" && config.s3Bucket
       ? createS3BlobTransferStore({
@@ -1298,10 +1306,6 @@ export function buildApp(
   const secretDrops: SecretDropStore = createSecretDropStore(artifactMap<SecretDropRecord>("secret_drops"));
   const modelGateway = createModelGateway();
 
-  const requireDbUrl = (kind: string): string => {
-    if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
-    return config.databaseUrl;
-  };
   const sessions: SessionStore =
     config.sessionStore === "postgres"
       ? createPostgresSessionStore(requireDbUrl("SESSION_STORE"))
