@@ -12,9 +12,13 @@ import { loadConfigAt, parseConfigJson, renderSource } from "../src/config.ts";
 
 import { renderScaffold } from "../src/provider-scaffold.ts";
 
-import { renderServiceEnv } from "../src/render-services.ts";
+import { renderConfigErrors } from "../src/backends/render.ts";
 
-import { computedSecrets } from "../src/secrets.ts";
+import { discoverPlugins } from "../src/plugins.ts";
+
+import { renderServiceEnv, renderWorkloads } from "../src/render-services.ts";
+
+import { computedSecrets, FIRST_PARTY_SECRET_SPECS, managedByFor } from "../src/secrets.ts";
 
 interface ScaffoldConfig {
   render: Record<string, unknown>;
@@ -45,6 +49,16 @@ const connections = {
   projectId: "prj-acme",
   environmentId: "evm-production",
 };
+
+test("Render rejects services that require TCP ingress", (t) => {
+  const { config } = deployment(t);
+  config.services.push("egress-proxy");
+  assert.ok(
+    renderConfigErrors(config, []).some(
+      (error) => error.message === "Render hosting does not support TCP ingress for egress-proxy",
+    ),
+  );
+});
 
 test("Render Git source accepts GitHub repositories and branch names without credentials", () => {
   assert.deepEqual(renderSource({ repo: "https://github.com/acme/qm.git/", branch: "feature/render" }, "config"), {
@@ -82,6 +96,23 @@ test("Render Git source accepts GitHub repositories and branch names without cre
     ].map((branch) => ({ repo: "https://github.com/acme/qm", branch })),
   ])
     assert.throws(() => renderSource(source, "config"), /render.source/);
+});
+
+test("Render uses Git builds for all services and rejects image overrides", (t) => {
+  const { config, dir } = deployment(t);
+  const workloads = renderWorkloads(config, dir);
+  assert.deepEqual(
+    workloads.find((workload) => workload.name === "core"),
+    { name: "core", source: config.render!.source, dockerfile: "deploy/core/Dockerfile" },
+  );
+  assert.ok(workloads.every((workload) => workload.source));
+  const core = renderServiceEnv(config, "core", new Map(), connections);
+  assert.equal(core.RENDER_DEPLOY_REPO, config.render!.source.repo);
+  assert.equal(core.RENDER_DEPLOY_BRANCH, "main");
+  assert.equal(config.render!.appRegion, undefined);
+  assert.equal(core.RENDER_APP_REGION, config.render!.region);
+  config.imageOverrides.core = "example.test/core:custom";
+  assert.ok(renderConfigErrors(config, []).some((error) => /remove imageOverrides/.test(error.message)));
 });
 
 test("Render init selects managed MinIO without generated infrastructure files or storage inputs", (t) => {
@@ -141,6 +172,29 @@ test("Render core receives scoped storage credentials and assigned URLs", (t) =>
   assert.equal(portal.AUTH_REDIRECT_URI, `${config.publicUrl}/auth/callback`);
   assert.equal(portal.ADMIN_UPSTREAM, "http://web-ui:8080/admin");
   assert.equal(renderServiceEnv(config, "slack", values, connections).PUBLIC_API_URL, config.apiUrl);
+});
+
+test("Render supplies core every secret that the specs mark as Render-managed and rejects overrides", (t) => {
+  const { config } = deployment(t);
+  const core = renderServiceEnv(config, "core", new Map(), connections);
+  for (const { name } of FIRST_PARTY_SECRET_SPECS.filter((spec) => managedByFor(spec, "render") === "render")) {
+    assert.ok(core[name], name);
+    config.secretEnv = { core: { [name]: name } };
+    assert.ok(
+      renderConfigErrors(config, []).some(
+        (error) => error.message === `Render derives core ${name}; remove its secretEnv entry`,
+      ),
+      name,
+    );
+  }
+});
+
+test("Render rejects prebuilt plugin images", (t) => {
+  const { config, dir } = deployment(t, (raw) => {
+    raw.plugins = [{ name: "reports", image: "example.test/reports:1" }];
+  });
+  const plugins = discoverPlugins(dir, config).plugins;
+  assert.ok(renderConfigErrors(config, plugins).some((error) => /Git source Dockerfiles/.test(error.message)));
 });
 
 test("removing hosted auth, admin, and Slack resets their managed settings", (t) => {

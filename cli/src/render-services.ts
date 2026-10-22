@@ -1,14 +1,56 @@
 import { securityScreenEnv, type QmConfig, type RenderConfig } from "./config.ts";
-
 import { CliError } from "./log.ts";
-
-import { type ResolvedPlugin } from "./plugins.ts";
-
+import { discoverPlugins, type ResolvedPlugin } from "./plugins.ts";
+import type { ServiceType } from "./render-api.ts";
 import { computedSecrets, runtimeSecretNames } from "./secrets.ts";
+import {
+  brandEnvOf,
+  brokerWiring,
+  hostedServiceEnv,
+  ordered,
+  orgEnv,
+  runnableServices,
+  virtualServiceEnv,
+} from "./services.ts";
 
-import { brandEnvOf, brokerWiring, hostedServiceEnv, orgEnv, virtualServiceEnv } from "./services.ts";
+export function renderWorkloads(
+  config: QmConfig,
+  configDir: string,
+): Array<RenderBuild & { name: string; plugin?: ResolvedPlugin }> {
+  const discovered = discoverPlugins(configDir, config);
+  if (discovered.errors.length) throw new CliError(discovered.errors.join("\n"));
+  const source = config.render?.source;
+  if (!source) throw new CliError("Render requires a render config block");
+  const build = (dockerfile: string): RenderBuild => ({ source, dockerfile });
+  return [
+    ...ordered(runnableServices(config.services)).map((service) => ({
+      name: service.name,
+      ...build(`deploy/${service.name}/Dockerfile`),
+    })),
+    ...discovered.plugins.map((plugin) => ({
+      name: plugin.name,
+      ...build(`plugins/${plugin.name}/Dockerfile`),
+      plugin,
+    })),
+  ];
+}
 
-function renderManagedCoreEnv(render: RenderConfig): Record<string, string> {
+interface RenderBuild {
+  source: NonNullable<QmConfig["render"]>["source"];
+  dockerfile: string;
+}
+
+export type RenderWorkload = RenderBuild & {
+  name: string;
+  type: ServiceType;
+  plan: string;
+  plugin?: ResolvedPlugin;
+  command?: string;
+  health?: string;
+  diskSizeGB?: number;
+};
+
+export function renderManagedCoreEnv(render: RenderConfig): Record<string, string> {
   return {
     DATA_DIR: "/data",
     SESSION_STORE: "postgres",
@@ -24,7 +66,7 @@ function renderManagedCoreEnv(render: RenderConfig): Record<string, string> {
   };
 }
 
-function renderStorageEnv(storage?: { endpoint: string; secretKey: string }): Record<string, string> {
+export function renderStorageEnv(storage?: { endpoint: string; secretKey: string }): Record<string, string> {
   return {
     S3_BUCKET: "qm-storage",
     S3_REGION: "us-east-1",

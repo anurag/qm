@@ -2,9 +2,37 @@ import { CliError } from "./log.ts";
 
 import { sleep } from "./util.ts";
 
-type RenderRequest = <T>(path: string, method?: string, body?: unknown) => Promise<T>;
+export type ServiceType = "web_service" | "private_service";
 
-class RenderApiError extends CliError {
+export interface RenderService {
+  id: string;
+  name: string;
+  type: ServiceType;
+  ownerId: string;
+  environmentId: string;
+  slug: string;
+  imagePath?: string;
+  repo?: string;
+  branch?: string;
+  rootDir?: string;
+  autoDeploy: string;
+  suspended: string;
+  serviceDetails: {
+    url?: string;
+    region: string;
+    plan: string;
+    numInstances: number;
+    runtime: string;
+    healthCheckPath?: string;
+    maxShutdownDelaySeconds?: number;
+    envSpecificDetails: { dockerCommand?: string; dockerfilePath?: string; dockerContext?: string };
+    disk?: { id: string; mountPath: string; sizeGB: number };
+  };
+}
+
+export type RenderRequest = <T>(path: string, method?: string, body?: unknown) => Promise<T>;
+
+export class RenderApiError extends CliError {
   readonly status: number;
   constructor(status: number, path: string, method: string, detail: string, requestId: string | null) {
     super(
@@ -75,4 +103,29 @@ export function renderClient(apiKey: string): RenderRequest {
     if (!text) return undefined as T;
     return (response.headers.get("content-type")?.includes("json") ? JSON.parse(text) : text) as T;
   };
+}
+
+export async function requestArray<T>(request: RenderRequest, path: string): Promise<T[]> {
+  const page = await request<unknown>(path);
+  if (page === null) return [];
+  if (!Array.isArray(page)) throw new CliError(`Render GET ${path.split("?")[0]} returned an invalid list response`);
+  return page as T[];
+}
+
+export async function list<T>(request: RenderRequest, path: string, key: string): Promise<T[]> {
+  const out: T[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (;;) {
+    const url = new URL(path, "https://api.render.com");
+    url.searchParams.set("limit", "100");
+    if (cursor) url.searchParams.set("cursor", cursor);
+    const page = await requestArray<Record<string, unknown>>(request, `${url.pathname}${url.search}`);
+    out.push(...page.map((item) => item[key] as T));
+    if (page.length < 100) return out;
+    const next = page.at(-1)?.cursor;
+    if (typeof next !== "string" || seen.has(next)) throw new CliError("Render pagination did not advance");
+    seen.add(next);
+    cursor = next;
+  }
 }

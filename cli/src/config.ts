@@ -1,9 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
-
 import { isAbsolute, resolve } from "node:path";
-
 import { CliError, die, errMessage, warn } from "./log.ts";
-
 import {
   AUTH_BROKER_ENV_KEYS,
   SERVICE_NAMES,
@@ -16,7 +13,6 @@ import {
   type DeclaredServiceName,
   type ServiceName,
 } from "./services.ts";
-
 import {
   hostingProviderChoices,
   isSandboxBackendId,
@@ -138,7 +134,6 @@ export function awsWorkloadArchitecture(config: QmConfig, workload: string): "ar
 }
 
 export const MODEL_PROVIDERS = ["anthropic", "openai", "openrouter"] as const;
-
 export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
 export const MODEL_PROVIDER_KEYS: Readonly<Record<ModelProvider, string>> = {
@@ -157,7 +152,6 @@ export const isModelProvider = (value: unknown): value is ModelProvider =>
   typeof value === "string" && (MODEL_PROVIDERS as readonly string[]).includes(value);
 
 export const EMAIL_TRANSPORTS = ["resend", "smtp"] as const;
-
 export type EmailTransport = (typeof EMAIL_TRANSPORTS)[number];
 
 export const isEmailTransport = (value: unknown): value is EmailTransport =>
@@ -1541,6 +1535,10 @@ const retiredRenderPlans: Record<string, string> = {
   pro_ultra: "8c-32g",
 };
 
+export function renderPlanId(plan: string): string {
+  return retiredRenderPlans[plan] ?? plan;
+}
+
 function validateRender(raw: unknown, path: string): RenderConfig {
   if (!isPlainObject(raw)) throw new CliError(`${path}: "render" must be an object`);
   const allowed = new Set([
@@ -1606,6 +1604,22 @@ function validateRender(raw: unknown, path: string): RenderConfig {
     postgresPlan: plan("postgresPlan", raw.postgresPlan ?? "0.5c-1g", false),
     postgresDiskSizeGB,
   };
+}
+
+export function updateConfigUrls(raw: string, updates: { publicUrl: string; apiUrl: string }): string {
+  const root = objectProps(stripJsonComments(raw), 0);
+  const edits: ConfigEdit[] = [];
+  for (const [key, value] of Object.entries(updates)) {
+    const property = root.props.find((entry) => entry.key === key);
+    if (property) edits.push({ start: property.valueStart, end: property.valueEnd, text: JSON.stringify(value) });
+    else
+      edits.push({
+        start: root.openBrace + 1,
+        end: root.openBrace + 1,
+        text: `\n  ${JSON.stringify(key)}: ${JSON.stringify(value)},`,
+      });
+  }
+  return applyEdits(raw, edits);
 }
 
 function validateSandbox(raw: unknown, path: string, target: Target): SandboxConfig | undefined {

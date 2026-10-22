@@ -1,7 +1,46 @@
+import { randomBytes } from "node:crypto";
+import type { RenderConfig } from "./config.ts";
 import { CliError } from "./log.ts";
 import { renderJobCommand } from "./render-job-command.ts";
+import type { RenderWorkload } from "./render-services.ts";
 
 export const renderMinioCommand = "minio server --address 0.0.0.0:9000 /data";
+
+export const renderMinioSecretNames = ["MINIO_ROOT_USER", "MINIO_ROOT_PASSWORD", "QM_STORAGE_SECRET_KEY"];
+
+export function renderMinioWorkload(render: RenderConfig): RenderWorkload {
+  return {
+    name: "minio",
+    source: render.source,
+    dockerfile: "deploy/render-minio/Dockerfile",
+    command: renderMinioCommand,
+    type: "web_service",
+    plan: render.storage.plan,
+    health: "/minio/health/live",
+    diskSizeGB: render.storage.diskSizeGB,
+  };
+}
+
+export function renderMinioEnv(
+  publicUrl: string,
+  existing: Record<string, string>,
+  saved: boolean,
+): Record<string, string> {
+  for (const key of renderMinioSecretNames)
+    if (saved && !existing[key])
+      throw new CliError(`Saved MinIO has no ${key}; restore its environment variable before deployment`);
+  return {
+    HOST: "0.0.0.0",
+    PORT: "9000",
+    MINIO_BROWSER: "off",
+    MINIO_ROOT_USER: existing.MINIO_ROOT_USER ?? `qm-root-${randomBytes(12).toString("hex")}`,
+    MINIO_ROOT_PASSWORD: existing.MINIO_ROOT_PASSWORD ?? randomBytes(32).toString("hex"),
+    QM_STORAGE_SECRET_KEY: existing.QM_STORAGE_SECRET_KEY ?? randomBytes(32).toString("hex"),
+    MINIO_API_STALE_UPLOADS_EXPIRY: "24h",
+    MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL: "6h",
+    MINIO_API_CORS_ALLOW_ORIGIN: publicUrl,
+  };
+}
 
 const storagePolicy = {
   Version: "2012-10-17",
