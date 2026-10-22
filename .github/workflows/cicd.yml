@@ -113,7 +113,7 @@ jobs:
         run: npm run test:root:shard
       - name: Render runner tests as root
         if: needs.reuse.outputs.reusable != 'true' && matrix.shard == 1
-        run: sudo env "PATH=$PATH" node --test test/render-deploy-runner.test.ts
+        run: sudo env "PATH=$PATH" node --experimental-test-module-mocks --test test/render-deploy-runner.test.ts
 
   core:
     name: Core

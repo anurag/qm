@@ -6,8 +6,9 @@ import { fileURLToPath } from "node:url";
 import { createServer, request, ServerResponse } from "node:http";
 import { connect } from "node:net";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { startRenderDatabase } from "./database.mjs";
 
-const SHUTDOWN_GRACE_MS = 30_000;
+const SHUTDOWN_GRACE_MS = 20_000;
 const READINESS_SWEEP_MS = 5_000;
 const READINESS_MISSES = 3;
 const APP_UID = 10001;
@@ -86,6 +87,7 @@ export async function prepareRenderApp(manifestPath, appDir, env = process.env) 
 export async function runRenderApp({
   manifestPath = "/etc/secrets/qm-render-artifact.json",
   appDir = "/app",
+  dataDir = "/data",
   env = process.env,
   gatewayPort = 8080,
   appPort = 8081,
@@ -107,7 +109,7 @@ export async function runRenderApp({
       throw new Error(`Render app runner refuses a manifest the app user can read: ${manifestPath}`);
   }
   const entrypoint = await prepareRenderApp(manifestPath, appDir, env);
-  const appEnv = { ...env, ...manifest.runtimeEnv, PORT: String(appPort) };
+  const appEnv = { ...env, ...manifest.runtimeEnv, PORT: String(appPort), DATA_DIR: dataDir };
   delete appEnv.QM_RENDER_APP_TOKEN;
   if (privileged) {
     appEnv.HOME = "/home/app";
@@ -155,6 +157,17 @@ export async function runRenderApp({
     server.once("error", reject);
     server.listen(gatewayPort, "0.0.0.0", ready);
   });
+  let database;
+  try {
+    database = await startRenderDatabase({
+      dataDir,
+      env: appEnv,
+      ...(privileged ? { uid: APP_UID, gid: APP_GID } : {}),
+    });
+  } catch (error) {
+    await new Promise((done) => server.close(done));
+    throw error;
+  }
   const child = spawn("bash", ["-c", entrypoint], {
     cwd: appDir,
     env: appEnv,
@@ -209,9 +222,11 @@ export async function runRenderApp({
   };
   process.on("SIGTERM", term);
   process.on("SIGINT", interrupt);
+  let failure;
   try {
     const deadline = Date.now() + 90_000;
     while (true) {
+      database.assertRunning();
       if (spawnError) throw new Error(`Render app could not start: ${spawnError.message}`);
       if (child.exitCode !== null || child.signalCode !== null)
         throw new Error(`Render app exited before it was ready (${child.signalCode ?? child.exitCode})`);
@@ -228,13 +243,27 @@ export async function runRenderApp({
       } else if (++missed >= READINESS_MISSES) appReady = false;
     }, readinessSweepMs);
     sweep.unref();
-    return await completion;
+    return await Promise.race([
+      completion,
+      database.exited.then((error) => {
+        throw error;
+      }),
+    ]);
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
     await stop("SIGTERM");
     forward("SIGKILL");
+    await completion;
     clearTimeout(shutdownTimer);
     process.off("SIGTERM", term);
     process.off("SIGINT", interrupt);
+    await database.stop().catch((error) => {
+      if (failure)
+        throw new AggregateError([failure, error], `${failure.message}; backup shutdown failed: ${error.message}`);
+      throw error;
+    });
   }
 }
 
