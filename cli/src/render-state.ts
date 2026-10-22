@@ -1,19 +1,12 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-
 import { join } from "node:path";
-
 import type { DeployContext } from "./backends/registry.ts";
-
 import { appPrefixOf, type QmConfig, type RenderConfig } from "./config.ts";
-
 import { CliError } from "./log.ts";
-
 import { list, RenderApiError, type RenderRequest, type ServiceType } from "./render-api.ts";
-
 import { withDeploymentLock } from "./state.ts";
 
 type Collection = "projects" | "postgres" | "services";
-
 export interface State {
   version: 1;
   orgId: string;
@@ -32,14 +25,12 @@ export interface State {
   updateInProgress?: boolean;
   rollbackProgress?: RollbackProgress;
 }
-
 interface Release {
   label: string;
   commit: string;
   createdAt: string;
   services: Record<string, string>;
 }
-
 interface RollbackProgress {
   mode: "restore" | "rebuild";
   label?: string;
@@ -47,22 +38,17 @@ interface RollbackProgress {
   services: Record<string, string>;
   restored: Record<string, string>;
 }
-
 const RETAINED_RELEASES = 10;
-
 export function recordRelease(state: State, commit: string, services: Record<string, string>): Release {
   state.releaseCount = (state.releaseCount ?? 0) + 1;
   const release: Release = { label: `r${state.releaseCount}`, commit, createdAt: new Date().toISOString(), services };
   state.releases = [release, ...(state.releases ?? [])].slice(0, RETAINED_RELEASES);
   return release;
 }
-
 export function describeRelease(release: Release): string {
   return `${release.label} (${release.commit.slice(0, 7)}, ${release.createdAt})`;
 }
-
 type RollbackTarget = { mode: "restore"; release: Release } | { mode: "rebuild"; commit: string };
-
 export function resolveRollbackTarget(state: State, to: string | undefined): RollbackTarget {
   const releases = state.releases ?? [];
   const retained = releases.length
@@ -95,17 +81,14 @@ export function resolveRollbackTarget(state: State, to: string | undefined): Rol
   }
   throw new CliError(`Rollback target ${JSON.stringify(to)} is not a release label, commit, or deploy ID. ${retained}`);
 }
-
 export function coordinates(config: QmConfig): RenderConfig {
   if (!config.render || config.render.workspaceId === "tea-replaceme")
     throw new CliError("Set render.workspaceId to your Render workspace ID before deployment");
   return config.render;
 }
-
-function statePath(ctx: DeployContext): string {
+export function statePath(ctx: DeployContext): string {
   return join(ctx.configDir, "render.resources.json");
 }
-
 export function readState(ctx: DeployContext, optional = false): State {
   const render = coordinates(ctx.config);
   if (!existsSync(statePath(ctx))) {
@@ -133,16 +116,13 @@ export function readState(ctx: DeployContext, optional = false): State {
     throw new CliError("render.resources.json belongs to another organization, workspace, region, or app prefix");
   return state;
 }
-
 export function saveState(ctx: DeployContext, state: State): void {
   const path = statePath(ctx);
   writeFileSync(`${path}.tmp`, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
 }
-
 export const locked = <T>(ctx: DeployContext, operation: () => Promise<T>): Promise<T> =>
   withDeploymentLock(join(ctx.configDir, ".render.lock"), operation);
-
 export async function createResource<T>(
   ctx: DeployContext,
   request: RenderRequest,
@@ -164,7 +144,6 @@ export async function createResource<T>(
     throw error;
   }
 }
-
 export async function recoverPendingCreate(
   ctx: DeployContext,
   request: RenderRequest,
