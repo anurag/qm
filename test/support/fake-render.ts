@@ -1,12 +1,21 @@
 import { SandboxSnapshotNotFoundError } from "@renderinc/sdk";
+
 import { AWS_CLI_ENSURE } from "../../src/sandbox/aws-cli.ts";
+
 import { execFile } from "node:child_process";
+
 import { randomUUID } from "node:crypto";
+
 import { promisify } from "node:util";
+
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+
 import { tmpdir } from "node:os";
+
 import { dirname, join } from "node:path";
+
 import type { TestContext } from "node:test";
+
 import {
   RENDER_SCRIPT_DIR,
   RENDER_SANDBOX_TTL_SEC,
@@ -14,6 +23,22 @@ import {
   type RenderSandboxInfo,
   type RenderSnapshot,
 } from "../../src/sandbox/render-client.ts";
+
+import type { Deployment } from "../../src/deploy/deploy-store.ts";
+
+import { scopeId } from "../../src/types.ts";
+
+export function fakeDeployment(versions: Deployment["versions"] = []): Deployment {
+  return {
+    id: randomUUID(),
+    ownerScopeId: scopeId("personal", "U1"),
+    createdBy: "U1",
+    currentVersion: 1,
+    status: "stopped",
+    endpoint: null,
+    versions,
+  };
+}
 
 export function createFakeRender() {
   const execFileAsync = promisify(execFile);
