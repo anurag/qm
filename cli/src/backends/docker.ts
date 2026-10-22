@@ -9,7 +9,6 @@ import {
   capture,
   captureBoth,
   deploymentSecretValue,
-  isInvalidSecret,
   readEnvFile,
   resolveBuildRepoRoot,
   runInherit,
@@ -35,7 +34,8 @@ import {
 } from "../services.ts";
 import { dockerBasePort, localSandboxActive, sandboxCoreEnv, securityScreenEnv, type QmConfig } from "../config.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
-import { computedSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
+import { computedSecrets, missingRequiredSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
+import { doctorCommon, localDoctorSecrets } from "./doctor.ts";
 import {
   deploymentDir,
   readDeploymentState,
@@ -608,14 +608,19 @@ function warnUnforwardedEnvKeys(ctx: DockerCtx): void {
   );
 }
 
-function missingRequiredOperatorSecrets(ctx: DockerCtx): string[] {
-  const lookup = (name: string): string | undefined => deploymentSecretValue(name, readEnvValue(ctx.envFile, name));
-  return computedSecrets(ctx.config)
-    .filter(
-      (secret) =>
-        secret.required && secret.managedBy === "operator" && isInvalidSecret(secret.name, lookup(secret.name)),
-    )
-    .map((secret) => secret.name);
+function missingRequiredOperatorSecrets(config: QmConfig, values: ReadonlyMap<string, string>): string[] {
+  return missingRequiredSecrets(
+    computedSecrets(config).filter((secret) => secret.managedBy === "operator"),
+    (name) => deploymentSecretValue(name, values.get(name)),
+  );
+}
+
+export async function dockerDoctor(config: QmConfig, configDir: string, envFile?: string): Promise<void> {
+  const values = localDoctorSecrets(configDir, envFile);
+  const missing = missingRequiredOperatorSecrets(config, values);
+  if (missing.length) throw new CliError(`required secrets are missing or placeholders: ${missing.join(", ")}`);
+  step("required operator secret values: ok");
+  await doctorCommon(config, values, { configDir });
 }
 
 export async function dockerUp(
@@ -640,7 +645,10 @@ export async function dockerUp(
   for (const name of ctx.missingSandboxSecrets) {
     warn(`sandbox.secretEnv "${name}" has no value in .env or the environment — it won't be set in the sandbox.`);
   }
-  const missingRequired = missingRequiredOperatorSecrets(ctx);
+  const missingRequired = missingRequiredOperatorSecrets(
+    ctx.config,
+    ctx.envFile ? readEnvFile(ctx.envFile) : new Map(),
+  );
   if (opts.dryRun && missingRequired.length) {
     warn(`MISSING required secrets — add them to .env before up: ${missingRequired.join(", ")}`);
   }

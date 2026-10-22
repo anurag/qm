@@ -20,8 +20,14 @@ import {
   awsUp,
   awsDeploymentLayerTransport,
 } from "./aws.ts";
-import { dockerDeploymentLayerTransport, dockerDown, dockerLogs, dockerStatus, dockerUp } from "./docker.ts";
-import { doctorCommon, localDoctorSecrets } from "./doctor.ts";
+import {
+  dockerDeploymentLayerTransport,
+  dockerDoctor,
+  dockerDown,
+  dockerLogs,
+  dockerStatus,
+  dockerUp,
+} from "./docker.ts";
 import {
   flyCheckLive,
   flyDoctor,
@@ -132,11 +138,7 @@ const docker: HostingProvider = {
     rollback: () => {
       throw new CliError("rollback is not implemented for target docker");
     },
-    doctor: () =>
-      doctorCommon(ctx.config, localDoctorSecrets(ctx.configDir, ctx.envFile), {
-        requiredSecretValues: true,
-        configDir: ctx.configDir,
-      }),
+    doctor: () => dockerDoctor(ctx.config, ctx.configDir, ctx.envFile),
     secretsPush: () => {
       note("docker reads .env directly; no secret upload is needed");
     },

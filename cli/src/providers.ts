@@ -12,6 +12,7 @@ export const SANDBOX_BACKENDS = {
   agent37: "",
   superserve: "Superserve sandboxes",
   e2b: "E2B sandboxes",
+  render: "Render Sandboxes",
 } as const;
 
 export type SandboxBackendId = keyof typeof SANDBOX_BACKENDS;
