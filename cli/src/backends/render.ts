@@ -1,8 +1,9 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 import { appPrefixOf, renderPlanId, updateConfigUrls, type QmConfig } from "../config.ts";
 
 import {
+  deploymentLayerRequest,
   httpDeploymentLayerTransport,
   syncDeploymentLayer,
   type DeploymentLayerTransport,
@@ -24,7 +25,7 @@ import {
   type ServiceType,
 } from "../render-api.ts";
 
-import { bindUrl, customDomains, httpsOrigin, publicUrl, renderInternalUrl } from "../render-domains.ts";
+import { bindUrl, customDomains, httpsOrigin, publicUrl, renderInternalUrl, verifiedUrl } from "../render-domains.ts";
 
 import {
   renderMinioEnv,
@@ -51,6 +52,7 @@ import {
   recoverPendingCreate,
   resolveRollbackTarget,
   saveState,
+  statePath,
   type State,
 } from "../render-state.ts";
 
@@ -410,6 +412,22 @@ async function runJob(
   }
 }
 
+async function liveSession(
+  request: RenderRequest,
+  core: RenderService,
+  workspaceId: string,
+  report: boolean,
+): Promise<void> {
+  await runJob(
+    request,
+    core,
+    workspaceId,
+    `timeout -s TERM -k 30 1200 node src/deployment/postdeploy-smoke.ts session ${renderInternalUrl(core)}`,
+    "live session",
+    report,
+  );
+}
+
 async function provision(
   ctx: DeployContext,
   request: RenderRequest,
@@ -654,7 +672,7 @@ export function renderConfigErrors(
   return errors;
 }
 
-export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "status" | "logs" | "down" | "rollback"> {
+export function createRenderBackend(ctx: DeployContext): Backend {
   return {
     up: async (opts) => {
       const desired = workloads(ctx);
@@ -1046,5 +1064,71 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "s
           `${progress.mode === "restore" ? `Release ${progress.label} restored` : `Commit ${progress.commit.slice(0, 7)} built and deployed`} as ${release.label}. Postgres and object data are retained; migrations are not reversed`,
         );
       }),
+    doctor: async () => {
+      const values = credentialValues(ctx);
+      requireSecrets(ctx, values);
+      await doctorCommon(ctx.config, values, { configDir: ctx.configDir });
+      const render = coordinates(ctx.config);
+      const request = api(ctx);
+      await request(`/owners/${render.workspaceId}`);
+      workloads(ctx);
+      if (existsSync(statePath(ctx))) await inventory(ctx, request, readState(ctx));
+      ok(`Render workspace: ${render.workspaceId}`);
+    },
+    secretsPush: async (envFile) =>
+      locked(ctx, async () => {
+        const request = api(ctx, envFile);
+        const state = readState(ctx);
+        if (state.pendingPurge) throw new CliError("Render cleanup is incomplete; run qm down --purge");
+        const bound = await inventory(ctx, request, state);
+        const values = credentialValues(ctx, envFile);
+        requireSecrets(ctx, values);
+        const plugins = ctx.config.plugins.filter((item) => item.coreAccess !== false).map((item) => item.name);
+        for (const workload of renderWorkloads(ctx.config, ctx.configDir)) {
+          const service = bound.services.get(workload.name);
+          if (!service) throw new CliError(`No Render service exists for ${workload.name}; run qm up`);
+          const entries = computedSecrets(ctx.config).flatMap((secret) => {
+            const value = values.get(secret.name);
+            if (secret.managedBy !== "operator" || value === undefined) return [];
+            return runtimeSecretNames(workload.name, secret, plugins).map((key) => [key, value] as const);
+          });
+          if (!entries.length) continue;
+          for (const [key, value] of entries)
+            await request(`/services/${service.id}/env-vars/${encodeURIComponent(key)}`, "PUT", { value });
+          ok(`${workload.name}: secrets saved`);
+        }
+        note("Run qm up to deploy the saved secrets");
+      }),
+    checkLive: async (opts) => {
+      const report = opts?.report ?? true;
+      const request = api(ctx);
+      const state = readState(ctx);
+      const bound = await inventory(ctx, request, state);
+      const core = bound.services.get("core");
+      const web = bound.services.get(ctx.config.services.includes("portal") ? "portal" : "web-ui");
+      if (!core || !web) throw new CliError("The Render deployment has no core or web service; run qm up");
+      for (const [name, service, configured] of [
+        ["core", core, ctx.config.apiUrl],
+        ["web", web, ctx.config.publicUrl],
+      ] as const) {
+        const url = await verifiedUrl(request, service, configured);
+        const response = await fetch(`${url}/healthz`, {
+          signal: AbortSignal.timeout(30_000),
+          redirect: "error",
+        });
+        if (!response.ok) throw new CliError(`${name} health check failed (HTTP ${response.status})`);
+        if (report) ok(`${name}: healthy`);
+      }
+      const layer = await deploymentLayerRequest({
+        config: ctx.config,
+        configDir: ctx.configDir,
+        method: "GET",
+        transport: renderDeploymentLayerTransport,
+        ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+      });
+      if (layer.status !== 200) throw new CliError(`Core deployment layer check failed (HTTP ${layer.status})`);
+      if (report) ok("core: signed deployment layer access works");
+      await liveSession(request, core, state.workspaceId, report);
+    },
   };
 }

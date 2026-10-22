@@ -443,6 +443,37 @@ function cloud(t: TestContext, d: Deployment) {
   return state;
 }
 
+test("Render validates local inputs before creating provider-managed values", async (t) => {
+  const d = deployment(t);
+  d.ctx.config.env.core!.HARNESS = "pi";
+  const c = cloud(t, d);
+  assert.doesNotMatch(readFileSync(join(d.ctx.configDir, ".env"), "utf8"), /PUBLIC_API_URL|DATABASE_URL/);
+  await d.backend.doctor!();
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.envs.get("srv-acme-core")!.PUBLIC_API_URL, "https://acme-core-assigned.onrender.com");
+  assert.ok(c.envs.get("srv-acme-core")!.DATABASE_URL);
+});
+
+test("Render rejects invalid operator values before deployment or secret updates", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const path = join(d.ctx.configDir, ".env");
+  writeFileSync(
+    path,
+    readFileSync(path, "utf8").replace(/^CORE_SIGNING_SECRET=.*$/m, "CORE_SIGNING_SECRET=replace-me"),
+  );
+  for (const operation of [
+    () => d.backend.doctor!(),
+    () => d.backend.up({ dryRun: false }),
+    () => d.backend.secretsPush(),
+  ]) {
+    c.calls.length = 0;
+    await assert.rejects(async () => operation(), /Required secrets are missing: CORE_SIGNING_SECRET/);
+    assert.ok(c.calls.every((call) => call.method === "GET"));
+  }
+});
+
 test("Render accepts null empty lists for projects, Postgres, and services", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
@@ -989,6 +1020,21 @@ test("Render purge resumes partial deletion and retains the project", async (t) 
   assert.equal(c.services.size, 3);
 });
 
+test("Render secret push targets consumers and keeps managed MinIO credentials", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  c.envs.get("srv-acme-core")!.AWS_SESSION_TOKEN = "old-session";
+  writeFileSync(
+    join(d.ctx.configDir, ".env"),
+    `${readFileSync(join(d.ctx.configDir, ".env"), "utf8")}\nAWS_SESSION_TOKEN=\n`,
+  );
+  await d.backend.secretsPush();
+  assert.equal(c.envs.get("srv-acme-core")!.AWS_SESSION_TOKEN, "old-session");
+  assert.equal(c.envs.get("srv-acme-web-ui")!.AWS_SECRET_ACCESS_KEY, undefined);
+  await d.backend.up({ dryRun: false });
+});
+
 test("Render updates retain stored operator secrets for the core", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
@@ -1018,6 +1064,36 @@ test("Render rejects disk shrink, plain HTTP URLs, and a shared hostname", async
   assert.ok(renderConfigErrors(d.ctx.config, []).some((error) => /www subdomain/.test(error.message)));
   d.ctx.config.apiUrl = "https://api.qm.example.com";
   assert.deepEqual(renderConfigErrors(d.ctx.config, []), []);
+});
+
+test("Render reports status, logs, and signed layer health from saved IDs", async (t) => {
+  const d = deployment(t, true);
+  mkdirSync(d.ctx.sandboxDir);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  await d.backend.status();
+  await d.backend.logs("core", { follow: false, tail: 10 });
+  await d.backend.checkLive!();
+  const layerCalls = c.calls.filter((call) => call.path === "/v1/deployment-layer");
+  assert.deepEqual(
+    layerCalls.map((call) => call.method),
+    ["PUT", "GET"],
+  );
+  assert.ok(layerCalls.every((call) => call.url.origin === "https://acme-core-assigned.onrender.com"));
+  assert.equal(d.ctx.config.publicUrl, "https://acme-portal-assigned.onrender.com");
+  const logCalls = c.calls.filter((call) => call.path === "/logs");
+  assert.ok(logCalls.some((call) => call.url.searchParams.get("resource") === "srv-acme-core"));
+  for (const call of logCalls) {
+    const startTime = call.url.searchParams.get("startTime");
+    assert.ok(
+      startTime === null || Date.parse(startTime) >= Date.now() - 30 * 24 * 60 * 60_000,
+      `Render rejects log queries that start more than 30 days ago: ${call.url.search}`,
+    );
+  }
+  assert.deepEqual(c.calls.find((call) => call.path === "/services/srv-acme-core/jobs")?.body, {
+    startCommand:
+      "timeout -s TERM -k 30 1200 node src/deployment/postdeploy-smoke.ts session http://acme-core-assigned:8080",
+  });
 });
 
 function logSubscription(t: TestContext, onConnect: (url: URL, options: WebSocketInit) => void) {
@@ -1123,6 +1199,88 @@ test("Render layer transport rejects missing or invalid core URLs before sending
     );
   }
   assert.equal(requests, 0);
+});
+
+test("Render live checks reject foreign resources and stale URLs before starting a canary", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const core = c.services.get("srv-acme-core")!;
+  core.ownerId = "tea-other";
+  await assert.rejects(async () => d.backend.checkLive!(), /does not match/);
+  core.ownerId = "tea-acme";
+  d.ctx.config.apiUrl = "https://other-core.onrender.com";
+  await assert.rejects(async () => d.backend.checkLive!(), /URLs do not match/);
+  d.ctx.config.apiUrl = core.serviceDetails.url;
+  core.slug = "core; unexpected-command";
+  await assert.rejects(async () => d.backend.checkLive!(), /invalid private hostname/);
+  assert.equal(
+    c.calls.some((call) => call.path === "/services/srv-acme-core/jobs"),
+    false,
+  );
+});
+
+test("Render live checks fail on failed and canceled canaries and identify their logs", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  for (const status of ["failed", "canceled"]) {
+    c.nextJobStatus = status;
+    await assert.rejects(
+      async () => d.backend.checkLive!({ report: false }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, new RegExp(`job-acmecanary ended with ${status}`));
+        assert.match(error.message, /GET \/v1\/logs\?ownerId=tea-acme&resource=job-acmecanary/);
+        return true;
+      },
+    );
+  }
+  assert.equal(
+    c.calls.some((call) => call.path.includes("/jobs/") && call.path.endsWith("/cancel")),
+    false,
+  );
+});
+
+test("Render live checks cancel a job that exceeds the deadline", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  c.nextJobStatus = "running";
+  c.intercept = (call) => {
+    if (call.path === "/services/srv-acme-core/jobs/job-acmecanary") now += 21 * 60_000;
+    return undefined;
+  };
+  await assert.rejects(
+    async () => d.backend.checkLive!({ report: false }),
+    /job-acmecanary did not finish within 20 minutes/,
+  );
+  assert.equal(
+    c.calls.filter((call) => call.path.includes("/jobs/") && call.path.endsWith("/cancel") && call.method === "POST")
+      .length,
+    1,
+  );
+});
+
+test("Render live checks cancel after a polling failure and report cleanup failures", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  c.intercept = (call) =>
+    call.path === "/services/srv-acme-core/jobs/job-acmecanary" || call.path.endsWith("/cancel")
+      ? new Response(null, { status: 503 })
+      : undefined;
+  await assert.rejects(
+    async () => d.backend.checkLive!({ report: false }),
+    /job-acmecanary.*HTTP 503.*cancellation failed/,
+  );
+  assert.equal(
+    c.calls.filter((call) => call.path.includes("/jobs/") && call.path.endsWith("/cancel") && call.method === "POST")
+      .length,
+    1,
+  );
 });
 
 test("private Render addresses use the workload port", () => {
