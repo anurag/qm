@@ -9,6 +9,7 @@ import { createPostgresDecisionStore, type DecisionStore } from "./decisions/sto
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
 import { availableRuntimeError } from "./api/runtime-config.ts";
 import { createApprovalStore } from "./core/approval-store.ts";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
 import { flushErrorReporting } from "../plugins/chassis/src/error-reporting.ts";
@@ -230,6 +231,7 @@ import {
   type StoredManagedAgentsSandbox,
 } from "./sandbox/managed-agents-sandbox.ts";
 import { createSdkManagedAgentsClient } from "./sandbox/managed-agents-client.ts";
+import { s3Client } from "./persistence/s3.ts";
 import { createS3SnapshotStore } from "./sandbox/home-snapshot.ts";
 import { createModalSandbox, type StoredModalSandbox } from "./sandbox/modal-sandbox.ts";
 import { createSdkModalClient } from "./sandbox/modal-client.ts";
@@ -771,6 +773,8 @@ export function buildApp(
     if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
     return config.databaseUrl;
   };
+  const s3 = config.s3Endpoint ? s3Client(config.s3Region, { endpoint: config.s3Endpoint }) : undefined;
+  const s3Override = s3 ? { _client: s3 } : {};
   const workspace =
     config.workspaceStore === "postgres"
       ? createRenderWorkspaceStore(config.dataDir, requireDbUrl("WORKSPACE_STORE"))
@@ -778,6 +782,7 @@ export function buildApp(
   const blobTransfer: BlobTransferStore =
     config.transferStore === "s3" && config.s3Bucket
       ? createS3BlobTransferStore({
+          ...s3Override,
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -786,6 +791,7 @@ export function buildApp(
   const fileBytes: DurableByteStore =
     config.snapshotStore === "s3" && config.s3Bucket
       ? createS3DurableByteStore({
+          ...s3Override,
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -797,6 +803,7 @@ export function buildApp(
   const fileUploads =
     config.databaseUrl && config.snapshotStore === "s3" && config.s3Bucket
       ? createDirectFileUploads({
+          ...(s3 ? { client: s3, presign: (command, expiresIn) => getSignedUrl(s3, command, { expiresIn }) } : {}),
           bucket: config.s3Bucket,
           ...(config.s3Region ? { region: config.s3Region } : {}),
           ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
@@ -1316,6 +1323,7 @@ export function buildApp(
           bytesFor: (prefix) =>
             config.snapshotStore === "s3" && config.s3Bucket
               ? createS3DurableByteStore({
+                  ...s3Override,
                   bucket: config.s3Bucket,
                   ...(config.s3Region ? { region: config.s3Region } : {}),
                   prefix: `${config.s3Prefix ?? ""}${prefix}`,
@@ -1687,6 +1695,7 @@ export function buildApp(
       ...(config.snapshotStore === "s3" && config.s3Bucket
         ? {
             archiveBytes: createS3DurableByteStore({
+              ...s3Override,
               bucket: config.s3Bucket,
               ...(config.s3Region ? { region: config.s3Region } : {}),
               prefix: `${config.s3Prefix ?? ""}deploy-git/`,
@@ -3053,6 +3062,7 @@ export function buildApp(
     sessionShareBytes:
       config.snapshotStore === "s3" && config.s3Bucket
         ? createS3DurableByteStore({
+            ...s3Override,
             bucket: config.s3Bucket,
             ...(config.s3Region ? { region: config.s3Region } : {}),
             prefix: `${config.s3Prefix ?? ""}session-shares/`,

@@ -163,6 +163,7 @@ export interface Config {
   workspaceStore: "local" | "postgres";
   s3Bucket?: string;
   s3Region?: string;
+  s3Endpoint?: string;
   s3Prefix?: string;
   deployIdleTtlMs?: number;
   deployGitDir: string;
@@ -1200,6 +1201,25 @@ function resolveStoreKinds(env: NodeJS.ProcessEnv): Pick<Config, "sessionStore" 
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const s3Endpoint = env.AWS_ENDPOINT_URL_S3?.trim();
+  if (s3Endpoint) {
+    let endpoint: URL;
+    try {
+      endpoint = new URL(s3Endpoint);
+    } catch {
+      throw new Error("AWS_ENDPOINT_URL_S3 must be an HTTP or HTTPS URL");
+    }
+    if (
+      !["http:", "https:"].includes(endpoint.protocol) ||
+      endpoint.username ||
+      endpoint.password ||
+      endpoint.search ||
+      endpoint.hash
+    )
+      throw new Error(
+        "AWS_ENDPOINT_URL_S3 must be an HTTP or HTTPS URL without credentials, query parameters, or a fragment",
+      );
+  }
   const token = env.SPEND_EXPORT_TOKEN;
   if (token) {
     const reused = Object.entries(env).some(([name, value]) => name !== "SPEND_EXPORT_TOKEN" && value === token);
@@ -1646,6 +1666,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     transferStore: env.TRANSFER_STORE === "s3" ? "s3" : "local",
     ...(env.S3_BUCKET ? { s3Bucket: env.S3_BUCKET } : {}),
     ...(env.S3_REGION ? { s3Region: env.S3_REGION } : {}),
+    ...(s3Endpoint ? { s3Endpoint } : {}),
     ...(env.S3_PREFIX ? { s3Prefix: env.S3_PREFIX } : {}),
     ...(numEnvStrict("DEPLOY_IDLE_TTL_MS", env.DEPLOY_IDLE_TTL_MS) !== undefined
       ? { deployIdleTtlMs: numEnvStrict("DEPLOY_IDLE_TTL_MS", env.DEPLOY_IDLE_TTL_MS) }
