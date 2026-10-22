@@ -55,6 +55,45 @@ export function recordRelease(state: State, commit: string, services: Record<str
   return release;
 }
 
+function describeRelease(release: Release): string {
+  return `${release.label} (${release.commit.slice(0, 7)}, ${release.createdAt})`;
+}
+
+type RollbackTarget = { mode: "restore"; release: Release } | { mode: "rebuild"; commit: string };
+
+export function resolveRollbackTarget(state: State, to: string | undefined): RollbackTarget {
+  const releases = state.releases ?? [];
+  const retained = releases.length
+    ? `Retained releases: ${releases.map(describeRelease).join(", ")}`
+    : "No release is retained";
+  if (to === undefined) {
+    const release = releases[state.updateInProgress === true ? 0 : 1];
+    if (!release || !Object.keys(release.services).length)
+      throw new CliError(`No previous Render release is recorded for rollback. ${retained}`);
+    return { mode: "restore", release };
+  }
+  const value = to.trim();
+  const byLabel = releases.find((release) => release.label === value);
+  if (byLabel) return { mode: "restore", release: byLabel };
+  if (/^dep-[a-z0-9]+$/.test(value)) {
+    const byDeploy = releases.find((release) => Object.values(release.services).includes(value));
+    if (byDeploy) return { mode: "restore", release: byDeploy };
+    throw new CliError(`No retained Render release contains deploy ${value}. ${retained}`);
+  }
+  if (/^[0-9a-f]{7,40}$/i.test(value)) {
+    const commit = value.toLowerCase();
+    const matches = releases.filter((release) => release.commit.startsWith(commit));
+    if (matches.length === 1) return { mode: "restore", release: matches[0]! };
+    if (matches.length > 1)
+      throw new CliError(`Commit ${value} matches several retained releases; use a release label. ${retained}`);
+    if (commit.length === 40) return { mode: "rebuild", commit };
+    throw new CliError(
+      `No retained Render release was built from ${value}; give the full 40-character commit to build it. ${retained}`,
+    );
+  }
+  throw new CliError(`Rollback target ${JSON.stringify(to)} is not a release label, commit, or deploy ID. ${retained}`);
+}
+
 export function coordinates(config: QmConfig): RenderConfig {
   if (!config.render || config.render.workspaceId === "tea-replaceme")
     throw new CliError("Set render.workspaceId to your Render workspace ID before deployment");
