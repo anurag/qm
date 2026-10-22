@@ -29,7 +29,7 @@ export interface SecretSpec {
 
 type ManagedBy = "operator" | "terraform" | "render";
 
-function managedByFor(spec: SecretSpec, target: QmConfig["target"] | "render"): ManagedBy {
+export function managedByFor(spec: SecretSpec, target: QmConfig["target"] | "render"): ManagedBy {
   if (typeof spec.managedBy === "string") return spec.managedBy;
   return spec.managedBy?.[target] ?? spec.managedBy?.default ?? "operator";
 }
