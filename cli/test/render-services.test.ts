@@ -1,23 +1,13 @@
 import assert from "node:assert/strict";
-
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-
 import { tmpdir } from "node:os";
-
 import { join } from "node:path";
-
 import { test, type TestContext } from "node:test";
-
 import { loadConfigAt, parseConfigJson, renderSource } from "../src/config.ts";
-
 import { renderScaffold } from "../src/provider-scaffold.ts";
-
 import { renderConfigErrors } from "../src/backends/render.ts";
-
 import { discoverPlugins } from "../src/plugins.ts";
-
 import { renderServiceEnv, renderWorkloads } from "../src/render-services.ts";
-
 import { computedSecrets, FIRST_PARTY_SECRET_SPECS, managedByFor } from "../src/secrets.ts";
 
 interface ScaffoldConfig {
@@ -35,11 +25,7 @@ function deployment(t: TestContext, change?: (raw: ScaffoldConfig) => void) {
   change?.(raw);
   const path = join(dir, "qm.config.jsonc");
   writeFileSync(path, JSON.stringify(raw));
-  writeFileSync(path, JSON.stringify({ ...raw, target: "docker", sandbox: undefined }));
-  const config = loadConfigAt(path).config;
-  Object.assign(config, { target: "render", sandbox: { backend: "render" } });
-  writeFileSync(path, JSON.stringify(raw));
-  return { dir, path, raw, config };
+  return { dir, path, raw, config: loadConfigAt(path).config };
 }
 
 const connections = {
@@ -128,6 +114,24 @@ test("Render init selects managed MinIO without generated infrastructure files o
       secrets.some((secret) => secret.name === key),
       false,
     );
+});
+
+test("Render appRegion accepts supported regions without changing the core region", (t) => {
+  const { path, raw } = deployment(t);
+  for (const appRegion of ["oregon", "ohio", "virginia", "frankfurt", "singapore"]) {
+    writeFileSync(path, JSON.stringify({ ...raw, render: { ...raw.render, appRegion } }));
+    const config = loadConfigAt(path).config;
+    assert.equal(config.render!.appRegion, appRegion);
+    assert.equal(config.render!.region, "oregon");
+    const core = renderServiceEnv(config, "core", new Map(), connections);
+    assert.equal(core.RENDER_APP_REGION, appRegion);
+    assert.equal(core.RENDER_REGION, "oregon");
+    assert.equal(renderServiceEnv(config, "web-ui", new Map(), connections).RENDER_APP_REGION, undefined);
+  }
+  for (const appRegion of ["us-east-1", "Virginia", "", null, 3, {}]) {
+    writeFileSync(path, JSON.stringify({ ...raw, render: { ...raw.render, appRegion } }));
+    assert.throws(() => loadConfigAt(path), /render.appRegion must be a Render region/);
+  }
 });
 
 test("Render core receives scoped storage credentials and assigned URLs", (t) => {
@@ -222,4 +226,25 @@ test("removing an embedded auth domain clears the core and broker allowlists", (
   assert.equal(core.AUTH_ALLOWED_EMAIL_DOMAIN, "");
   assert.equal(portal.AUTH_ALLOWED_EMAIL_DOMAIN, "");
   assert.equal(portal.OIDC_ALLOWED_EMAIL_DOMAIN, "");
+});
+
+test("Render storage validates settings and reserves bundled resource names", (t) => {
+  const { dir, path, raw } = deployment(t);
+  for (const storage of [
+    { type: "other" },
+    { type: "external", diskSizeGB: 10 },
+    { type: "minio", plan: "free" },
+    { type: "minio", diskSizeGB: 0 },
+    { type: "minio", diskSizeGB: 1.5 },
+  ]) {
+    writeFileSync(path, JSON.stringify({ ...raw, render: { ...raw.render, storage } }));
+    assert.throws(() => loadConfigAt(path), /render.storage/);
+  }
+  writeFileSync(path, JSON.stringify({ ...raw, plugins: [{ name: "minio", image: "example.test/plugin:1" }] }));
+  const config = loadConfigAt(path).config;
+  assert.ok(
+    renderConfigErrors(config, discoverPlugins(dir, config).plugins).some(
+      (error) => error.message === "Render plugin minio conflicts with the bundled Render minio service",
+    ),
+  );
 });

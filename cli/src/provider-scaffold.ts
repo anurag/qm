@@ -25,7 +25,7 @@ export interface ProviderScaffold {
 }
 
 interface ConfigValues {
-  target: Target | "render";
+  target: Target;
   modelProvider: ModelProvider;
   publicUrl: string;
   providerFields: string;

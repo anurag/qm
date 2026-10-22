@@ -802,6 +802,7 @@ function validate(raw: unknown, path: string): QmConfig {
     out.aws = validateAws(o["aws"], path, runnableServices(services), configuredSecretNames);
   }
   if (o["render"] !== undefined) out.render = validateRender(o["render"], path);
+  if (target === "render" && !out.render) throw new CliError(`${path}: target "render" requires a "render" block`);
   if (target === "aws" && !out.aws) throw new CliError(`${path}: target "aws" requires an "aws" block`);
   validateModelProvider(out, path);
   validatePortalTrust(out, path);
@@ -1659,7 +1660,7 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       throw new CliError(`${path}: ${field} ${JSON.stringify(name)} is not a valid env var name`);
     }
   };
-  const out: SandboxConfig = {};
+  const out: SandboxConfig = target === "render" ? { backend: "render" } : {};
   if (o["backend"] !== undefined) {
     if (!isSandboxBackendId(o["backend"])) {
       const choices = Object.entries(SANDBOX_BACKENDS).map(([id, label]) => (label ? `"${id}" (${label})` : `"${id}"`));
