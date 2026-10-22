@@ -542,6 +542,23 @@ test("Render plan needs no API calls, Git repository, or state file", async (t) 
   assert.equal(existsSync(join(d.ctx.configDir, "render.resources.json")), false);
 });
 
+test("Render retains the MinIO source when the QM repository and branch change", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  d.setCommit("c".repeat(40));
+  d.ctx.config.render!.source = { repo: "https://github.com/acme/qm-next", branch: "release" };
+  await d.backend.up({ dryRun: false });
+  assert.equal(c.services.get("srv-acme-minio")!.repo, "https://github.com/acme/qm");
+  assert.equal(c.services.get("srv-acme-minio")!.branch, "main");
+  assert.equal(c.services.get("srv-acme-core")!.repo, "https://github.com/acme/qm-next");
+  assert.equal(c.deploys.get("srv-acme-minio")!.commit!.id, "a".repeat(40));
+  await d.backend.up({ dryRun: false, upgradeMinio: true });
+  assert.equal(c.services.get("srv-acme-minio")!.repo, "https://github.com/acme/qm-next");
+  assert.equal(c.services.get("srv-acme-minio")!.branch, "release");
+  assert.equal(c.deploys.get("srv-acme-minio")!.commit!.id, "c".repeat(40));
+});
+
 test("Render refuses to change an unknown MinIO version without an explicit upgrade", async (t) => {
   const d = deployment(t);
   const c = cloud(t, d);
@@ -549,7 +566,6 @@ test("Render refuses to change an unknown MinIO version without an explicit upgr
   const saved = d.saved();
   delete saved.minioSource;
   writeFileSync(join(d.ctx.configDir, "render.resources.json"), JSON.stringify(saved));
-  delete c.deploys.get("srv-acme-minio")!.commit;
   d.setCommit("c".repeat(40));
   const mark = c.calls.length;
   await assert.rejects(d.backend.up({ dryRun: false }), /MinIO has no saved Git source.*render.resources.json/);

@@ -661,7 +661,11 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up"> {
           step(
             `${workload.name}: ${workload.type}, ${workload.plan}, ${workload.source.repo} branch ${workload.source.branch}, ${workload.dockerfile}${workload.diskSizeGB ? `, ${workload.diskSizeGB} GB persistent disk` : ""}`,
           );
-        step("retain the selected MinIO source commit");
+        step(
+          opts.upgradeMinio
+            ? "upgrade MinIO to the selected source commit"
+            : "retain the selected MinIO source commit; use --upgrade-minio to upgrade it",
+        );
         step("set service connections and secrets, deploy changes, and upload the deployment layer");
         return;
       }
@@ -730,6 +734,7 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up"> {
             });
             service = result.service;
             state.services[workload.name] = { id: service.id, name, type: workload.type };
+            if (workload.name === "minio") state.minioSource = { ...workload.source, commit };
             saveState(ctx, state);
             services.set(workload.name, service);
           }
@@ -759,25 +764,14 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up"> {
           let service = services.get(workload.name)!;
           let serviceCommit = commit;
           if (workload.name === "minio") {
-            if (!state.minioSource) {
-              const previous = (
-                await requestArray<{ deploy: RenderDeploy }>(
-                  request,
-                  `/services/${service.id}/deploys?status=live&status=deactivated&limit=1`,
-                )
-              )[0]?.deploy;
-              if (previous) {
-                const repo = githubRepoUrl(service.repo ?? "");
-                if (!previous.commit?.id || !repo || !service.branch)
-                  throw new CliError("MinIO has no saved Git source; restore minioSource in render.resources.json");
-                state.minioSource = { repo, branch: service.branch, commit: previous.commit.id };
-                saveState(ctx, state);
-              }
-            }
-            if (!state.minioSource) {
+            if (opts.upgradeMinio) {
               state.minioSource = { ...workload.source, commit };
               saveState(ctx, state);
             }
+            if (!state.minioSource)
+              throw new CliError(
+                "MinIO has no saved Git source; restore minioSource in render.resources.json or pass --upgrade-minio",
+              );
             serviceCommit = state.minioSource.commit;
             workload.source = { repo: state.minioSource.repo, branch: state.minioSource.branch };
           }
