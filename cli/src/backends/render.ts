@@ -647,7 +647,11 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up"> {
           step(
             `${workload.name}: ${workload.type}, ${workload.plan}, ${workload.source.repo} branch ${workload.source.branch}, ${workload.dockerfile}${workload.diskSizeGB ? `, ${workload.diskSizeGB} GB persistent disk` : ""}`,
           );
-        step("retain the selected MinIO source commit");
+        step(
+          opts.upgradeMinio
+            ? "upgrade MinIO to the selected source commit"
+            : "retain the selected MinIO source commit; use --upgrade-minio to upgrade it",
+        );
         step("set service connections and secrets, deploy changes, and upload the deployment layer");
         return;
       }
@@ -745,7 +749,7 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up"> {
           let service = services.get(workload.name)!;
           let serviceCommit = commit;
           if (workload.name === "minio") {
-            if (!state.minioSource) {
+            if (!state.minioSource && !opts.upgradeMinio) {
               const previous = (
                 await requestArray<{ deploy: RenderDeploy }>(
                   request,
@@ -760,7 +764,7 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up"> {
                 saveState(ctx, state);
               }
             }
-            if (!state.minioSource) {
+            if (!state.minioSource || opts.upgradeMinio) {
               state.minioSource = { ...workload.source, commit };
               saveState(ctx, state);
             }
