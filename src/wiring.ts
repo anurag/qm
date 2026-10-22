@@ -2805,8 +2805,7 @@ export function buildApp(
   const deepIdleMachineMs = config.deepIdleMachineMs;
   const devIdleMachineMs = config.devIdleMachineMs;
   const SANDBOX_MAINTENANCE_INTERVAL_MS = 5 * 60_000;
-  const deepIdleReapEnabled = Boolean(sandbox.reapDeepIdle && (deepIdleMachineMs > 0 || devIdleMachineMs > 0));
-  const deepIdleSweeper = deepIdleReapEnabled
+  const deepIdleSweeper = sandbox.reapDeepIdle
     ? createSweeper(
         () =>
           leaderLease.hold("sandbox:deep-idle-reaper", () =>
