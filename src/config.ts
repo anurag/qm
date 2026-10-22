@@ -1,4 +1,5 @@
 import { codexAuthFileForEnv, loadCodexAuthFile } from "./model/chatgpt-auth-file.ts";
+import { RENDER_SANDBOX_TTL_SEC } from "./sandbox/render-client.ts";
 import {
   deploymentBrokerCredentialsFromEnv,
   type DeploymentBrokerCredential,
@@ -212,6 +213,7 @@ export interface Config {
   managedAgentsSandbox: ManagedAgentsSandboxEnv;
   modalSandbox: ModalSandboxEnv;
   porterSandbox: PorterSandboxEnv;
+  renderSandbox: RenderSandboxEnv;
   porterDeploy: PorterDeployEnv;
   awsDeploy: AwsDeployEnv;
   deployAppsDomain?: string;
@@ -435,6 +437,23 @@ function e2bSandboxEnv(env: NodeJS.ProcessEnv): E2bSandboxEnv {
     ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
       ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
       : {}),
+  };
+}
+
+interface RenderSandboxEnv {
+  apiKey?: string;
+  workspaceId?: string;
+  region: string;
+  defaultTimeoutSec?: number;
+}
+
+function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
+  const defaultTimeoutSec = numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC);
+  return {
+    ...(env.RENDER_API_KEY?.trim() ? { apiKey: env.RENDER_API_KEY.trim() } : {}),
+    ...(env.RENDER_WORKSPACE_ID?.trim() ? { workspaceId: env.RENDER_WORKSPACE_ID.trim() } : {}),
+    region: env.RENDER_REGION?.trim() || "oregon",
+    ...(defaultTimeoutSec !== undefined ? { defaultTimeoutSec } : {}),
   };
 }
 
@@ -1040,6 +1059,7 @@ export function enabledSandboxBackends(config: Config): Array<Config["sandboxBac
     modal: Boolean(config.modalSandbox?.tokenId && config.modalSandbox?.tokenSecret),
     aws: Boolean(config.awsSandbox?.s3Bucket),
     porter: Boolean(config.porterSandbox?.token),
+    render: Boolean(config.renderSandbox?.apiKey && config.renderSandbox?.workspaceId),
   };
   const enabled = new Set<Config["sandboxBackend"]>([config.sandboxBackend]);
   for (const [name, on] of Object.entries(credentialed)) {
@@ -1061,11 +1081,12 @@ function sandboxBackendEnvStrict(value: string | undefined, name = "SANDBOX_BACK
     backend === "agent37" ||
     backend === "superserve" ||
     backend === "do-managed-agents" ||
-    backend === "porter"
+    backend === "porter" ||
+    backend === "render"
   )
     return backend;
   throw new Error(
-    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, agent37, superserve, or do-managed-agents, or unset it.`,
+    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, agent37, superserve, do-managed-agents, or render, or unset it.`,
   );
 }
 
@@ -1345,10 +1366,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (env.NODE_ENV === "production" && !env.SANDBOX_BACKEND?.trim()) {
     throw new Error(
-      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, superserve, do-managed-agents, aws, or local.",
+      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, superserve, do-managed-agents, render, aws, or local.",
     );
   }
   const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
+  if (sandboxBackend === "render" || env.DEPLOY_PROVIDER === "render") {
+    if (!env.RENDER_WORKSPACE_ID?.trim()) throw new Error("Render providers require RENDER_WORKSPACE_ID");
+  }
+  const renderSandboxEnabled =
+    sandboxBackend === "render" || Boolean(env.RENDER_API_KEY?.trim() && env.RENDER_WORKSPACE_ID?.trim());
+  if (renderSandboxEnabled) {
+    if ((numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) ?? 600) + 60 >= RENDER_SANDBOX_TTL_SEC)
+      throw new Error(
+        `SANDBOX_TIMEOUT_SEC must stay more than 60 seconds below the ${RENDER_SANDBOX_TTL_SEC} second Render sandbox lifetime`,
+      );
+  }
   const legacySandboxScopeDefaults: LegacySandboxScopeDefaults = {};
   if (env.SANDBOX_SCOPE_BACKENDS) {
     const values: unknown = JSON.parse(env.SANDBOX_SCOPE_BACKENDS);
@@ -1708,6 +1740,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     agent37Sandbox: agent37SandboxEnv(env),
     superserveSandbox: superserveSandboxEnv(env),
     porterSandbox: porterSandboxEnv(env),
+    renderSandbox: renderSandboxEnv(env),
     porterDeploy: porterDeployEnv(env),
     e2bSandbox: e2bSandboxEnv(env),
     managedAgentsSandbox: managedAgentsSandboxEnv(env),
