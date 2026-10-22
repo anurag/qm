@@ -1000,6 +1000,80 @@ test("Render rejects disk shrink, plain HTTP URLs, and a shared hostname", async
   assert.deepEqual(renderConfigErrors(d.ctx.config, []), []);
 });
 
+function logSubscription(t: TestContext, onConnect: (url: URL, options: WebSocketInit) => void) {
+  const socket = Object.assign(new EventTarget(), { binaryType: "blob", close: t.mock.fn() });
+  t.mock.method(globalThis, "WebSocket", function (url: string | URL, options: WebSocketInit) {
+    queueMicrotask(() => {
+      socket.dispatchEvent(new Event("open"));
+      onConnect(new URL(url), options);
+    });
+    return socket;
+  });
+  return socket;
+}
+
+test("Render prints a paginated tail in time order and follows logs through one subscription", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  await d.backend.up({ dryRun: false });
+  const lines: string[] = [];
+  t.mock.method(console, "log", (line: string) => lines.push(line));
+  const entries = Array.from({ length: 101 }, (_, i) => ({
+    timestamp: new Date(Date.now() - 100_000 + i).toISOString(),
+    message: `line ${i}`,
+  }));
+  entries[0]!.timestamp = `${entries[50]!.timestamp.slice(0, -1)}000001Z`;
+  entries[52]!.timestamp = entries[51]!.timestamp;
+  const requests: URL[] = [];
+  c.intercept = ({ path, url }) => {
+    if (path !== "/logs") return;
+    requests.push(url);
+    return Response.json({
+      logs: requests.length === 1 ? entries.slice(1) : entries.slice(0, 1),
+      hasMore: requests.length === 1,
+      nextStartTime: new Date(Date.now() - 60 * 60_000).toISOString(),
+      nextEndTime: entries[0]!.timestamp,
+    });
+  };
+  const socket = logSubscription(t, (url, options) => {
+    assert.equal(url.origin, "wss://api.render.com");
+    assert.equal(url.pathname, "/v1/logs/subscribe");
+    assert.equal(new Headers(options.headers).get("authorization"), `Bearer ${"e".repeat(64)}`);
+    assert.deepEqual(url.searchParams.getAll("resource"), ["srv-acme-core"]);
+    assert.equal(url.searchParams.get("ownerId"), "tea-acme");
+    assert.equal(url.searchParams.get("direction"), "forward");
+    assert.equal(url.searchParams.get("endTime"), null);
+    assert.equal(url.searchParams.get("limit"), null);
+    const start = url.searchParams.get("startTime")!;
+    const end = requests[0]!.searchParams.get("endTime")!;
+    assert.equal(start, end);
+    socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ timestamp: start, message: "live" }) }));
+    socket.dispatchEvent(
+      new MessageEvent("message", {
+        data: new TextEncoder().encode(JSON.stringify({ timestamp: start, message: "binary" })).buffer,
+      }),
+    );
+    socket.dispatchEvent(Object.assign(new Event("close"), { code: 1011, reason: "service restart" }));
+  });
+  await assert.rejects(
+    async () => d.backend.logs("core", { follow: true, tail: 101 }),
+    /closed \(1011\): service restart/,
+  );
+  const ordered = [...entries.slice(1, 51), entries[0]!, ...entries.slice(51)];
+  assert.deepEqual(
+    lines.slice(0, 101),
+    ordered.map((entry) => `${entry.timestamp} ${entry.message}`),
+  );
+  assert.ok(lines[101]!.endsWith(" live"));
+  assert.ok(lines[102]!.endsWith(" binary"));
+  assert.equal(lines.length, 103);
+  assert.deepEqual(
+    requests.map((url) => url.searchParams.get("limit")),
+    ["100", "1"],
+  );
+  assert.equal(socket.close.mock.callCount(), 1);
+});
+
 test("Render layer transport rejects missing or invalid core URLs before sending a request", async (t) => {
   const d = deployment(t);
   let requests = 0;
@@ -1388,6 +1462,37 @@ test("Render rollback can rebuild a release after its provider deploy record is 
   );
   assert.equal(d.saved().rollbackProgress, undefined);
   assert.equal(c.deploys.get("srv-acme-web-ui")!.commit!.id, first.commit);
+});
+
+test("Render rollback retains ten releases and can replace an incomplete target", async (t) => {
+  const d = deployment(t);
+  const c = cloud(t, d);
+  for (let index = 0; index < 12; index++) {
+    d.setCommit(index.toString(16).repeat(40).slice(0, 40));
+    await d.backend.up({ dryRun: false });
+  }
+  const labels = d.saved().releases.map((release: { label: string }) => release.label);
+  assert.deepEqual(labels, ["r12", "r11", "r10", "r9", "r8", "r7", "r6", "r5", "r4", "r3"]);
+  const lines: string[] = [];
+  const log = t.mock.method(console, "log", (message: string) => void lines.push(String(message)));
+  await d.backend.status();
+  log.mock.restore();
+  assert.ok(
+    lines.some((line) => /^release r12 \(bbbbbbb, .*\) latest$/.test(line)),
+    lines.join("\n"),
+  );
+  assert.equal(lines.filter((line) => line.startsWith("release r")).length, 10);
+  c.intercept = ({ path, method }) =>
+    path === "/services/srv-acme-web-ui/deploys" && method === "POST" ? new Response(null, { status: 500 }) : undefined;
+  await assert.rejects(async () => d.backend.rollback("r5"), /HTTP 500/);
+  assert.equal(d.saved().rollbackProgress.label, "r5");
+  c.intercept = undefined;
+  await d.backend.rollback("r4");
+  assert.equal(d.saved().rollbackProgress, undefined);
+  assert.equal(d.saved().releases[0].label, "r13");
+  assert.equal(d.saved().releases[0].commit, "3".repeat(40));
+  assert.equal(c.deploys.get("srv-acme-core")!.commit!.id, "3".repeat(40));
+  assert.equal(c.deploys.get("srv-acme-web-ui")!.commit!.id, "3".repeat(40));
 });
 
 test("Render branch resolution keeps Git diagnostics before cloud changes", async (t) => {

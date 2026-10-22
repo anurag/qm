@@ -17,12 +17,14 @@ import {
   RenderApiError,
   renderClient,
   requestArray,
+  streamRenderLogs,
+  type RenderLog,
   type RenderRequest,
   type RenderService,
   type ServiceType,
 } from "../render-api.ts";
 
-import { bindUrl, httpsOrigin, publicUrl, renderInternalUrl } from "../render-domains.ts";
+import { bindUrl, customDomains, httpsOrigin, publicUrl, renderInternalUrl } from "../render-domains.ts";
 
 import {
   renderMinioEnv,
@@ -42,6 +44,7 @@ import {
 import {
   coordinates,
   createResource,
+  describeRelease,
   locked,
   readState,
   recordRelease,
@@ -59,7 +62,7 @@ import {
   runtimeSecretNames,
 } from "../secrets.ts";
 
-import { runnableServices, serviceDef } from "../services.ts";
+import { runnableServices, serviceDef, serviceHost } from "../services.ts";
 
 import { capture, deploymentSecretValue, isInvalidSecret, sleep } from "../util.ts";
 
@@ -637,7 +640,7 @@ export function renderConfigErrors(
   return errors;
 }
 
-export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "down" | "rollback"> {
+export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "status" | "logs" | "down" | "rollback"> {
   return {
     up: async (opts) => {
       const desired = workloads(ctx);
@@ -838,6 +841,80 @@ export function createRenderBackend(ctx: DeployContext): Pick<Backend, "up" | "d
         note(`QM: ${urls.publicUrl}`);
         note(`Core API: ${urls.apiUrl}`);
       });
+    },
+    status: async () => {
+      const request = api(ctx);
+      const state = readState(ctx);
+      const bound = await inventory(ctx, request, state, state.pendingPurge);
+      note(
+        `project: ${state.projectId}, production: ${state.environmentId}${state.pendingPurge ? " (cleanup pending)" : ""}`,
+      );
+      if (bound.postgres) note(`postgres: ${bound.postgres.status} (${bound.postgres.id})`);
+      for (const [name, service] of bound.services) {
+        const recent = await latestDeploy(request, service);
+        note(
+          `${name}: ${service.suspended}, ${recent?.status ?? "no deploy"} (${service.id})${service.serviceDetails.url ? ` ${service.serviceDetails.url}` : ""}`,
+        );
+      }
+      for (const service of bound.services.values()) {
+        if (service.type !== "web_service" || service.serviceDetails.disk) continue;
+        for (const domain of await customDomains(request, service))
+          note(`${service.name}: custom domain ${domain.name} ${domain.verificationStatus}`);
+      }
+      for (const [index, release] of (state.releases ?? []).entries())
+        note(`release ${describeRelease(release)}${index === 0 ? " latest" : ""}`);
+    },
+    logs: async (service, opts) => {
+      const request = api(ctx);
+      const state = readState(ctx);
+      const bound = await inventory(ctx, request, state);
+      const host = service ? serviceHost(service) : undefined;
+      const ids = host
+        ? [bound.services.get(host)?.id].filter((id): id is string => Boolean(id))
+        : [...bound.services.values()].map((item) => item.id);
+      if (!ids.length) throw new CliError(`No Render service exists${host ? ` for ${host}` : ""}`);
+      const startTime = new Date().toISOString();
+      const entries: RenderLog[] = [];
+      const count = opts.tail ?? 100;
+      const query = new URLSearchParams({
+        ownerId: state.workspaceId,
+        direction: "backward",
+        endTime: startTime,
+      });
+      for (const id of ids) query.append("resource", id);
+      while (entries.length < count) {
+        query.set("limit", String(Math.min(count - entries.length, 100)));
+        const result = await request<{
+          logs: RenderLog[];
+          hasMore: boolean;
+          nextStartTime: string;
+          nextEndTime: string;
+        }>(`/logs?${query}`);
+        entries.push(...result.logs);
+        if (!result.hasMore || entries.length >= count) break;
+        if (
+          !result.nextStartTime ||
+          !result.nextEndTime ||
+          (result.nextStartTime === query.get("startTime") && result.nextEndTime === query.get("endTime"))
+        )
+          throw new CliError("Render log pagination did not advance");
+        query.set("startTime", result.nextStartTime);
+        query.set("endTime", result.nextEndTime);
+      }
+      entries.sort(
+        (a, b) =>
+          Date.parse(a.timestamp) - Date.parse(b.timestamp) ||
+          a.timestamp.slice(20, -1).padEnd(9, "0").localeCompare(b.timestamp.slice(20, -1).padEnd(9, "0")),
+      );
+      const printLog = (log: RenderLog): void => note(`${log.timestamp} ${log.message}`);
+      for (const log of entries) printLog(log);
+      if (opts.follow) {
+        query.delete("limit");
+        query.delete("endTime");
+        query.set("direction", "forward");
+        query.set("startTime", startTime);
+        await streamRenderLogs(apiKey(ctx), query, printLog);
+      }
     },
     down: async (opts) =>
       locked(ctx, async () => {

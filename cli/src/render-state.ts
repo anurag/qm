@@ -57,7 +57,7 @@ export function recordRelease(state: State, commit: string, services: Record<str
   return release;
 }
 
-function describeRelease(release: Release): string {
+export function describeRelease(release: Release): string {
   return `${release.label} (${release.commit.slice(0, 7)}, ${release.createdAt})`;
 }
 
