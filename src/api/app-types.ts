@@ -633,6 +633,10 @@ export interface App {
   attachScope(input: { scopeId: ScopeId; environmentId: string; actorId: string }): Promise<void>;
 }
 
+interface DeploymentGitPrincipals {
+  authorizes(deployment: Deployment, principalId: string, permission: "read" | "write"): Promise<boolean | undefined>;
+}
+
 export interface AppDeps {
   externalSlackPolicies?: ExternalSlackPolicies;
   admittedWork?: AdmittedWork;
@@ -681,6 +685,7 @@ export interface AppDeps {
   projects?: ProjectStore;
   deploy: DeployService;
   deployAppsDomain?: string;
+  deploymentGitPrincipals?: DeploymentGitPrincipals;
   deploymentLayer?: DeploymentLayerRuntime;
   files: FileArtifactStore;
   approvals?: DurableMap<PendingApprovalRecord>;
