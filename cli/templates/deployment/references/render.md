@@ -28,6 +28,8 @@ Set these keys in `qm.config.jsonc`:
   `--upgrade-minio` is set. Automatic deploys are off so `qm up` controls the
   update order.
 - `render.region`: the region for the core services, Postgres, and MinIO.
+  Render creates each sandbox in the default sandbox group of the workspace, so
+  this setting does not place sandboxes.
   `render.appRegion` optionally selects the region for new published apps; it
   defaults to `render.region`, and each app keeps the region selected at
   creation.
@@ -128,9 +130,11 @@ branch advances. Use the flag again to select another version. The persistent
 disk remains attached, but deployment can briefly stop storage access.
 
 `rollback` restores the previous successful service builds, retains the current
-operator environment values, and does not reverse database migrations. The CLI
-retains every release in `render.resources.json`; `qm status` lists
-them. `down` suspends the services; Postgres and the MinIO disk keep running and
+operator environment values, and does not reverse database migrations. A
+release that needs a setting which the current configuration no longer provides
+can fail to start; Render keeps the previous instance serving, and `rollback
+--to` selects another release. The CLI retains every release in
+`render.resources.json`; `qm status` lists them. `down` suspends the services; Postgres and the MinIO disk keep running and
 continue to incur charges. Archive published apps before stopping their parent
 deployment. `down --purge` deletes the recorded QM services, Postgres, and MinIO
 disk and stored objects, including app SQLite backups. Before purge, back up
