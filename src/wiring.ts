@@ -9,6 +9,9 @@ import { createPostgresDecisionStore, type DecisionStore } from "./decisions/sto
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
 import { availableRuntimeError } from "./api/runtime-config.ts";
 import { createApprovalStore } from "./core/approval-store.ts";
+import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/render-deploy-provider.ts";
+import { createRenderDeployArtifacts, type StoredRenderDeployCredential } from "./deploy/render-deploy-artifacts.ts";
+import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/render-app-storage.ts";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createRenderWorkspaceStore } from "./workspace/render-workspace-store.ts";
 import {
@@ -1742,6 +1745,53 @@ export function buildApp(
         : {}),
     },
   });
+  const renderDeployBodies = artifactMap<StoredRenderDeploy>("render_deploy_bodies");
+  const renderArtifacts =
+    config.deployProvider === "render"
+      ? createRenderDeployArtifacts({
+          baseUrl: config.apiBaseUrl ?? "",
+          signingSecret: config.signingSecret ?? "",
+          store: artifactMap<StoredRenderDeployCredential>("render_deploy_credentials"),
+          deployStore,
+        })
+      : undefined;
+  const buildRenderDeploy = (): DeployProvider => {
+    const render = config.renderDeploy;
+    if (
+      !config.databaseUrl ||
+      !pgArtifactMap ||
+      !config.s3Bucket ||
+      !config.s3Endpoint ||
+      !render.source ||
+      !render.environmentId ||
+      !renderArtifacts ||
+      !config.connectorSecretKey
+    )
+      throw new Error(
+        "Render app deployment requires the QM database, storage, Git source, environment, and credential keys",
+      );
+    const storage = createRenderAppStorage({
+      apiKey: render.apiKey,
+      workspaceId: render.workspaceId,
+      environmentId: render.environmentId,
+      minioServiceId: render.minioServiceId,
+      endpoint: config.s3Endpoint,
+      bucket: config.s3Bucket,
+      prefix: config.s3Prefix,
+      region: config.s3Region,
+      store: artifactMap<StoredRenderAppStorage>("render_app_storage"),
+      keyMaterial: config.connectorSecretKey,
+    });
+    return createRenderDeployProvider({
+      ...render,
+      source: render.source,
+      environmentId: render.environmentId,
+      store: renderDeployBodies,
+      artifacts: renderArtifacts,
+      advisoryLock,
+      resources: storage,
+    });
+  };
   const buildAwsDeploy = (): DeployProvider =>
     createAwsDeployProvider({
       ...config.awsDeploy,
@@ -1764,6 +1814,7 @@ export function buildApp(
       : undefined;
   const buildDeployProvider: Record<Config["deployProvider"], () => DeployProvider> = {
     aws: buildAwsDeploy,
+    render: buildRenderDeploy,
     docker: () => createDockerDeployProvider({ onError: sandboxOnError }),
     fly: () =>
       createFlyDeployProvider({
@@ -2343,6 +2394,7 @@ export function buildApp(
     environments,
     deploy: deployService,
     deployAppsDomain: config.awsDeploy.appsDomain,
+    ...(renderArtifacts ? { deploymentGitPrincipals: renderArtifacts } : {}),
     deploymentLayer,
     ...(processes ? { processes } : {}),
     monitors,

@@ -1015,6 +1015,35 @@ test("a subscription-only company ChatGPT deployment defaults pi to the plain Co
   assert.equal(configuredModelForHarness(base, "pi"), undefined);
 });
 
+test("Render app region defaults to the core region and accepts a separate creation region", () => {
+  assert.equal(loadConfig({}).renderDeploy.appRegion, "oregon");
+  assert.equal(loadConfig({ RENDER_REGION: "ohio" }).renderDeploy.appRegion, "ohio");
+  const config = loadConfig({ RENDER_REGION: "oregon", RENDER_APP_REGION: " virginia " });
+  assert.equal(config.renderDeploy.region, "oregon");
+  assert.equal(config.renderDeploy.appRegion, "virginia");
+});
+
+test("Render app publishing needs a complete source, project, and environment", () => {
+  const env = {
+    DEPLOY_PROVIDER: "render",
+    RENDER_API_KEY: "rnd_key",
+    RENDER_WORKSPACE_ID: "tea-test",
+    RENDER_DEPLOY_REPO: "https://github.com/acme/qm.git",
+    RENDER_DEPLOY_BRANCH: "main",
+    RENDER_MINIO_SERVICE_ID: "srv-minio",
+    RENDER_PROJECT_ID: "prj-test",
+    RENDER_ENVIRONMENT_ID: "evm-test",
+    GIT_SHA: "a".repeat(40),
+  };
+  const source = loadConfig(env).renderDeploy.source;
+  assert.deepEqual(source, { repo: "https://github.com/acme/qm", branch: "main", commit: "a".repeat(40) });
+  assert.throws(
+    () => loadConfig({ ...env, GIT_SHA: "main" }),
+    /requires RENDER_DEPLOY_REPO, RENDER_DEPLOY_BRANCH, and GIT_SHA/,
+  );
+  assert.throws(() => loadConfig({ ...env, RENDER_ENVIRONMENT_ID: "" }), /requires RENDER_ENVIRONMENT_ID/);
+});
+
 test("The Render sandbox backend needs the Postgres workspace store", () => {
   const env = { SANDBOX_BACKEND: "render", RENDER_API_KEY: "rnd_key", RENDER_WORKSPACE_ID: "tea-test" };
   assert.throws(() => loadConfig(env), /SANDBOX_BACKEND=render requires WORKSPACE_STORE=postgres/);

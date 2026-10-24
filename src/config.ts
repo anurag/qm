@@ -1,10 +1,12 @@
 import { codexAuthFileForEnv, loadCodexAuthFile } from "./model/chatgpt-auth-file.ts";
+import { githubRepoUrl, isGitBranchName } from "../cli/src/render-source.ts";
 import { RENDER_SANDBOX_TTL_SEC } from "./sandbox/render-client.ts";
 import {
   deploymentBrokerCredentialsFromEnv,
   type DeploymentBrokerCredential,
 } from "./credentials/deployment-credentials.ts";
 import { errMessage } from "./util/errors.ts";
+import { commitShaSchema } from "./util/ids.ts";
 import type { ExternalSlackPolicies } from "./resolution/external-slack.ts";
 import { isBearerSecret, isStrongSigningSecret } from "./auth/source-auth.ts";
 import { parseSandboxCapabilityTtlMs } from "./auth/capability-token.ts";
@@ -76,7 +78,7 @@ export interface Config {
   legacySandboxScopeDefaults?: LegacySandboxScopeDefaults;
   sandboxBackend: SandboxBackendName;
   sandboxSecondaryBackend?: SandboxBackendName;
-  deployProvider: "docker" | "aws" | "fly" | "porter" | "e2b";
+  deployProvider: "docker" | "aws" | "fly" | "porter" | "e2b" | "render";
   egressServiceHosts?: string[];
   brandingDefault?: OrgBranding;
   modelId?: string;
@@ -203,6 +205,7 @@ export interface Config {
   modalSandbox: ModalSandboxEnv;
   porterSandbox: PorterSandboxEnv;
   renderSandbox: RenderSandboxEnv;
+  renderDeploy: RenderDeployEnv;
   porterDeploy: PorterDeployEnv;
   awsDeploy: AwsDeployEnv;
   deployAppsDomain?: string;
@@ -441,6 +444,59 @@ function renderSandboxEnv(env: NodeJS.ProcessEnv): RenderSandboxEnv {
     ...(env.RENDER_API_KEY?.trim() ? { apiKey: env.RENDER_API_KEY.trim() } : {}),
     ...(env.RENDER_WORKSPACE_ID?.trim() ? { workspaceId: env.RENDER_WORKSPACE_ID.trim() } : {}),
     ...(defaultTimeoutSec !== undefined ? { defaultTimeoutSec } : {}),
+  };
+}
+
+function renderRegion(env: NodeJS.ProcessEnv): string {
+  return env.RENDER_REGION?.trim() || "oregon";
+}
+
+interface RenderDeployEnv {
+  projectId: string;
+  environmentId?: string;
+  apiKey: string;
+  workspaceId: string;
+  minioServiceId: string;
+  source?: { repo: string; branch: string; commit: string };
+  region: string;
+  appRegion: string;
+}
+
+function renderDeployEnv(env: NodeJS.ProcessEnv): RenderDeployEnv {
+  const rawRepo = env.RENDER_DEPLOY_REPO?.trim();
+  const repo = rawRepo ? githubRepoUrl(rawRepo) : undefined;
+  const branch = env.RENDER_DEPLOY_BRANCH?.trim();
+  const commit = env.GIT_SHA?.trim();
+  const minioServiceId = env.RENDER_MINIO_SERVICE_ID?.trim() || "";
+  if (Boolean(rawRepo) !== Boolean(branch))
+    throw new Error("RENDER_DEPLOY_REPO and RENDER_DEPLOY_BRANCH must be set together");
+  if (rawRepo && !repo)
+    throw new Error("RENDER_DEPLOY_REPO must be an HTTPS GitHub repository URL without credentials");
+  if (branch && !isGitBranchName(branch)) throw new Error("RENDER_DEPLOY_BRANCH must be a valid Git branch name");
+  if (env.DEPLOY_PROVIDER === "render" && (!repo || !branch || !commitShaSchema.safeParse(commit).success))
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_DEPLOY_REPO, RENDER_DEPLOY_BRANCH, and GIT_SHA");
+  if (env.DEPLOY_PROVIDER === "render" && !/^srv-[a-z0-9]+$/.test(minioServiceId))
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_MINIO_SERVICE_ID");
+  const projectId = env.RENDER_PROJECT_ID?.trim() || "";
+  if (env.DEPLOY_PROVIDER === "render" && !projectId)
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_PROJECT_ID");
+  if (projectId && !/^prj-[a-z0-9]+$/.test(projectId))
+    throw new Error("RENDER_PROJECT_ID must be a project ID (prj-...)");
+  const environmentId = env.RENDER_ENVIRONMENT_ID?.trim();
+  if (env.DEPLOY_PROVIDER === "render" && !environmentId)
+    throw new Error("DEPLOY_PROVIDER=render requires RENDER_ENVIRONMENT_ID");
+  if (environmentId && !/^evm-[a-z0-9]+$/.test(environmentId))
+    throw new Error("RENDER_ENVIRONMENT_ID must be an environment ID (evm-...)");
+  const region = renderRegion(env);
+  return {
+    projectId,
+    ...(environmentId ? { environmentId } : {}),
+    apiKey: env.RENDER_API_KEY?.trim() || "",
+    workspaceId: env.RENDER_WORKSPACE_ID?.trim() || "",
+    minioServiceId,
+    ...(repo && branch && commit ? { source: { repo, branch, commit } } : {}),
+    region,
+    appRegion: env.RENDER_APP_REGION?.trim() || region,
   };
 }
 
@@ -1459,10 +1515,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     deployProvider !== "docker" &&
     deployProvider !== "fly" &&
     deployProvider !== "porter" &&
-    deployProvider !== "e2b"
+    deployProvider !== "e2b" &&
+    deployProvider !== "render"
   ) {
     throw new Error(
-      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, porter, or e2b)`,
+      `DEPLOY_PROVIDER=${JSON.stringify(deployProvider)} is not recognized (expected aws, docker, fly, porter, e2b, or render)`,
     );
   }
   const providerBaseUrls = providerBaseUrlsFromEnv(env);
@@ -1718,6 +1775,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     superserveSandbox: superserveSandboxEnv(env),
     porterSandbox: porterSandboxEnv(env),
     renderSandbox: renderSandboxEnv(env),
+    renderDeploy: renderDeployEnv(env),
     porterDeploy: porterDeployEnv(env),
     e2bSandbox: e2bSandboxEnv(env),
     managedAgentsSandbox: managedAgentsSandboxEnv(env),
