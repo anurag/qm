@@ -1,7 +1,7 @@
 import { serviceHost, type DeclaredServiceName } from "./services.ts";
 import { effectiveModelProvider, type ModelProvider, type QmConfig } from "./config.ts";
 import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
-import { deploymentSecretValue } from "./util.ts";
+import { deploymentSecretValue, isInvalidSecret } from "./util.ts";
 
 type SecretCondition =
   | { kind: "background-work-control" }
@@ -35,6 +35,15 @@ export interface ComputedSecret {
   generate?: string;
   managedBy: "operator" | "terraform";
   aliases?: Array<{ service: DeclaredServiceName; name: string }>;
+}
+
+export function missingRequiredSecrets(
+  secrets: readonly ComputedSecret[],
+  valueFor: (name: string) => string | undefined,
+): string[] {
+  return secrets
+    .filter((secret) => secret.required && isInvalidSecret(secret.name, valueFor(secret.name)))
+    .map((secret) => secret.name);
 }
 
 export const MINT_LOCALLY = "openssl rand -hex 32";
