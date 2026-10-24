@@ -1,18 +1,13 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-
 import { appPrefixOf, renderPlanId, updateConfigUrls, type QmConfig } from "../config.ts";
-
 import {
   deploymentLayerRequest,
   httpDeploymentLayerTransport,
   syncDeploymentLayer,
   type DeploymentLayerTransport,
 } from "../deployment-layer.ts";
-
 import { CliError, errMessage, note, ok, step } from "../log.ts";
-
 import type { ResolvedPlugin } from "../plugins.ts";
-
 import {
   list,
   RenderApiError,
@@ -24,16 +19,13 @@ import {
   type RenderService,
   type ServiceType,
 } from "../render-api.ts";
-
 import { bindUrl, customDomains, httpsOrigin, publicUrl, renderInternalUrl, verifiedUrl } from "../render-domains.ts";
-
 import {
   renderMinioEnv,
   renderMinioInitCommand,
   renderMinioSecretNames,
   renderMinioWorkload,
 } from "../render-minio.ts";
-
 import {
   renderManagedCoreEnv,
   renderServiceEnv,
@@ -41,7 +33,6 @@ import {
   renderWorkloads,
   type RenderWorkload,
 } from "../render-services.ts";
-
 import {
   coordinates,
   createResource,
@@ -55,7 +46,6 @@ import {
   statePath,
   type State,
 } from "../render-state.ts";
-
 import {
   computedSecrets,
   FIRST_PARTY_SECRET_SPECS,
@@ -65,13 +55,9 @@ import {
 } from "../secrets.ts";
 import { githubRepoUrl } from "../render-source.ts";
 import { runnableServices, serviceDef, serviceHost } from "../services.ts";
-
 import { capture, deploymentSecretValue, isInvalidSecret, sleep } from "../util.ts";
-
 import { doctorCommon, localDoctorSecrets } from "./doctor.ts";
-
 import type { DeployContext } from "./registry.ts";
-
 import type { Backend } from "./types.ts";
 
 function layerTransport(originOf: (config: QmConfig) => string): DeploymentLayerTransport {
@@ -80,7 +66,6 @@ function layerTransport(originOf: (config: QmConfig) => string): DeploymentLayer
     urlOf: (config) => new URL("/v1/deployment-layer", originOf(config)),
   });
 }
-
 export const renderDeploymentLayerTransport = layerTransport((config) => {
   if (!config.apiUrl) throw new CliError("Render requires apiUrl; qm init --target render sets it");
   const origin = httpsOrigin(config.apiUrl);
@@ -99,36 +84,29 @@ interface RenderPostgres {
   plan: string;
   diskSizeGB: number;
 }
-
 interface RenderJob {
   id: string;
   serviceId: string;
   status: "pending" | "running" | "succeeded" | "failed" | "canceled";
 }
-
 interface RenderDeploy {
   id: string;
   status: string;
   commit?: { id: string };
 }
-
 const bootstrapCommand = "/bin/sh -c exit 0";
-
 const failedDeployStatuses = ["build_failed", "update_failed", "pre_deploy_failed", "canceled", "deactivated"];
-
 interface Project {
   id: string;
   name: string;
   owner: { id: string };
   environmentIds: string[];
 }
-
 interface Environment {
   id: string;
   name: string;
   projectId: string;
 }
-
 function credentialValues(ctx: DeployContext, envFile = ctx.envFile): Map<string, string> {
   const values = localDoctorSecrets(ctx.configDir, envFile);
   for (const secret of computedSecrets(ctx.config)) {
@@ -141,17 +119,14 @@ function credentialValues(ctx: DeployContext, envFile = ctx.envFile): Map<string
   }
   return values;
 }
-
 function apiKey(ctx: DeployContext, envFile?: string): string {
   const key = credentialValues(ctx, envFile ?? ctx.envFile).get("RENDER_API_KEY");
   if (!key || isInvalidSecret("RENDER_API_KEY", key)) throw new CliError("RENDER_API_KEY is required; run qm setup");
   return key;
 }
-
 function api(ctx: DeployContext, envFile?: string): RenderRequest {
   return renderClient(apiKey(ctx, envFile));
 }
-
 function requireSecrets(ctx: DeployContext, values: ReadonlyMap<string, string>): void {
   const missing = missingRequiredSecrets(
     computedSecrets(ctx.config).filter((secret) => secret.managedBy === "operator"),
@@ -160,7 +135,6 @@ function requireSecrets(ctx: DeployContext, values: ReadonlyMap<string, string>)
   if (missing.length) throw new CliError(`Required secrets are missing: ${missing.join(", ")}; run qm setup`);
   step("required operator secret values: ok");
 }
-
 async function envVars(request: RenderRequest, id: string): Promise<Record<string, string>> {
   return Object.fromEntries(
     (await list<{ key: string; value: string }>(request, `/services/${id}/env-vars`, "envVar")).map((item) => [
@@ -169,17 +143,14 @@ async function envVars(request: RenderRequest, id: string): Promise<Record<strin
     ]),
   );
 }
-
 function pairs(values: Record<string, string>): Array<{ key: string; value: string }> {
   return Object.entries(values)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, value]) => ({ key, value }));
 }
-
 function same(a: Record<string, string>, b: Record<string, string>): boolean {
   return JSON.stringify(pairs(a)) === JSON.stringify(pairs(b));
 }
-
 function workloads(ctx: DeployContext): RenderWorkload[] {
   const render = coordinates(ctx.config);
   const out: RenderWorkload[] = [renderMinioWorkload(render)];
@@ -196,7 +167,6 @@ function workloads(ctx: DeployContext): RenderWorkload[] {
   }
   return out;
 }
-
 async function inventory(ctx: DeployContext, request: RenderRequest, state: State, missing = false) {
   const desired = workloads(ctx);
   let project: Project | undefined;
@@ -265,7 +235,6 @@ async function inventory(ctx: DeployContext, request: RenderRequest, state: Stat
   }
   return { services, postgres, environmentIds: project?.environmentIds ?? [] };
 }
-
 async function assertAvailable(
   request: RenderRequest,
   path: string,
@@ -298,11 +267,9 @@ async function poll(
     await sleep(3_000);
   }
 }
-
 async function latestDeploy(request: RenderRequest, service: RenderService): Promise<RenderDeploy | undefined> {
   return (await requestArray<{ deploy: RenderDeploy }>(request, `/services/${service.id}/deploys?limit=1`))[0]?.deploy;
 }
-
 async function waitDeploy(
   request: RenderRequest,
   service: RenderService,
@@ -334,7 +301,6 @@ async function waitDeploy(
   );
   ok(`${service.name}: live`);
 }
-
 async function prepareBootstrap(
   request: RenderRequest,
   workload: RenderWorkload,
@@ -347,7 +313,6 @@ async function prepareBootstrap(
   await poll(`${service.name} resume`, async () => (await latestDeploy(request, service))?.id !== before);
   return request<RenderService>(`/services/${service.id}`);
 }
-
 async function deploy(request: RenderRequest, service: RenderService, commit: string): Promise<void> {
   if (service.suspended === "suspended") throw new CliError(`${service.name} must be resumed before deployment`);
   const history = await list<RenderDeploy>(request, `/services/${service.id}/deploys`, "deploy");
@@ -411,7 +376,6 @@ async function runJob(
     throw new CliError(`Render ${label} job ${job.id} ${message}. Read its logs: GET /v1/logs?${logs}`);
   }
 }
-
 async function liveSession(
   request: RenderRequest,
   core: RenderService,
@@ -427,7 +391,6 @@ async function liveSession(
     report,
   );
 }
-
 async function provision(
   ctx: DeployContext,
   request: RenderRequest,
@@ -492,13 +455,11 @@ async function provision(
   );
   return postgres;
 }
-
 interface Connections {
   databaseUrl: string;
   commit: string;
   storage?: { endpoint: string; secretKey: string };
 }
-
 function serviceEnv(
   ctx: DeployContext,
   workload: RenderWorkload,
@@ -537,7 +498,6 @@ function serviceEnv(
     workload.plugin,
   );
 }
-
 function serviceSpec(workload: RenderWorkload, dockerCommand = workload.command ?? "") {
   return {
     autoDeploy: "no",
@@ -602,7 +562,6 @@ async function reconcileService(
   }
   return changed;
 }
-
 export function renderConfigErrors(
   config: QmConfig,
   plugins: readonly ResolvedPlugin[],

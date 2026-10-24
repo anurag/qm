@@ -14,7 +14,7 @@ type SecretCondition =
   | { kind: "service-absent"; service: DeclaredServiceName }
   | { kind: "all"; conditions: SecretCondition[] }
   | { kind: "any"; conditions: SecretCondition[] }
-  | { kind: "target"; target: QmConfig["target"] | "render" }
+  | { kind: "target"; target: QmConfig["target"] }
   | { kind: "model-provider"; provider: ModelProvider };
 
 export interface SecretSpec {
@@ -24,12 +24,12 @@ export interface SecretSpec {
   required: boolean | { when: SecretCondition; optional?: true; optionalOtherwise?: true };
   description: string;
   generate?: string;
-  managedBy?: ManagedBy | Partial<Record<(QmConfig["target"] | "render") | "default", ManagedBy>>;
+  managedBy?: ManagedBy | Partial<Record<QmConfig["target"] | "default", ManagedBy>>;
 }
 
 type ManagedBy = "operator" | "terraform" | "render";
 
-export function managedByFor(spec: SecretSpec, target: QmConfig["target"] | "render"): ManagedBy {
+export function managedByFor(spec: SecretSpec, target: QmConfig["target"]): ManagedBy {
   if (typeof spec.managedBy === "string") return spec.managedBy;
   return spec.managedBy?.[target] ?? spec.managedBy?.default ?? "operator";
 }

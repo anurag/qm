@@ -25,7 +25,7 @@ export interface ProviderScaffold {
 }
 
 interface ConfigValues {
-  target: Target | "render";
+  target: Target;
   modelProvider: ModelProvider;
   publicUrl: string;
   providerFields: string;
@@ -392,9 +392,10 @@ administrator credentials.
 
 Apps build from an immutable QM Git commit. Keep dependency installation in the
 entrypoint when the app needs packages. Update an app by its existing name.
-Archive suspends the service and disables its credentials; restore reuses the
-retained disk, object prefix, and service. Verify a record and an object
-after create, update, rollback, and archive or restore.
+Archive suspends the service and revokes its source access. Restore resumes the
+same service with new source access, repaired storage access, its retained disk,
+and its object prefix.
+Verify a record and an object after create, update, rollback, and archive or restore.
 
 The agent executes in native Render Sandboxes. Save useful workspace changes
 before an operation that replaces a sandbox. Sandboxes are workspace resources;

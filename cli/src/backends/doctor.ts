@@ -147,6 +147,8 @@ export async function doctorCommon(
 ): Promise<void> {
   if (localSandboxActive(config)) {
     step("local Docker sandbox: configured");
+  } else if (config.target === "render") {
+    step("Render sandbox: configured");
   } else if (config.target === "aws") {
     step("AWS Lambda MicroVM sandbox: configured");
   } else if (config.sandbox) {
