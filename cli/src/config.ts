@@ -1,6 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
+
 import { isAbsolute, resolve } from "node:path";
+
 import { CliError, die, errMessage, warn } from "./log.ts";
+
 import {
   AUTH_BROKER_ENV_KEYS,
   SERVICE_NAMES,
@@ -13,6 +16,7 @@ import {
   type DeclaredServiceName,
   type ServiceName,
 } from "./services.ts";
+
 import {
   hostingProviderChoices,
   isSandboxBackendId,
@@ -23,6 +27,7 @@ import {
   SANDBOX_BACKENDS,
   targetsAllowingSandboxBackend,
 } from "./providers.ts";
+import { githubRepoUrl, isGitBranchName } from "./render-source.ts";
 import { TARGET_ENV_DEFAULTS } from "./target-env-defaults.ts";
 import { envNum, isEnvVarName, isMissingOrPlaceholder } from "./util.ts";
 
@@ -82,6 +87,18 @@ export interface AwsServiceConfig {
   stopTimeout?: number;
 }
 
+export interface RenderConfig {
+  source: { repo: string; branch: string };
+  storage: { plan: string; diskSizeGB: number };
+  workspaceId: string;
+  region: "oregon" | "ohio" | "virginia" | "frankfurt" | "singapore";
+  appRegion?: RenderConfig["region"];
+  corePlan: string;
+  servicePlan: string;
+  postgresPlan: string;
+  postgresDiskSizeGB: number;
+}
+
 export interface AwsConfig {
   deploymentState?: { table: string; namespace: string };
   accountId: string;
@@ -121,6 +138,7 @@ export function awsWorkloadArchitecture(config: QmConfig, workload: string): "ar
 }
 
 export const MODEL_PROVIDERS = ["anthropic", "openai", "openrouter"] as const;
+
 export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
 export const MODEL_PROVIDER_KEYS: Readonly<Record<ModelProvider, string>> = {
@@ -139,6 +157,7 @@ export const isModelProvider = (value: unknown): value is ModelProvider =>
   typeof value === "string" && (MODEL_PROVIDERS as readonly string[]).includes(value);
 
 export const EMAIL_TRANSPORTS = ["resend", "smtp"] as const;
+
 export type EmailTransport = (typeof EMAIL_TRANSPORTS)[number];
 
 export const isEmailTransport = (value: unknown): value is EmailTransport =>
@@ -170,6 +189,7 @@ export interface QmConfig {
   imageFrom?: string;
   deployAppPrefix?: string;
   aws?: AwsConfig;
+  render?: RenderConfig;
 }
 
 export function securityScreenEnv(config: Pick<QmConfig, "securityScreen">): Record<string, string> {
@@ -289,7 +309,7 @@ function stripTrailingCommas(text: string): string {
   return out;
 }
 
-const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
+export const parseConfigJson = (text: string): unknown => JSON.parse(stripTrailingCommas(stripJsonComments(text)));
 
 const skipWs = (s: string, i: number): number => {
   while (i < s.length && /\s/.test(s[i]!)) i++;
@@ -351,10 +371,23 @@ function objectProps(s: string, objStart: number): { props: PropSpan[]; openBrac
   }
 }
 
+interface ConfigEdit {
+  start: number;
+  end: number;
+  text: string;
+}
+
+function applyEdits(raw: string, edits: ConfigEdit[]): string {
+  let out = raw;
+  for (const edit of edits.sort((a, b) => b.start - a.start))
+    out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
+  return out;
+}
+
 function updateConfigStringMap(raw: string, key: string, updates: Record<string, string>): string {
   const stripped = stripJsonComments(raw);
   const root = objectProps(stripped, 0);
-  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const edits: ConfigEdit[] = [];
   const entry = ([k, v]: [string, string]): string => `${JSON.stringify(k)}: ${JSON.stringify(v)}`;
   const property = root.props.find((p) => p.key === key);
   if (property) {
@@ -375,10 +408,7 @@ function updateConfigStringMap(raw: string, key: string, updates: Record<string,
     const text = `${root.props.length ? "," : ""}\n  ${JSON.stringify(key)}: { ${body} }\n`;
     edits.push({ start: root.closeBrace, end: root.closeBrace, text });
   }
-  edits.sort((a, b) => b.start - a.start);
-  let out = raw;
-  for (const e of edits) out = out.slice(0, e.start) + e.text + out.slice(e.end);
-  return out;
+  return applyEdits(raw, edits);
 }
 
 export const updateConfigImageOverrides = (raw: string, updates: Record<string, string>): string =>
@@ -387,7 +417,7 @@ export const updateConfigImageOverrides = (raw: string, updates: Record<string, 
 export function updateConfigCoreEnv(raw: string, updates: Record<string, string>): string {
   const stripped = stripJsonComments(raw);
   const root = objectProps(stripped, 0);
-  const edits: Array<{ start: number; end: number; text: string }> = [];
+  const edits: ConfigEdit[] = [];
   const envProp = root.props.find((p) => p.key === "env");
   if (!envProp) throw new CliError('config has no top-level "env" object');
   const env = objectProps(stripped, envProp.valueStart);
@@ -408,10 +438,7 @@ export function updateConfigCoreEnv(raw: string, updates: Record<string, string>
       text: core.props.length ? ` ${body},` : ` ${body} `,
     });
   }
-  edits.sort((a, b) => b.start - a.start);
-  let out = raw;
-  for (const edit of edits) out = out.slice(0, edit.start) + edit.text + out.slice(edit.end);
-  return out;
+  return applyEdits(raw, edits);
 }
 
 export function loadConfigAt(path: string, overrides?: { target?: Target }): { config: QmConfig; path: string } {
@@ -529,6 +556,7 @@ const VALID_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
   "imageFrom",
   "deployAppPrefix",
   "aws",
+  "render",
 ]);
 
 function validate(raw: unknown, path: string): QmConfig {
@@ -780,6 +808,7 @@ function validate(raw: unknown, path: string): QmConfig {
     ];
     out.aws = validateAws(o["aws"], path, runnableServices(services), configuredSecretNames);
   }
+  if (o["render"] !== undefined) out.render = validateRender(o["render"], path);
   if (target === "aws" && !out.aws) throw new CliError(`${path}: target "aws" requires an "aws" block`);
   validateModelProvider(out, path);
   validatePortalTrust(out, path);
@@ -1492,6 +1521,93 @@ function validateAws(
   return out;
 }
 
+export function renderSource(raw: unknown, path: string): NonNullable<RenderConfig["source"]> {
+  if (!isPlainObject(raw) || Object.keys(raw).some((key) => !["repo", "branch"].includes(key)))
+    throw new CliError(`${path}: render.source must contain repo and branch`);
+  const repo = typeof raw.repo === "string" ? githubRepoUrl(raw.repo) : undefined;
+  if (!repo)
+    throw new CliError(`${path}: render.source.repo must be an HTTPS GitHub repository URL without credentials`);
+  const branch = typeof raw.branch === "string" ? raw.branch.trim() : "";
+  if (!isGitBranchName(branch)) throw new CliError(`${path}: render.source.branch must be a Git branch name`);
+  return { repo, branch };
+}
+
+const retiredRenderPlans: Record<string, string> = {
+  starter: "0.5c-512mb",
+  standard: "1c-2g",
+  pro: "2c-4g",
+  pro_plus: "4c-8g",
+  pro_max: "4c-16g",
+  pro_ultra: "8c-32g",
+};
+
+function validateRender(raw: unknown, path: string): RenderConfig {
+  if (!isPlainObject(raw)) throw new CliError(`${path}: "render" must be an object`);
+  const allowed = new Set([
+    "workspaceId",
+    "region",
+    "appRegion",
+    "corePlan",
+    "servicePlan",
+    "postgresPlan",
+    "postgresDiskSizeGB",
+    "storage",
+    "source",
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) throw new CliError(`${path}: unknown render.${key}`);
+  }
+  const storageRaw = raw.storage ?? {};
+  if (!isPlainObject(storageRaw)) throw new CliError(`${path}: render.storage must be an object`);
+  for (const key of Object.keys(storageRaw)) {
+    if (!["plan", "diskSizeGB"].includes(key)) throw new CliError(`${path}: unknown render.storage.${key}`);
+  }
+  const plan = (key: string, value: unknown, compute = true): string => {
+    if (compute && typeof value === "string" && retiredRenderPlans[value])
+      throw new CliError(
+        `${path}: render.${key} ${value} is a retired Render plan name; use ${retiredRenderPlans[value]}`,
+      );
+    if (typeof value !== "string" || !/^[a-z0-9][a-z0-9._-]*$/.test(value) || value === "free")
+      throw new CliError(`${path}: render.${key} must name a paid Render plan`);
+    return value;
+  };
+  const storagePlan = plan("storage.plan", storageRaw.plan ?? "0.5c-512mb");
+  const diskSizeGB = storageRaw.diskSizeGB ?? 10;
+  if (typeof diskSizeGB !== "number" || !Number.isInteger(diskSizeGB) || diskSizeGB < 1)
+    throw new CliError(`${path}: render.storage.diskSizeGB must be a positive integer`);
+  const storage: RenderConfig["storage"] = { plan: storagePlan, diskSizeGB };
+  const workspaceId = raw.workspaceId;
+  if (typeof workspaceId !== "string" || !/^(tea|usr)-[a-z0-9]+$/.test(workspaceId)) {
+    throw new CliError(`${path}: render.workspaceId must be a Render workspace ID (tea-... or usr-...)`);
+  }
+  const region = raw.region ?? "oregon";
+  const regions = ["oregon", "ohio", "virginia", "frankfurt", "singapore"];
+  if (typeof region !== "string" || !regions.includes(region)) {
+    throw new CliError(`${path}: render.region must be a Render region`);
+  }
+  const appRegion = raw.appRegion;
+  if (appRegion !== undefined && (typeof appRegion !== "string" || !regions.includes(appRegion)))
+    throw new CliError(`${path}: render.appRegion must be a Render region`);
+  const postgresDiskSizeGB = raw.postgresDiskSizeGB ?? 10;
+  if (typeof postgresDiskSizeGB !== "number" || !Number.isInteger(postgresDiskSizeGB) || postgresDiskSizeGB < 1) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be a positive integer`);
+  }
+  if (postgresDiskSizeGB !== 1 && postgresDiskSizeGB % 5 !== 0) {
+    throw new CliError(`${path}: render.postgresDiskSizeGB must be 1 or a multiple of 5`);
+  }
+  return {
+    source: renderSource(raw.source, path),
+    storage,
+    workspaceId,
+    region: region as RenderConfig["region"],
+    ...(appRegion === undefined ? {} : { appRegion: appRegion as RenderConfig["region"] }),
+    corePlan: plan("corePlan", raw.corePlan ?? "2c-4g"),
+    servicePlan: plan("servicePlan", raw.servicePlan ?? "0.5c-512mb"),
+    postgresPlan: plan("postgresPlan", raw.postgresPlan ?? "0.5c-1g", false),
+    postgresDiskSizeGB,
+  };
+}
+
 function validateSandbox(raw: unknown, path: string, target: Target): SandboxConfig | undefined {
   if (raw === undefined) return undefined;
   if (!isPlainObject(raw)) {
@@ -1570,7 +1686,7 @@ function validateSandbox(raw: unknown, path: string, target: Target): SandboxCon
       );
     }
   }
-  if (out.backend === "agent37" || out.backend === "superserve" || out.backend === "e2b") {
+  if (out.backend === "agent37" || out.backend === "superserve" || out.backend === "e2b" || out.backend === "render") {
     const stray = (["app", "image", "baseImage", "env", "secretEnv"] as const).filter((key) => out[key] !== undefined);
     if (stray.length) {
       throw new CliError(
