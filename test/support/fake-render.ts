@@ -9,11 +9,11 @@ import { dirname, join } from "node:path";
 import type { TestContext } from "node:test";
 import {
   RENDER_SCRIPT_DIR,
-  RENDER_SANDBOX_TTL_SEC,
   type RenderClient,
   type RenderSandboxInfo,
   type RenderSnapshot,
 } from "../../src/sandbox/render-client.ts";
+import { RENDER_SANDBOX_TTL_SEC } from "../../src/sandbox/render-limits.ts";
 import type { RenderApi } from "../../src/deploy/render-api.ts";
 import type { Deployment } from "../../src/deploy/deploy-store.ts";
 import { scopeId } from "../../src/types.ts";

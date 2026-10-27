@@ -11,9 +11,9 @@ import { randomUUID } from "node:crypto";
 import { retryOperation, withAbort } from "../util/async.ts";
 import { swallowAs } from "../util/errors.ts";
 import { shq } from "../util/shell.ts";
+import { RENDER_SANDBOX_TTL_SEC } from "./render-limits.ts";
 
 export const RENDER_SCRIPT_DIR = "/dev/.qm-run";
-export const RENDER_SANDBOX_TTL_SEC = 86400;
 const CONTROL_TIMEOUT_MS = 30_000;
 const SUBMIT_TIMEOUT_MS = 60_000;
 const TRANSFER_TIMEOUT_MS = 300_000;
@@ -188,6 +188,7 @@ export function createSdkRenderClient(opts: SdkRenderClientOptions): RenderClien
         () =>
           api.create({
             timeoutSeconds: RENDER_SANDBOX_TTL_SEC,
+            idleTimeoutSeconds: 0,
             ...(snapshotId ? { snapshotId } : {}),
           }),
         "refused",

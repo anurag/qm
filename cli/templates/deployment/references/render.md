@@ -110,6 +110,10 @@ snapshots have a provider expiry time. If the sandbox and its snapshot are no
 longer available, QM refuses an empty replacement. Keep durable work in Git or
 Files.
 
+QM creates every sandbox with Render's idle suspension disabled, so files and
+background processes stay in place between turns until the 24-hour lifetime
+ends; a suspended sandbox would otherwise be replaced from its last checkpoint.
+
 Render sandbox recovery does not require `S3_BUCKET` or `SNAPSHOT_STORE=s3`.
 The hosted stack still sets these values for durable files, tool output, app
 repositories, and shared session files.

@@ -26,12 +26,8 @@ import {
   type Sandbox,
   type SandboxHandle,
 } from "./sandbox.ts";
-import {
-  RENDER_SANDBOX_TTL_SEC,
-  type RenderClient,
-  type RenderSandboxInfo,
-  type RenderSnapshot,
-} from "./render-client.ts";
+import type { RenderClient, RenderSandboxInfo, RenderSnapshot } from "./render-client.ts";
+import { RENDER_SANDBOX_TTL_SEC } from "./render-limits.ts";
 
 interface RenderSandboxResources {
   sandboxId?: string;

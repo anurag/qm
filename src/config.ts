@@ -1,6 +1,6 @@
 import { codexAuthFileForEnv, loadCodexAuthFile } from "./model/chatgpt-auth-file.ts";
 import { githubRepoUrl, isGitBranchName } from "../cli/src/render-source.ts";
-import { RENDER_SANDBOX_TTL_SEC } from "./sandbox/render-client.ts";
+import { RENDER_SANDBOX_TTL_SEC } from "./sandbox/render-limits.ts";
 import {
   deploymentBrokerCredentialsFromEnv,
   type DeploymentBrokerCredential,
