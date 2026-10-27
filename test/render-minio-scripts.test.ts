@@ -194,14 +194,19 @@ import { execFileSync } from "node:child_process";
 import { readdir, rm, writeFile, readFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { startSqliteBackup } from "/opt/qm/sqlite.mjs";
-const start = (env = process.env) => startSqliteBackup({ dataDir: "/data", env });
-let replica = await startSqliteBackup({ dataDir: "/data", env: process.env, uid: 10001, gid: 10001 });
-process.setgid(10001);
-process.setuid(10001);
+const start = (env = process.env) => startSqliteBackup({ dataDir: "/data", env, uid: 10001, gid: 10001 });
+let replica = await start();
 const open = () => {
-  const db = new DatabaseSync("/data/app.db");
-  db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS entries (value TEXT NOT NULL)");
-  return db;
+  process.setegid(10001);
+  process.seteuid(10001);
+  try {
+    const db = new DatabaseSync("/data/app.db");
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS entries (value TEXT NOT NULL)");
+    return db;
+  } finally {
+    process.seteuid(0);
+    process.setegid(0);
+  }
 };
 const waitForBackup = async (expected) => {
   await writeFile("/tmp/restore.json", JSON.stringify({ dbs: [{ path: "/data/app.db", replicas: [{
@@ -230,6 +235,7 @@ await waitForBackup(["first"]);
 replica.assertRunning();
 const pid = Number(execFileSync("pidof", ["litestream"], { encoding: "utf8" }).trim());
 assert.ok(Number.isInteger(pid) && pid > 1);
+assert.throws(() => execFileSync("cat", ["/proc/" + pid + "/environ"], { uid: 10001, gid: 10001, stdio: "pipe" }));
 process.kill(pid, "SIGKILL");
 await replica.exited;
 assert.throws(() => replica.assertRunning(), /SIGKILL/);

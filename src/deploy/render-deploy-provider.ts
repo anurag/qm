@@ -421,7 +421,12 @@ export function createRenderDeployProvider(opts: RenderDeployProviderOptions): D
     const secretFiles = [
       {
         name: "qm-render-artifact.json",
-        content: JSON.stringify({ ...artifact, readinessNonce, runtimeEnv: appEnv(version.env, resources) }),
+        content: JSON.stringify({
+          ...artifact,
+          readinessNonce,
+          runtimeEnv: appEnv(version.env),
+          storageEnv: resources,
+        }),
       },
     ];
     await api.request("PUT", `${path(service)}/env-vars`, envVars);

@@ -71,7 +71,8 @@ core, applies registered database migrations, and uploads the deployment layer.
 Each published app gets a network-isolated environment and one persistent disk
 in the same project. Apps use SQLite at `/data/app.db`, with `DATA_DIR=/data`.
 Litestream 0.3.13 backs up this SQLite database to `S3_PREFIX + "litestream"` in MinIO,
-using the app's scoped credentials. The runner restores a missing local SQLite file
+using the app's scoped credentials. Only Litestream receives these credentials;
+the app's environment does not include them. The runner restores a missing local SQLite file
 before it starts the app. An existing local file takes precedence over backups.
 Other files under `/data` persist on the disk but have no Litestream backup.
 App updates have downtime because Render stops the old instance before the new

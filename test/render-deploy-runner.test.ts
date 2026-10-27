@@ -30,15 +30,12 @@ import { singleProcessDeps } from "./support/single-process.ts";
 
 const runner = new URL(process.env.QM_RENDER_RUNNER_MODULE ?? "../deploy/render-runner/start.mjs", import.meta.url);
 const sqliteBackupStop = mock.fn(async () => {});
-mock.module(new URL("./sqlite.mjs", runner).href, {
-  namedExports: {
-    startSqliteBackup: async () => ({
-      exited: new Promise(() => {}),
-      assertRunning() {},
-      stop: sqliteBackupStop,
-    }),
-  },
-});
+const startSqliteBackup = mock.fn(async (_options: { env: Record<string, string> }) => ({
+  exited: new Promise(() => {}),
+  assertRunning() {},
+  stop: sqliteBackupStop,
+}));
+mock.module(new URL("./sqlite.mjs", runner).href, { namedExports: { startSqliteBackup } });
 const { prepareRenderApp, runRenderApp, createRenderAppGateway } = await import(runner.href);
 const signingSecret = "render-runner-secret".repeat(3);
 
@@ -185,15 +182,21 @@ async function startApp(
     shutdownGraceMs?: number;
     readinessSweepMs?: number;
     beforeStart?: (manifestPath: string) => Promise<void>;
+    manifest?: Record<string, unknown>;
   } = {},
 ) {
-  const { beforeStart, ...runnerOptions } = options;
+  const { beforeStart, manifest: extra, ...runnerOptions } = options;
   const f = await fixture(t, appSource, entrypoint);
   const manifest = await f.artifacts.prepare(f.d, f.d.versions[0]!);
   const manifestPath = join(f.root, "artifact.json");
   await writeFile(
     manifestPath,
-    JSON.stringify({ ...manifest, readinessNonce: "n".repeat(43), runtimeEnv: { QM_TEST_MANIFEST: manifestPath } }),
+    JSON.stringify({
+      ...manifest,
+      readinessNonce: "n".repeat(43),
+      runtimeEnv: { QM_TEST_MANIFEST: manifestPath },
+      ...extra,
+    }),
   );
   await chmod(manifestPath, 0o600);
   await beforeStart?.(manifestPath);
@@ -570,6 +573,22 @@ process.on("SIGTERM", () => {
   process.emit("SIGTERM", "SIGTERM");
   assert.equal(await app.running, 143);
   assert.equal(await readFile(join(app.appDir, "cleanup.txt"), "utf8"), "complete");
+});
+
+test("Render runner gives storage credentials to backups but not to the app", { timeout: 45_000 }, async (t) => {
+  startSqliteBackup.mock.resetCalls();
+  const storageEnv = { AWS_ACCESS_KEY_ID: "storage-key", AWS_SECRET_ACCESS_KEY: "storage-secret" };
+  const app = await startApp(
+    t,
+    `require("node:http").createServer((_req, res) => res.end(JSON.stringify([process.env.AWS_ACCESS_KEY_ID, process.env.AWS_SECRET_ACCESS_KEY ?? null])))
+.listen(Number(process.env.PORT), "127.0.0.1");`,
+    undefined,
+    { manifest: { runtimeEnv: { AWS_ACCESS_KEY_ID: "user-key" }, storageEnv } },
+  );
+  assert.deepEqual(await (await app.request("/")).json(), ["user-key", null]);
+  const backupEnv = startSqliteBackup.mock.calls[0]!.arguments[0].env;
+  assert.equal(backupEnv.AWS_ACCESS_KEY_ID, "storage-key");
+  assert.equal(backupEnv.AWS_SECRET_ACCESS_KEY, "storage-secret");
 });
 
 test(

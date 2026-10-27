@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { chmod, chown, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, chown, lchown, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -21,7 +21,6 @@ export async function startSqliteBackup({ dataDir, env, uid, gid }) {
   const directory = await mkdtemp(join(tmpdir(), "qm-render-sqlite-"));
   const cleanup = () => rm(directory, { recursive: true, force: true });
   const configPath = join(directory, "litestream.json");
-  const identity = uid === undefined ? {} : { uid, gid };
   let child;
   let exited;
   try {
@@ -49,12 +48,8 @@ export async function startSqliteBackup({ dataDir, env, uid, gid }) {
       }),
       { mode: 0o600 },
     );
-    if (uid !== undefined) {
-      await chown(directory, uid, gid);
-      await chown(configPath, uid, gid);
-    }
     await chmod(directory, 0o700);
-    const options = { env, ...identity, timeout: 180_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 };
+    const options = { env, timeout: 180_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 };
     const config = ["-config", configPath, "-no-expand-env"];
     const probe = new URL(env.AWS_ENDPOINT_URL_S3);
     probe.pathname = `/${[env.S3_BUCKET, ...`${env.S3_PREFIX}litestream/.write-probe`.split("/")].map(encodeURIComponent).join("/")}`;
@@ -79,7 +74,11 @@ export async function startSqliteBackup({ dataDir, env, uid, gid }) {
       });
     }
     await exec("litestream", ["restore", ...config, "-if-replica-exists", "-if-db-not-exists", sqlitePath], options);
-    child = spawn("litestream", ["replicate", ...config], { env, ...identity, stdio: "inherit" });
+    if (uid !== undefined)
+      await lchown(sqlitePath, uid, gid).catch((error) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    child = spawn("litestream", ["replicate", ...config], { env, stdio: "inherit" });
     let failure;
     exited = new Promise((done) => {
       child.once("error", (error) => {

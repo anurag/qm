@@ -388,6 +388,14 @@ test("Render app create, update, rollback, and archive retain one service with a
   );
 });
 
+test("Render gives app storage credentials only to the runner, not the app environment", async () => {
+  const f = fixture();
+  const v1 = f.deployment.versions[0]!;
+  await f.provider.apply(f.deployment, { ...v1, env: { AWS_ACCESS_KEY_ID: "user-key", S3_PREFIX: "user/" } });
+  assert.deepEqual(f.manifest.runtimeEnv, { AWS_ACCESS_KEY_ID: "user-key", S3_PREFIX: "user/" });
+  assert.deepEqual(f.manifest.storageEnv, { S3_PREFIX: "app-data/scoped/" });
+});
+
 for (const commit of ["f".repeat(40), sha])
   test(`Render submits its own deploy when a deploy of ${commit === sha ? "the same" : "another"} commit starts during an update`, async () => {
     const f = fixture();

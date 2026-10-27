@@ -161,7 +161,7 @@ export async function runRenderApp({
   try {
     sqliteBackup = await startSqliteBackup({
       dataDir,
-      env: appEnv,
+      env: { ...env, ...manifest.storageEnv },
       ...(privileged ? { uid: APP_UID, gid: APP_GID } : {}),
     });
   } catch (error) {
