@@ -10,7 +10,8 @@ import { cliVersion } from "../src/manifest.ts";
 import { validateSandboxLayer } from "../src/sandbox-layer.ts";
 import { parseToolDescriptor } from "../src/tool-descriptor.ts";
 import { SERVICE_NAMES, VIRTUAL_SERVICE_NAMES } from "../src/services.ts";
-import { renderEnvExample } from "../src/secrets.ts";
+import { computedSecrets, renderEnvExample } from "../src/secrets.ts";
+import { readEnvFile } from "../src/util.ts";
 import { runChecks } from "../src/commands/check.ts";
 import { renderTerraformVars } from "../src/terraform.ts";
 import { requiredSlackScopes, slackManifestBotScopes } from "../src/backends/doctor.ts";
@@ -119,6 +120,25 @@ test("init scaffolds a loadable config, generated local secrets, and a valid san
     assert.equal(layer.tools.length, 1);
     assert.equal(layer.skills.length, 1);
     assert.ok(layer.tools[0]!.executablePath, "the example tool ships an executable");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init mints every locally mintable secret, including the broker signing key", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-"));
+  try {
+    const dir = join(base, "acme");
+    quiet(() => runInit({ dir, org: "acme", target: "fly" }));
+    const { config } = loadConfigInDir(dir);
+    const env = readEnvFile(join(dir, ".env"));
+    const mintable = computedSecrets(config).filter((secret) => secret.required && secret.generate);
+    assert.ok(
+      mintable.some((secret) => secret.name === "AUTH_SIGNING_JWK"),
+      "the broker signing key is mintable",
+    );
+    for (const secret of mintable) assert.ok(env.get(secret.name), `init should mint ${secret.name}`);
+    assert.doesNotThrow(() => JSON.parse(env.get("AUTH_SIGNING_JWK")!), "the broker signing key is a JSON Web Key");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
