@@ -1902,7 +1902,7 @@ test("a file posted in a GROUP conversation is granted read to the conversation 
   assert.equal(fileHandle!.ownerScopeId, scopeId("personal", "U1"));
 });
 
-test("a file shared with the session is LISTED in the cached system prompt — without provisioning a sandbox", async () => {
+test("a file shared with the session is counted, not named, in the system prompt — without provisioning a sandbox", async () => {
   const built = freshApp();
   const { app, acl } = built;
   const boxes = spyProvisioning(built.sandbox);
@@ -1925,9 +1925,9 @@ test("a file shared with the session is LISTED in the cached system prompt — w
   });
   const res = await app.turn(dm("!sysprompt"));
   assert.equal(res.status, "ok");
-  assert.match(res.reply ?? "", /## Files shared with you/);
-  assert.match(res.reply ?? "", /shared\/budget\.csv/);
-  assert.match(res.reply ?? "", /read a path below to fetch that file on demand/);
+  const system = (res.reply ?? "").split("<environment>")[0]!;
+  assert.match(system, /\n1 file is shared with you; /);
+  assert.doesNotMatch(res.reply ?? "", /budget\.csv/);
   assert.equal(boxes.provisioned, 0, "listing shared files must not provision a box");
 });
 
@@ -2278,7 +2278,7 @@ test("turn file context leads the environment block before the conversation head
 
   const res = await app.turn(
     channel("what should I do with this?", {
-      conversationHeader: "You are in #eng. People here: @Alice, @Bob. You are replying to a top-level message.",
+      conversationHeader: "You are in #eng. You are replying to a top-level message.",
       attachments: [{ name: "notes.txt", mimetype: "text/plain", sizeBytes: blob.sizeBytes, blobId: blob.blobId }],
     }),
   );
@@ -2287,7 +2287,7 @@ test("turn file context leads the environment block before the conversation head
   const reply = res.reply ?? "";
   const requestAt = reply.indexOf("what should I do with this?");
   const envAt = reply.indexOf("<environment>");
-  const inboxAt = reply.indexOf("The user shared 1 file");
+  const inboxAt = reply.indexOf("shared notes.txt (");
   const headerAt = reply.indexOf("You are in #eng");
   const envEndAt = reply.indexOf("</environment>");
   assert.notEqual(requestAt, -1, "expected live user request");
@@ -2305,13 +2305,13 @@ test("the situational conversationHeader rides in the <environment> block, not a
   const { app } = freshApp();
   const res = await app.turn(
     channel("@agent is this possible?", {
-      conversationHeader: "You are in #design. People here: @U2, @U3. You are replying in a thread @U2 started.",
+      conversationHeader: "You are in #design. You are replying in a thread @U2 started.",
       priorTurns: [{ role: "user", name: "U2", text: "here's the original idea that started this thread" }],
     }),
   );
   assert.equal(res.status, "ok");
   assert.match(res.reply ?? "", /<environment>/);
-  assert.match(res.reply ?? "", /People here: @U2, @U3/);
+  assert.match(res.reply ?? "", /You are replying in a thread @U2 started\./);
   const found = await app.getSession(res.sessionId!);
   const userEntry = found!.entries.find((e) => e.type === "user");
   const userText = (userEntry!.payload as { text: string }).text;
@@ -4453,22 +4453,30 @@ for (const [securityPosture, securityScreen] of [
   });
 }
 
-test("environment inventories are incremental across real turns with a durable full-snapshot anchor", async () => {
-  const { app, sessions } = freshApp();
-  const first = await app.turn(dm("first", { timezone: "America/Los_Angeles" }));
-  assert.equal(first.status, "ok");
-  assert.match(first.reply ?? "", /## Sandbox provider/);
-  const second = await app.turn(dm("second", { timezone: "America/Los_Angeles" }));
-  assert.equal(second.status, "ok");
-  assert.doesNotMatch(second.reply ?? "", /## Sandboxes|## Sandbox provider/);
-  assert.match(second.reply ?? "", /## The user's local time/);
-  const entries = await sessions.getEntries(first.sessionId!);
-  const users = entries.filter((entry) => entry.type === "user");
-  const firstSnapshot = (users[0]!.payload as { environmentSnapshot: { hashes: Record<string, string> } })
-    .environmentSnapshot;
-  assert.ok(Object.keys(firstSnapshot.hashes).some((key) => key.startsWith("Sandbox provider")));
-  const secondSnapshot = (users[1]!.payload as { environmentSnapshot: { anchorSeq: number } }).environmentSnapshot;
-  assert.equal(secondSnapshot.anchorSeq, users[0]!.seq);
+test("only a conversation where several people can speak names the sender of each message", async () => {
+  const { app } = freshApp();
+  const ada = { externalId: "U1", displayName: "Ada" };
+  const environmentOf = (reply?: string) => (reply ?? "").split("<environment>")[1] ?? "";
+  const direct = await app.turn(dm("!sysprompt", { actor: ada }));
+  assert.doesNotMatch(environmentOf(direct.reply), /This message is from/);
+  const room = await app.turn(
+    channel("!sysprompt", {
+      actor: ada,
+      conversation: { kind: "channel", threadRef: "ch:C1:sender", channelRef: "C1", audience: [ada] },
+    }),
+  );
+  assert.match(environmentOf(room.reply), /This message is from @Ada\./);
+});
+
+test("inventories ride a byte-stable system prompt; a warm turn's environment carries only the clock", async () => {
+  const { app } = freshApp();
+  const first = await app.turn(dm("!sysprompt", { timezone: "America/Los_Angeles" }));
+  const second = await app.turn(dm("!sysprompt", { timezone: "America/Los_Angeles" }));
+  const [system1, environment1] = (first.reply ?? "").split("<environment>");
+  const [system2, environment2] = (second.reply ?? "").split("<environment>");
+  assert.equal(system2, system1);
+  assert.match(environment2!, /^\nLocal time: \S+ \d\d:\d\d P[SD]T \(America\/Los_Angeles\)\n<\/environment>$/);
+  assert.doesNotMatch(environment1!, /## /);
 });
 
 test("an isolated channel environment does not disclose the actor's private sandbox", async () => {
@@ -4499,16 +4507,11 @@ test("an isolated channel environment does not disclose the actor's private sand
       channelRef: "C1",
       audience: [{ externalId: "U1" }, { externalId: "U2" }],
     },
-    text: "hello",
+    text: "!sysprompt",
   };
   const result = await built.app.turn(request);
   assert.equal(result.status, "ok");
-  const session = await built.sessions.getByThread(request.conversation.threadRef);
-  const entries = await built.sessions.getEntries(session!.id);
-  const environment = (entries.find((entry) => entry.type === "user")!.payload as { environment: string }).environment;
-  assert.match(environment, /## Sandbox provider sprites/);
-  for (const content of [environment, result.reply ?? ""]) {
-    assert.ok(!content.includes(privateName), "the private sandbox name must not reach the shared turn");
-    assert.ok(!content.includes(personal.id), "the private sandbox ID must not reach the shared turn");
-  }
+  assert.match(result.reply ?? "", /## Sandboxes\nsprites/);
+  assert.ok(!(result.reply ?? "").includes(privateName), "the private sandbox name must not reach the shared turn");
+  assert.ok(!(result.reply ?? "").includes(personal.id), "the private sandbox ID must not reach the shared turn");
 });

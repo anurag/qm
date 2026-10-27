@@ -16,7 +16,7 @@ import { readContextFile } from "../resolution/context-files.ts";
 import { type TurnContext } from "../resolution/turn-context.ts";
 import { canReadNotebook, readNotebook, searchNotebooks } from "../memory/cross-scope.ts";
 import type { SandboxAccessPlan, SandboxResource, SandboxResources } from "../sandbox/sandbox-resources.ts";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { workspacePathOf } from "../sandbox/exec-file-ops.ts";
 import { DROPPED_PROXY_ENV } from "../sandbox/sandbox-env.ts";
 import { interpolateSplitEnv } from "../deployment/deployment-layer.ts";
@@ -977,6 +977,10 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         const content = await withAbort(() => memory.read(deps.memoryScopeId!), signal);
         return { content, sourceScopeId: deps.memoryScopeId };
       }
+      if (posix.normalize(`${path}/`) === "shared/") {
+        const names = [...new Set(deps.grantedHandles.map((handle) => handle.handlePath))].sort();
+        return { content: names.length ? names.join("\n") : "[no files are shared with you]", sourceScopeId: null };
+      }
       const sharedFile = deps.context
         ? await withAbort(() => deps.context!.readFile(path), signal)
         : await withAbort(() => readContextFile(path, deps.grantedHandles, deps.files), signal);
@@ -1039,7 +1043,7 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
 
     async listSkills(query = "", offset = 0, limit = 50, source?: string) {
       const available = (await deps.listSkills?.(source)) ?? [];
-      const matches = rankedSkills(available, query, [], Boolean(query));
+      const matches = rankedSkills(available, query, Boolean(query));
       const start = Math.max(0, Math.floor(offset));
       const selected = matches.slice(start, start + Math.max(1, Math.min(100, Math.floor(limit))));
       const sourceScopeId = selected.length && source ? selected[0]!.skill!.scopeId : null;

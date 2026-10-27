@@ -3,7 +3,6 @@ import { safeSkillFilePath, type SkillFile, type SkillResolution } from "./skill
 import type { SkillBundle } from "./skill-bundle-store.ts";
 import { swallow } from "../util/errors.ts";
 import { assertSafeSkillName } from "./skill-name.ts";
-import type { ScopeId } from "../types.ts";
 
 export const SKILLS_DIR = "skills";
 export const SKILLS_ROOT = ".agent-skills";
@@ -92,12 +91,7 @@ export async function materializeSkillTree(
   for (const e of entries) await sandbox.writeFile(handle, e.path, e.content);
 }
 
-export function rankedSkills(
-  resolved: SkillResolution[],
-  query = "",
-  usedNames: readonly string[] = [],
-  onlyMatches = false,
-): SkillResolution[] {
+export function rankedSkills(resolved: SkillResolution[], query = "", onlyMatches = false): SkillResolution[] {
   const tokens = (text: string) =>
     new Set(
       [...new Intl.Segmenter("en", { granularity: "word" }).segment(text.toLowerCase())]
@@ -121,15 +115,11 @@ export function rankedSkills(
       return {
         entry,
         relevance: words.filter((word) => text.has(word)).length,
-        used: usedNames.includes(skill.manifest.name) ? 1 : 0,
       };
     })
     .filter(({ relevance }) => !onlyMatches || relevance > 0)
     .sort(
-      (a, b) =>
-        b.relevance - a.relevance ||
-        b.used - a.used ||
-        a.entry.skill!.manifest.name.localeCompare(b.entry.skill!.manifest.name),
+      (a, b) => b.relevance - a.relevance || a.entry.skill!.manifest.name.localeCompare(b.entry.skill!.manifest.name),
     )
     .map(({ entry }) => entry);
 }
@@ -150,19 +140,10 @@ function fitDescriptions(heads: string[], descriptions: string[], budget: number
   return low;
 }
 
-export function skillsIndex(
-  resolved: SkillResolution[],
-  provenanceScopes: readonly ScopeId[] = [],
-  usedNames: readonly string[] = [],
-  budget = SKILLS_INDEX_BUDGET,
-): string {
-  const provenance = new Set(provenanceScopes);
-  const items = rankedSkills(resolved, "", usedNames);
+export function skillsIndex(resolved: SkillResolution[], budget = SKILLS_INDEX_BUDGET): string {
+  const items = rankedSkills(resolved);
   if (!items.length) return "";
-  const heads = items.map((r) => {
-    const source = provenance.has(r.skill!.scopeId) ? ` [from ${r.skill!.scopeId}]` : "";
-    return `- **${r.skill!.manifest.name}**${source}`;
-  });
+  const heads = items.map((r) => `- ${r.skill!.manifest.name}`);
   const descriptions = items.map((r) => r.skill!.manifest.description.trim());
   const cap = fitDescriptions(heads, descriptions, budget);
   let lines: string[];

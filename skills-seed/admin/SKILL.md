@@ -78,15 +78,14 @@ still have a key they are not granted. To check the org, read
 `enabled: true`, `hasSecret: true`, `delivery: "env"` and `envKey: "COMPOSIO_API_KEY"`
 means Composio is configured.
 
-**Own OAuth apps.** The live Connected apps block reflects the providers configured with
-client credentials, from Admin → Connectors or deployment secrets. The line "No direct
-OAuth app connections are configured" means none are, even if MCP apps appear under
-"Connected". Without that line, at least one provider is configured.
+**Own OAuth apps.** `GET $AGENT_API_URL/v1/connectors/catalog` (header `x-agent-capability: $AGENT_API_TOKEN`) marks each provider
+configured with client credentials, from Admin → Connectors or deployment secrets, with
+`configured: true`. No such entry means none are.
 `GET /v1/admin/scopes/<org scope>?view=connectors` shows only apps added in Admin →
 Connectors, not ones set by deployment secrets, so it cannot prove absence.
 
 Composio is absent only when the toolkits read fails and the org check finds no such
-credential. If either source exists, skip silently. If the block is missing or a read
+credential. If either source exists, skip silently. If a read
 fails, treat it as unknown, not absent, and do not offer setup. Only when both are
 confirmed absent, send one short message:
 
@@ -100,10 +99,8 @@ confirmed absent, send one short message:
   `<web origin>/v1/connectors/oauth/<provider>/callback`, which the Connectors page also
   shows.
 
-Links: the web origin is the origin of the Connection page URL in the Connected apps
-block (`<web origin>/keychain`). Link `<web origin>/admin/credentials` and
-`<web origin>/admin/connectors`. If that line is absent, name the pages without links and
-offer the drop link. Never invent URLs or ask for keys or client secrets in chat. Never
+Name the pages (Admin → Credentials, Admin → Connectors) without links and offer the drop
+link. Never invent URLs or ask for keys or client secrets in chat. Never
 ask regular users to configure a source.
 
 ## Guide Slack installation
