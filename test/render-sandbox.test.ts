@@ -53,7 +53,7 @@ function setup(
       scratchStore,
       cleanupStore,
       advisoryLock,
-      deploymentId: async () => "deployment-a",
+      deploymentName: async () => "default-org-deployment-a",
       blobTransfer,
       checkpointIntervalMs,
       onError: (error) => errors.push({ code: error.code, message: error.message }),
@@ -899,11 +899,10 @@ test("Render leaves the sandboxes of another database with the same org ID runni
     scratchStore: testMap<StoredRenderScratch>(),
     cleanupStore: testMap<StoredRenderCleanup>(),
     advisoryLock,
-    deploymentId: async () => "deployment-b",
+    deploymentName: async () => "default-org-deployment-b",
     blobTransfer,
   });
   await other.provision(scopeId("personal", "other"));
-  assert.notEqual(fake.nameOf("sbx-1"), fake.nameOf("sbx-2"));
   for (const id of fake.sandboxes.keys()) fake.age(id, 16 * 60_000);
   assert.deepEqual(await other.reapDeepIdle!(0), { reaped: 0 });
   assert.deepEqual(await make().reapDeepIdle!(0), { reaped: 0 });

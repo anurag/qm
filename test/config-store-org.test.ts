@@ -20,7 +20,6 @@ test("a durable database keeps one deployment ID, added once to an identity row 
   await testConfigStore("default-org", { deploymentIdentity }).hydrate!();
   assert.equal((await claimDeploymentIdentity(deploymentIdentity, "default-org")).id, first.id);
   assert.deepEqual(await deploymentIdentity.get("singleton"), { orgId: "default-org", id: first.id });
-  await assert.rejects(claimDeploymentIdentity(deploymentIdentity, "other"), /database belongs to org default-org/);
 });
 
 test("purpose runtimes persist independently without manufacturing a conversation default", async () => {

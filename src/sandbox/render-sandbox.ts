@@ -1,5 +1,4 @@
 import { SandboxSnapshotNotFoundError } from "@renderinc/sdk";
-import { orgId } from "../config.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { CredentialPathSpec } from "../credentials/resident-paths.ts";
@@ -65,7 +64,7 @@ export interface RenderSandboxOptions extends BlobStagingOptions {
   scratchStore: DurableMap<StoredRenderScratch>;
   cleanupStore: DurableMap<StoredRenderCleanup>;
   advisoryLock: AdvisoryLock;
-  deploymentId: () => Promise<string>;
+  deploymentName: () => Promise<string>;
   namePrefix?: string;
   homeDir?: string;
   defaultTimeoutSec?: number;
@@ -85,12 +84,12 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
   const checkpointIntervalMs = opts.checkpointIntervalMs ?? 5 * 60_000;
   const scratch = new Map<string, RenderSandboxInfo>();
   const nameFor = (scope: string): string => sandboxScopeName(prefix, scope);
-  let deploymentName: Promise<string> | undefined;
+  let sandboxName: Promise<string> | undefined;
   const nameSandbox = (): Promise<string> =>
-    (deploymentName ??= opts.deploymentId().then(
-      (id) => sandboxScopeName(prefix, `${orgId()}-${id}`),
+    (sandboxName ??= opts.deploymentName().then(
+      (deployment) => sandboxScopeName(prefix, deployment),
       (error: unknown) => {
-        deploymentName = undefined;
+        sandboxName = undefined;
         throw error;
       },
     ));

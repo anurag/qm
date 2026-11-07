@@ -1082,7 +1082,10 @@ export function buildApp(
       store: renderBodies,
       scratchStore: renderScratch,
       cleanupStore: renderCleanup,
-      deploymentId: async () => (await claimDeploymentIdentity(configMaps.deploymentIdentity, config.orgId)).id,
+      deploymentName: async () => {
+        const identity = await claimDeploymentIdentity(configMaps.deploymentIdentity, config.orgId);
+        return `${identity.orgId}-${identity.id}`;
+      },
       advisoryLock,
       extraTools: deploymentLayer.advertisedTools,
       credentialPaths: deploymentLayer.credentialPaths,
