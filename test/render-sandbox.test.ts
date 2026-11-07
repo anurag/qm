@@ -854,6 +854,53 @@ for (const failure of ["cleanup release", "record write"] as const) {
   });
 }
 
+test("Render names sandboxes for the deployment and terminates named sandboxes that no record tracks after a grace period", async (t) => {
+  const { make, fake, http, scope } = setup(t, { http: true });
+  const sandbox = make();
+  const computer = await sandbox.provision(scope);
+  const disposable = await sandbox.provision(scope, { scratch: { key: "job" } });
+  const name = fake.nameOf("sbx-1")!;
+  assert.match(name, /^qm-default-org-/);
+  assert.equal(fake.nameOf(disposable.providerSandboxId!), name);
+  const orphans: string[] = [];
+  for (let i = 0; i < 100; i++) orphans.push((await fake.client.create({ name, lifetimeSec: 3600 })).id);
+  const otherDeployment = (await fake.client.create({ name: "qm-other-org-123456", lifetimeSec: 3600 })).id;
+
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  assert.ok(orphans.every((id) => fake.sandboxes.get(id)?.status === "running"));
+
+  for (const id of fake.sandboxes.keys()) fake.age(id, 16 * 60_000);
+  http!.listQueries.length = 0;
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 100 });
+  assert.ok(orphans.every((id) => fake.sandboxes.get(id)?.status === "terminated"));
+  assert.equal(fake.sandboxes.get("sbx-1")?.status, "running");
+  assert.equal(fake.sandboxes.get(disposable.providerSandboxId!)?.status, "running");
+  assert.equal(fake.sandboxes.get(otherDeployment)?.status, "running");
+  assert.deepEqual(
+    http!.listQueries.map((query) => query.get("cursor")),
+    [null, "sbx-100"],
+  );
+  await sandbox.teardown(disposable);
+  await sandbox.teardown(computer);
+});
+
+test("Render keeps reaping idle computers when it cannot list its sandboxes", async (t) => {
+  const { make, scope, errors } = setup(t, {
+    http: true,
+    intercept: (request) =>
+      request.method === "GET" && new URL(request.url).pathname === "/v1/sandboxes"
+        ? Response.json({ message: "forbidden" }, { status: 403 })
+        : undefined,
+  });
+  const sandbox = make();
+  await sandbox.teardown(await sandbox.provision(scope));
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  assert.deepEqual(
+    errors.map((error) => error.code),
+    ["orphan_list_failed"],
+  );
+});
+
 test("Render checkpoints at teardown once per interval and skips an unused computer", async (t) => {
   const { make, store, scope } = setup(t);
   const sandbox = make(5 * 60_000);

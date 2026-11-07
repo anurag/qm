@@ -1,4 +1,5 @@
 import { SandboxSnapshotNotFoundError } from "@renderinc/sdk";
+import { orgId } from "../config.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { CredentialPathSpec } from "../credentials/resident-paths.ts";
@@ -24,9 +25,11 @@ import {
   type Sandbox,
   type SandboxHandle,
 } from "./sandbox.ts";
-import type { RenderClient, RenderSandboxInfo, RenderSnapshot } from "./render-client.ts";
+import type { RenderClient, RenderListedSandbox, RenderSandboxInfo, RenderSnapshot } from "./render-client.ts";
 import type { RenderBase } from "./render-base.ts";
 import { RENDER_COMPUTER_LIFETIME_SEC, RENDER_IDLE_STOP_MS, RENDER_SANDBOX_TTL_SEC } from "./render-limits.ts";
+
+const ORPHAN_GRACE_MS = 15 * 60_000;
 
 interface RenderSandboxResources {
   sandboxId?: string;
@@ -81,6 +84,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
   const checkpointIntervalMs = opts.checkpointIntervalMs ?? 5 * 60_000;
   const scratch = new Map<string, RenderSandboxInfo>();
   const nameFor = (scope: string): string => sandboxScopeName(prefix, scope);
+  const deploymentName = sandboxScopeName(prefix, orgId());
   const lifecycleKey = (name: string): string => `render-sandbox:${name}`;
   const useKey = (name: string): string => `render-sandbox-use:${name}`;
   const withLifecycle = <T>(name: string, fn: () => Promise<T>): Promise<T> =>
@@ -323,6 +327,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
     source: { ref: string; snapshotId: string },
   ): Promise<void> {
     const created = await client.create({
+      name: deploymentName,
       snapshotId: source.snapshotId,
       lifetimeSec: RENDER_COMPUTER_LIFETIME_SEC,
       onCreated: (sandboxId) => holdForCleanup(scope, sandboxId),
@@ -406,6 +411,41 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
     );
   }
 
+  async function trackedSandboxIds(): Promise<Set<string>> {
+    const resources: RenderSandboxResources[] = [];
+    for (const [, stored] of await store.entries()) resources.push(stored, ...(stored.retiredResources ?? []));
+    for (const [, pending] of await cleanupStore.entries()) resources.push(...pending.resources);
+    const ids = new Set(resources.flatMap((entry) => (entry.sandboxId ? [entry.sandboxId] : [])));
+    for (const [, temporary] of await scratchStore.entries()) ids.add(temporary.id);
+    for (const temporary of scratch.values()) ids.add(temporary.id);
+    return ids;
+  }
+
+  async function sweepOrphans(): Promise<number> {
+    let listed: RenderListedSandbox[];
+    try {
+      listed = await client.listLive(deploymentName);
+    } catch (error) {
+      reportError("orphan_list_failed", error);
+      return 0;
+    }
+    const cutoff = Date.now() - ORPHAN_GRACE_MS;
+    const candidates = listed.filter((sandbox) => sandbox.createdAtMs <= cutoff);
+    if (!candidates.length) return 0;
+    const tracked = await trackedSandboxIds();
+    let reaped = 0;
+    for (const orphan of candidates) {
+      if (tracked.has(orphan.id)) continue;
+      try {
+        await client.terminate(orphan.id);
+        reaped++;
+      } catch (error) {
+        reportError("orphan_terminate_failed", error);
+      }
+    }
+    return reaped;
+  }
+
   async function destroyScratch(name: string): Promise<void> {
     const temporary = (await scratchStore.get(name)) ?? scratch.get(name);
     if (!temporary) return;
@@ -432,6 +472,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
     isProvisioned: (name) => scratch.has(name),
     async recreateScratch(name) {
       const temporary = await client.create({
+        name: deploymentName,
         snapshotId: (await goldens.ready()).snapshotId,
         lifetimeSec: RENDER_SANDBOX_TTL_SEC,
       });
@@ -647,6 +688,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
           else await checkpoint(scope, stored, active || undefined);
         }).catch((error) => reportError("idle_checkpoint_failed", error, scope));
       }
+      reaped += await sweepOrphans();
       return { reaped };
     },
     async computerStatus(scope): Promise<ComputerStatus> {
