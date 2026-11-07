@@ -43,6 +43,7 @@ function setup(t: TestContext) {
       scratchStore: backing,
       cleanupStore,
       advisoryLock: lock,
+      deploymentId: async () => "deployment-a",
       onError: ({ code }) => errors.push(code),
     });
   return { make, fake, store, scratchStore, errors };

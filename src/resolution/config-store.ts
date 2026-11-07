@@ -1,7 +1,7 @@
 import type { CommandPolicy, EgressPolicy, ScopeId } from "../types.ts";
 import { scopeId } from "../types.ts";
 import { defaultOrgPolicy } from "../policy/command-policy.ts";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { createKeyedQueue } from "../util/async.ts";
@@ -90,6 +90,21 @@ export interface OrgBranding {
 }
 export interface PersistedDeploymentIdentity {
   orgId: string;
+  id: string;
+}
+
+export async function claimDeploymentIdentity(
+  identities: DurableMap<PersistedDeploymentIdentity>,
+  orgId: string,
+): Promise<PersistedDeploymentIdentity> {
+  const [identity] = await identities.mutateMany([
+    {
+      id: "singleton",
+      apply: (value) => (value?.id ? value : { ...value, orgId: value?.orgId ?? orgId, id: randomUUID() }),
+    },
+  ]);
+  if (identity!.orgId !== orgId) throw new Error(`database belongs to org ${identity!.orgId}, not ${orgId}`);
+  return identity!;
 }
 export interface ScopedConfigStore {
   refreshSecurity(ids: ScopeId[]): Promise<void>;
@@ -465,8 +480,7 @@ export function createConfigStore(
     hydrate() {
       if (!hydrated) {
         hydrated = (async () => {
-          const identity = await deploymentIdentity.putIfAbsent("singleton", { orgId });
-          if (identity.orgId !== orgId) throw new Error(`database belongs to org ${identity.orgId}, not ${orgId}`);
+          await claimDeploymentIdentity(deploymentIdentity, orgId);
           for (const r of await soulStore.all()) {
             souls.set(r.scopeId, { content: r.content, version: r.version });
             if (r.history?.length) soulHistory.set(r.scopeId, r.history);

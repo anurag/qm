@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { type PersistedDeploymentIdentity } from "../src/resolution/config-store.ts";
+import { claimDeploymentIdentity, type PersistedDeploymentIdentity } from "../src/resolution/config-store.ts";
 import { testConfigStore, testMap } from "./support/test-database.ts";
 
 test("a durable database is pinned to one organization", async () => {
@@ -10,6 +10,17 @@ test("a durable database is pinned to one organization", async () => {
     testConfigStore("other", { deploymentIdentity }).hydrate!(),
     /database belongs to org default-org/,
   );
+});
+
+test("a durable database keeps one deployment ID, added once to an identity row that has none", async () => {
+  const deploymentIdentity = testMap<PersistedDeploymentIdentity>();
+  await deploymentIdentity.put("singleton", { orgId: "default-org" } as PersistedDeploymentIdentity);
+  const first = await claimDeploymentIdentity(deploymentIdentity, "default-org");
+  assert.ok(first.id);
+  await testConfigStore("default-org", { deploymentIdentity }).hydrate!();
+  assert.equal((await claimDeploymentIdentity(deploymentIdentity, "default-org")).id, first.id);
+  assert.deepEqual(await deploymentIdentity.get("singleton"), { orgId: "default-org", id: first.id });
+  await assert.rejects(claimDeploymentIdentity(deploymentIdentity, "other"), /database belongs to org default-org/);
 });
 
 test("purpose runtimes persist independently without manufacturing a conversation default", async () => {

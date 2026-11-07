@@ -53,6 +53,7 @@ function setup(
       scratchStore,
       cleanupStore,
       advisoryLock,
+      deploymentId: async () => "deployment-a",
       blobTransfer,
       checkpointIntervalMs,
       onError: (error) => errors.push({ code: error.code, message: error.message }),
@@ -64,6 +65,7 @@ function setup(
   });
   return {
     fake,
+    client,
     http,
     store,
     scratchStore,
@@ -885,6 +887,28 @@ test("Render names sandboxes for the deployment and terminates named sandboxes t
   assert.equal(fake.sandboxes.get(otherDeployment)?.status, "running");
   await sandbox.teardown(disposable);
   await sandbox.teardown(computer);
+});
+
+test("Render leaves the sandboxes of another database with the same org ID running", async (t) => {
+  const { make, fake, client, scope, advisoryLock, blobTransfer } = setup(t, { http: true });
+  await make().provision(scope);
+  const other = createRenderSandbox({
+    client,
+    base: { ready: async () => ({ ref: BASE_REF, snapshotId: fake.seedGolden(BASE_REF) }), prepare: async () => {} },
+    store: testMap<StoredRenderSandbox>(),
+    scratchStore: testMap<StoredRenderScratch>(),
+    cleanupStore: testMap<StoredRenderCleanup>(),
+    advisoryLock,
+    deploymentId: async () => "deployment-b",
+    blobTransfer,
+  });
+  await other.provision(scopeId("personal", "other"));
+  assert.notEqual(fake.nameOf("sbx-1"), fake.nameOf("sbx-2"));
+  for (const id of fake.sandboxes.keys()) fake.age(id, 16 * 60_000);
+  assert.deepEqual(await other.reapDeepIdle!(0), { reaped: 0 });
+  assert.deepEqual(await make().reapDeepIdle!(0), { reaped: 0 });
+  assert.equal(fake.sandboxes.get("sbx-1")?.status, "running");
+  assert.equal(fake.sandboxes.get("sbx-2")?.status, "running");
 });
 
 test("Render stops an idle computer when it cannot list its sandboxes", async (t) => {

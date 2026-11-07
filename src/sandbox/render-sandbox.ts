@@ -65,6 +65,7 @@ export interface RenderSandboxOptions extends BlobStagingOptions {
   scratchStore: DurableMap<StoredRenderScratch>;
   cleanupStore: DurableMap<StoredRenderCleanup>;
   advisoryLock: AdvisoryLock;
+  deploymentId: () => Promise<string>;
   namePrefix?: string;
   homeDir?: string;
   defaultTimeoutSec?: number;
@@ -84,7 +85,15 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
   const checkpointIntervalMs = opts.checkpointIntervalMs ?? 5 * 60_000;
   const scratch = new Map<string, RenderSandboxInfo>();
   const nameFor = (scope: string): string => sandboxScopeName(prefix, scope);
-  const deploymentName = sandboxScopeName(prefix, orgId());
+  let deploymentName: Promise<string> | undefined;
+  const nameSandbox = (): Promise<string> =>
+    (deploymentName ??= opts.deploymentId().then(
+      (id) => sandboxScopeName(prefix, `${orgId()}-${id}`),
+      (error: unknown) => {
+        deploymentName = undefined;
+        throw error;
+      },
+    ));
   const lifecycleKey = (name: string): string => `render-sandbox:${name}`;
   const useKey = (name: string): string => `render-sandbox-use:${name}`;
   const withLifecycle = <T>(name: string, fn: () => Promise<T>): Promise<T> =>
@@ -327,7 +336,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
     source: { ref: string; snapshotId: string },
   ): Promise<void> {
     const created = await client.create({
-      name: deploymentName,
+      name: await nameSandbox(),
       snapshotId: source.snapshotId,
       lifetimeSec: RENDER_COMPUTER_LIFETIME_SEC,
       onCreated: (sandboxId) => holdForCleanup(scope, sandboxId),
@@ -424,7 +433,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
   async function sweepOrphans(): Promise<number> {
     let listed: RenderListedSandbox[];
     try {
-      listed = await client.listLive(deploymentName);
+      listed = await client.listLive(await nameSandbox());
     } catch (error) {
       reportError("orphan_list_failed", error);
       return 0;
@@ -472,7 +481,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
     isProvisioned: (name) => scratch.has(name),
     async recreateScratch(name) {
       const temporary = await client.create({
-        name: deploymentName,
+        name: await nameSandbox(),
         snapshotId: (await goldens.ready()).snapshotId,
         lifetimeSec: RENDER_SANDBOX_TTL_SEC,
       });

@@ -93,7 +93,12 @@ import type { SlackAccountLink, ComposioReturn } from "./api/routes/composio.ts"
 import { installPrincipalLinks } from "./directory/person.ts";
 import type { ExternalMember } from "./identity/external-members.ts";
 import { resendMailer } from "../plugins/chassis/src/resend.ts";
-import { configStoreMaps, createConfigStore, type ScopedConfigStore } from "./resolution/config-store.ts";
+import {
+  claimDeploymentIdentity,
+  configStoreMaps,
+  createConfigStore,
+  type ScopedConfigStore,
+} from "./resolution/config-store.ts";
 import { createResolutionService } from "./resolution/resolution-service.ts";
 import { createAclStore, type AclStore } from "./acl/acl-store.ts";
 import { createPostgresGrantStore } from "./acl/postgres-grant-store.ts";
@@ -623,8 +628,9 @@ export function buildApp(
   });
   void identity.refresh().catch(reportFailureAs("startup: hydrate identity", undefined));
   const leaderLease: LeaderLease = createPostgresLeaderLease(pgArtifactMap.pool);
+  const configMaps = configStoreMaps(artifactMap);
   const configStore = createConfigStore(config.orgId, {
-    ...configStoreMaps(artifactMap),
+    ...configMaps,
     defaultSecurityPosture: config.securityPosture,
     defaultSharingPosture: config.sharingPosture,
     ...(config.connectorSecretKey ? { connectorSecretKey: config.connectorSecretKey } : {}),
@@ -1076,6 +1082,7 @@ export function buildApp(
       store: renderBodies,
       scratchStore: renderScratch,
       cleanupStore: renderCleanup,
+      deploymentId: async () => (await claimDeploymentIdentity(configMaps.deploymentIdentity, config.orgId)).id,
       advisoryLock,
       extraTools: deploymentLayer.advertisedTools,
       credentialPaths: deploymentLayer.credentialPaths,

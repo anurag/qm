@@ -33,7 +33,7 @@ mock.module("../src/resolution/config-store.ts", {
         ...args[1],
         deploymentIdentity: {
           ...args[1].deploymentIdentity,
-          putIfAbsent: async () => {
+          mutateMany: async () => {
             throw configFailure;
           },
         },
