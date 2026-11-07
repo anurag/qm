@@ -855,7 +855,7 @@ for (const failure of ["cleanup release", "record write"] as const) {
 }
 
 test("Render names sandboxes for the deployment and terminates named sandboxes that no record tracks after a grace period", async (t) => {
-  const { make, fake, http, scope } = setup(t, { http: true });
+  const { make, fake, scope, errors } = setup(t, { http: true });
   const sandbox = make();
   const computer = await sandbox.provision(scope);
   const disposable = await sandbox.provision(scope, { scratch: { key: "job" } });
@@ -870,22 +870,25 @@ test("Render names sandboxes for the deployment and terminates named sandboxes t
   assert.ok(orphans.every((id) => fake.sandboxes.get(id)?.status === "running"));
 
   for (const id of fake.sandboxes.keys()) fake.age(id, 16 * 60_000);
-  http!.listQueries.length = 0;
-  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 100 });
-  assert.ok(orphans.every((id) => fake.sandboxes.get(id)?.status === "terminated"));
+  fake.failTerminate(new Error("terminate outage"), orphans[0]);
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 99 });
+  assert.ok(orphans.slice(1).every((id) => fake.sandboxes.get(id)?.status === "terminated"));
+  assert.deepEqual(
+    errors.filter((error) => error.code === "orphan_terminate_failed").map((error) => error.message),
+    [`terminate orphan sandbox ${orphans[0]} <- Error: terminate outage`],
+  );
+  fake.failTerminate(undefined, orphans[0]);
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 1 });
+  assert.equal(fake.sandboxes.get(orphans[0]!)?.status, "terminated");
   assert.equal(fake.sandboxes.get("sbx-1")?.status, "running");
   assert.equal(fake.sandboxes.get(disposable.providerSandboxId!)?.status, "running");
   assert.equal(fake.sandboxes.get(otherDeployment)?.status, "running");
-  assert.deepEqual(
-    http!.listQueries.map((query) => query.get("cursor")),
-    [null, "sbx-100"],
-  );
   await sandbox.teardown(disposable);
   await sandbox.teardown(computer);
 });
 
-test("Render keeps reaping idle computers when it cannot list its sandboxes", async (t) => {
-  const { make, scope, errors } = setup(t, {
+test("Render stops an idle computer when it cannot list its sandboxes", async (t) => {
+  const { make, fake, store, scope, errors } = setup(t, {
     http: true,
     intercept: (request) =>
       request.method === "GET" && new URL(request.url).pathname === "/v1/sandboxes"
@@ -893,8 +896,11 @@ test("Render keeps reaping idle computers when it cannot list its sandboxes", as
         : undefined,
   });
   const sandbox = make();
-  await sandbox.teardown(await sandbox.provision(scope));
-  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 0 });
+  await sandbox.provision(scope);
+  const { sandboxId } = (await store.get(scope))!;
+  await store.merge(scope, { lastActivityMs: Date.now() - 7200_000 });
+  assert.deepEqual(await sandbox.reapDeepIdle!(0), { reaped: 1 });
+  assert.equal(fake.sandboxes.get(sandboxId)?.status, "terminated");
   assert.deepEqual(
     errors.map((error) => error.code),
     ["orphan_list_failed"],

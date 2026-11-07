@@ -321,7 +321,6 @@ export function serveFakeRenderApi(
 ) {
   const tokenRequests: FakeRenderTokenRequest[] = [];
   const proxyCommands: string[] = [];
-  const listQueries: URLSearchParams[] = [];
   let groupName: string | undefined = "Default";
   let groupCreatedElsewhere: string | undefined;
   let groupWithoutDefault = false;
@@ -395,7 +394,6 @@ export function serveFakeRenderApi(
       return Response.json(sandboxJson(id), { status: 201 });
     }
     if (path === "/sandboxes" && request.method === "GET") {
-      listQueries.push(query);
       const statuses = new Set(query.getAll("status"));
       const matching = [...fake.sandboxes.values()].filter(
         (info) => fake.nameOf(info.id) === query.get("name") && statuses.has(info.status),
@@ -518,7 +516,6 @@ export function serveFakeRenderApi(
   return {
     tokenRequests,
     proxyCommands,
-    listQueries,
     uploads,
     removeSandboxGroups: () => (groupName = undefined),
     keepGroupWithoutDefault: () => (groupWithoutDefault = true),

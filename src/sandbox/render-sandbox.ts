@@ -440,7 +440,7 @@ export function createRenderSandbox(opts: RenderSandboxOptions): Sandbox {
         await client.terminate(orphan.id);
         reaped++;
       } catch (error) {
-        reportError("orphan_terminate_failed", error);
+        reportError("orphan_terminate_failed", new Error(`terminate orphan sandbox ${orphan.id}`, { cause: error }));
       }
     }
     return reaped;
